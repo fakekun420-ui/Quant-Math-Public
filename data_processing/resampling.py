@@ -231,22 +231,31 @@ class TimeSeriesResampler:
     @staticmethod
     def resample_to_frequency(
         df: pd.DataFrame,
-        timestamp_col: str = 'timestamp',
         target_freq: str = '1h',
-        how: str = 'last'
+        how: str = 'last',
+        timestamp_col: str = None
     ) -> pd.DataFrame:
         """
         Resample to specific frequency
 
         Args:
             df: Input DataFrame
-            timestamp_col: Timestamp column
-            target_freq: Target frequency ('1h', '30min', etc.)
+            target_freq: Target frequency ('1h', '4h', '30min', etc.)
             how: Aggregation method ('last', 'first', 'mean', 'sum')
+            timestamp_col: Timestamp column (auto-detected if None)
 
         Returns:
             Resampled DataFrame
         """
+        # Auto-detect the timestamp column if not provided
+        if timestamp_col is None or timestamp_col not in df.columns:
+            candidates = ['timestamp', 'date', 'time', 'datetime', 'open_time']
+            timestamp_col = next(
+                (c for c in df.columns if c.lower() in candidates), None)
+            if timestamp_col is None:
+                raise ValueError(
+                    f"No timestamp column found in {list(df.columns)}")
+
         agg_map = {
             'last': 'last',
             'first': 'first',

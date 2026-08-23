@@ -48,7 +48,9 @@ def test_efficient_frontier():
     print(f"  Volatility: {vol:.4f}")
 
     # Max Sharpe
-    weights, ret, vol = ef.find_max_sharpe()
+    weights = ef.find_max_sharpe()
+    ret = weights @ ef.expected_returns
+    vol = np.sqrt(weights @ ef.cov_matrix @ weights)
     sharpe = (ret - 0.02) / vol
 
     print(f"\nMaximum Sharpe portfolio:")
@@ -133,13 +135,17 @@ def test_risk_parity():
         })()
     })()
 
-    result = rp.optimize()
+    weights = rp.optimize()
+
+    # Derive risk stats from the optimized weights
+    risk_contributions = rp._calculate_risk_contributions(weights)
+    total_risk = float(np.sqrt(weights @ rp.cov_matrix @ weights))
 
     print(f"\nRisk Parity portfolio:")
-    print(f"  Weights: {result.weights}")
-    print(f"  Risk contributions: {result.risk_contributions}")
-    print(f"  Total risk: {result.total_risk:.4f}")
-    print(f"  Risk contribution deviation: {np.std(result.risk_contributions):.4f}")
+    print(f"  Weights: {weights}")
+    print(f"  Risk contributions: {risk_contributions}")
+    print(f"  Total risk: {total_risk:.4f}")
+    print(f"  Risk contribution deviation: {np.std(risk_contributions):.4f}")
 
 
 def main():

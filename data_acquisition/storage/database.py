@@ -14,7 +14,25 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class DataStore:
+def DataStore(*args, **kwargs):
+    """
+    Factory: returns the SQLite-backed store when called with db_path,
+    otherwise the PostgreSQL-based store.
+
+    SQLite mode:
+        DataStore(db_path="data.db")
+
+    PostgreSQL mode:
+        DataStore(dbname=..., user=..., password=...)
+    """
+    if 'db_path' in kwargs:
+        from .sqlite_store import SQLiteDataStore
+        return SQLiteDataStore(**kwargs)
+
+    return _PostgreSQLDataStore(*args, **kwargs)
+
+
+class _PostgreSQLDataStore:
     """
     PostgreSQL-based data store with time zone awareness
     """

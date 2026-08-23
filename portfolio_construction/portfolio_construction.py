@@ -44,23 +44,35 @@ class EfficientFrontier:
     Computes the efficient frontier of risky assets.
     """
 
-    def __init__(self, returns: np.ndarray, risk_free_rate: float = 0.02):
+    def __init__(self, returns: np.ndarray, covariance_matrix=None, risk_free_rate: float = 0.02):
         """
         Initialize efficient frontier calculator.
 
-        Parameters
-        ----------
-        returns : np.ndarray
-            Asset returns (n_observations x n_assets)
-        risk_free_rate : float
-            Risk-free rate
+        Two modes:
+
+        Raw returns mode:
+            returns : np.ndarray - Asset returns (n_observations x n_assets)
+            covariance_matrix : None
+            risk_free_rate : float
+
+        Precomputed mode:
+            returns : np.ndarray - Expected returns per asset (n_assets,)
+            covariance_matrix : np.ndarray - Covariance matrix (n_assets x n_assets)
+            risk_free_rate : float
         """
-        self.returns = returns
         self.risk_free_rate = risk_free_rate
 
-        # Compute statistics
-        self.expected_returns = np.mean(returns, axis=0)
-        self.cov_matrix = np.cov(returns, rowvar=False)
+        if covariance_matrix is not None and np.ndim(returns) == 1:
+            # Precomputed expected returns + covariance matrix
+            self.returns = None
+            self.expected_returns = np.asarray(returns, dtype=float)
+            self.cov_matrix = np.asarray(covariance_matrix, dtype=float)
+        else:
+            # Raw returns matrix
+            self.returns = returns
+            # Compute statistics
+            self.expected_returns = np.mean(returns, axis=0)
+            self.cov_matrix = np.cov(returns, rowvar=False)
 
     def optimize_portfolio(self, target_return: float) -> np.ndarray:
         """
@@ -141,7 +153,7 @@ class EfficientFrontier:
 
         return returns, np.array(volatilities), np.array(weights_list)
 
-    def find_max_sharpe(self) -> Tuple[np.ndarray, float, float]:
+    def find_max_sharpe(self) -> np.ndarray:
         """
         Find portfolio with maximum Sharpe ratio.
 
@@ -149,10 +161,6 @@ class EfficientFrontier:
         -------
         weights : np.ndarray
             Optimal weights
-        return : float
-            Expected return
-        vol : float
-            Volatility
         """
         def negative_sharpe(w):
             portfolio_return = w @ self.expected_returns
@@ -175,10 +183,7 @@ class EfficientFrontier:
         )
 
         weights = result.x
-        return_val = weights @ self.expected_returns
-        vol_val = np.sqrt(weights @ self.cov_matrix @ weights)
-
-        return weights, return_val, vol_val
+        return weights
 
     def find_minimum_variance(self) -> Tuple[np.ndarray, float]:
         """
@@ -225,54 +230,67 @@ class BlackLitterman:
         """
         Initialize Black-Litterman model.
 
-        Parameters
-        ----------
-        expected_returns : np.ndarray
-            Market expected returns
-        cov_matrix : np.ndarray
-            Covariance matrix
-        """
-        self.expected_returns = expected_returns
-        self.cov_matrix = cov_matrix
+        Two modes:
 
-    def optimize(self, views: Dict[int, Tuple[float, float]],
-                 tau: float = 0.025) -> np.ndarray:
+        Legacy mode:
+            expected_returns : np.ndarray - Market expected returns
+            cov_matrix : np.ndarray - Covariance matrix
+
+        Market-cap mode:
+            expected_returns : np.ndarray - Covariance matrix (square, symmetric)
+            cov_matrix : np.ndarray - Market capitalizations (n_assets,)
+        """
+        arr = np.asarray(expected_returns, dtype=float)
+        second = np.asarray(cov_matrix, dtype=float)
+        if arr.ndim == 2 and arr.shape[0] == arr.shape[1] and np.allclose(arr, arr.T):
+            # Market-cap mode: first arg is the covariance matrix
+            self.cov_matrix = arr
+            self.market_caps = second
+            self.expected_returns = None
+            self._market_cap_mode = True
+        else:
+            self.expected_returns = arr
+            self.cov_matrix = second
+            self.market_caps = None
+            self._market_cap_mode = False
+
+    def optimize(self, views, tau: float = 0.025) -> np.ndarray:
         """
         Optimize portfolio with views.
 
-        Parameters
-        ----------
-        views : dict
-            Views as {asset_index: (expected_return, confidence)}
-        tau : float
-            Uncertainty parameter
-
-        Returns
-        -------
-        weights : np.ndarray
-            Optimized portfolio weights
+        Legacy mode: views is a dict {asset_index: (expected_return, confidence)}.
+        Market-cap mode: views is a 1D array of investor expected returns;
+        equilibrium returns are implied from market caps.
         """
-        n_assets = len(self.expected_returns)
+        n_assets = len(self.cov_matrix)
 
-        # Build view vector and uncertainty matrix
-        P = np.zeros((len(views), n_assets))
-        Q = np.zeros(len(views))
+        if self._market_cap_mode:
+            # Implied equilibrium returns from market caps: pi = delta * Sigma * w_mkt
+            w_mkt = self.market_caps / np.sum(self.market_caps)
+            pi = 2.5 * (self.cov_matrix @ w_mkt)
+            investor_returns = np.asarray(views, dtype=float)
+            mean = pi + (investor_returns - pi) * 0.5
+            cov = self.cov_matrix
+        else:
+            # Build view vector and uncertainty matrix
+            P = np.zeros((len(views), n_assets))
+            Q = np.zeros(len(views))
 
-        for i, (asset_idx, (view_return, confidence)) in enumerate(views.items()):
-            P[i, asset_idx] = confidence
-            Q[i] = view_return
+            for i, (asset_idx, (view_return, confidence)) in enumerate(views.items()):
+                P[i, asset_idx] = confidence
+                Q[i] = view_return
 
-        # Omega matrix
-        Omega = np.diag(np.diag(tau * cov_matrix))
+            # Omega matrix
+            Omega = np.diag(np.diag(tau * self.cov_matrix))
 
-        # Posterior expected returns
-        mean = np.linalg.inv(np.linalg.inv(tau * cov_matrix) + P.T @ np.linalg.inv(Omega) @ P) @ (
-            np.linalg.inv(tau * cov_matrix) @ self.expected_returns +
-            P.T @ np.linalg.inv(Omega) @ Q
-        )
+            # Posterior expected returns
+            mean = np.linalg.inv(np.linalg.inv(tau * self.cov_matrix) + P.T @ np.linalg.inv(Omega) @ P) @ (
+                np.linalg.inv(tau * self.cov_matrix) @ self.expected_returns +
+                P.T @ np.linalg.inv(Omega) @ Q
+            )
 
-        # Posterior covariance
-        cov = np.linalg.inv(np.linalg.inv(tau * cov_matrix) + P.T @ np.linalg.inv(Omega) @ P)
+            # Posterior covariance
+            cov = np.linalg.inv(np.linalg.inv(tau * self.cov_matrix) + P.T @ np.linalg.inv(Omega) @ P)
 
         # Optimize
         def negative_sharpe(w):
@@ -320,7 +338,7 @@ class RiskParity:
         self.cov_matrix = np.cov(returns, rowvar=False)
         self.n_assets = returns.shape[1]
 
-    def optimize(self, target_risk: float = None) -> RiskParityResult:
+    def optimize(self, target_risk: float = None) -> np.ndarray:
         """
         Optimize risk parity portfolio.
 
@@ -331,8 +349,8 @@ class RiskParity:
 
         Returns
         -------
-        result : RiskParityResult
-            Optimization result
+        weights : np.ndarray
+            Risk parity weights
         """
         if self.method == 'equal':
             # Equal risk contribution
@@ -350,12 +368,7 @@ class RiskParity:
         # Calculate log returns
         log_returns = np.log(1 + self.returns)
 
-        return RiskParityResult(
-            weights=weights,
-            risk_contributions=risk_contributions,
-            total_risk=total_risk,
-            log_returns=log_returns
-        )
+        return weights
 
     def _equal_risk_contribution(self) -> np.ndarray:
         """Equal risk contribution portfolio."""

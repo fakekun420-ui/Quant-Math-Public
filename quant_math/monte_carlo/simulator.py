@@ -7,6 +7,7 @@ Unified Monte Carlo simulation for backtest robustness testing and risk assessme
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from quant_math.core.types import StrategyResult, MonteCarloResult
 
@@ -64,6 +65,15 @@ class MonteCarloSimulator:
         n_iter = n_iterations or self.config.n_iterations
         conf = confidence_level or self.config.confidence_level
         meth = method or self.config.method
+
+        # Accept either a StrategyResult or a raw list/array of trade PnLs
+        if isinstance(result, (list, tuple, np.ndarray)):
+            result = SimpleNamespace(
+                hypothesis_id="direct_pnls",
+                trades=[{"pnl": float(p)} for p in result],
+                total_return=float(np.mean(result)) if len(result) else 0.0,
+                total_trades=len(result),
+            )
 
         if not result.trades or len(result.trades) == 0:
             return MonteCarloResult(

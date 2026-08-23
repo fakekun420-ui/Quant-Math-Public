@@ -29,10 +29,20 @@ class ExchangeAPI:
 
         Args:
             exchange_id: Exchange identifier (e.g., 'binance', 'bybit')
+                or 'synthetic' for offline/simulated mode
             api_key: API key (optional)
             api_secret: API secret (optional)
             sandbox: Use testnet/sandbox environment
         """
+        self.exchange = None
+        self.exchange_id = exchange_id
+
+        if exchange_id == 'synthetic':
+            # Offline / simulated mode: no real exchange connection.
+            # Data must be provided via generate_synthetic_data().
+            logger.info("Initialized synthetic (offline) exchange mode")
+            return
+
         exchange_class = getattr(ccxt, exchange_id)
 
         exchange_config = {
@@ -51,7 +61,6 @@ class ExchangeAPI:
             exchange_config['sandbox'] = True
 
         self.exchange = exchange_class(exchange_config)
-        self.exchange_id = exchange_id
 
         logger.info(f"Initialized {exchange_id} exchange connection")
 

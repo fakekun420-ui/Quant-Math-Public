@@ -6,6 +6,8 @@ Autonomous Quant Discovery Engine domain from implementation details.
 Domain contracts are used by adapters to communicate with the domain core.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum

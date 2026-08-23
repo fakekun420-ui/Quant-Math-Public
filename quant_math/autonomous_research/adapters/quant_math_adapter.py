@@ -6,6 +6,8 @@ KnowledgeBase, BacktestEngine, etc.) by wrapping existing quant-math
 components.
 """
 
+from __future__ import annotations
+
 import sys
 import os
 from datetime import datetime
@@ -354,14 +356,15 @@ class QuantMathAdapter:
 
     # BacktestEngine Implementation
 
-    def run_backtest(self, hypothesis, data: Dict[str, Any],
+    def run_backtest(self, hypothesis, data: Dict[str, Any] = None,
                     initial_capital: float = 100000.0) -> Any:
         """
         Run backtest using quant-math backtester.
 
         Args:
             hypothesis: Hypothesis dict with 'hypothesis_id' or strategy config
-            data: Market data from fetch_market_data
+            data: Market data from fetch_market_data. If omitted, synthetic
+                  OHLCV data is generated for offline / dry-run usage.
             initial_capital: Starting capital
 
         Returns:
@@ -369,6 +372,14 @@ class QuantMathAdapter:
         """
         if not HAS_QUANT_MATH:
             raise ValueError("Backtester not available")
+
+        if data is None:
+            symbol = "BTC/USDT"
+            if isinstance(hypothesis, dict):
+                symbol = hypothesis.get('symbol', hypothesis.get('asset', symbol))
+            elif hasattr(hypothesis, 'symbol') and getattr(hypothesis, 'symbol'):
+                symbol = hypothesis.symbol
+            data = self.generate_synthetic_data(symbol, n_candles=1000)
 
         df = data["data"]
         symbol = data["symbol"]

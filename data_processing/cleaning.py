@@ -42,10 +42,9 @@ class DataCleaner:
         logger.info(f"Found {df_clean.isnull().sum().sum()} missing values")
 
         if method == 'ffill':
-            df_clean = df_clean.fillna(method='ffill')
-            df_clean = df_clean.fillna(method='bfill')
+            df_clean = df_clean.ffill().bfill()
         elif method == 'bfill':
-            df_clean = df_clean.fillna(method='bfill')
+            df_clean = df_clean.bfill()
         elif method == 'mean':
             df_clean = df_clean.fillna(df_clean.mean())
         elif method == 'median':

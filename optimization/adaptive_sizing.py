@@ -5,24 +5,43 @@ import numpy as np
 class AdaptiveSizer:
     """Adaptive position sizing based on market conditions."""
 
-    @staticmethod
-    def calculate(new_position: float, current_portfolio: float,
-                  volatility: float, trend_strength: float = 0.5) -> float:
+    def calculate(self, new_position: float = None, current_portfolio: float = None,
+                  volatility: float = None, trend_strength: float = 0.5, *,
+                  portfolio_value: float = None, risk_per_trade: float = None,
+                  stop_loss_distance: float = None,
+                  kelly_fraction: float = None) -> float:
         """
         Calculate adaptive position size.
 
-        Parameters:
-        -----------
-        new_position : float
-        current_portfolio : float
-        volatility : float
-        trend_strength : float
+        Supports two modes:
 
-        Returns:
-        --------
+        Risk-based mode (keyword args):
+            portfolio_value : float - Total portfolio value
+            risk_per_trade : float - Fraction of portfolio to risk per trade
+            stop_loss_distance : float - Relative distance to stop loss
+            kelly_fraction : float - Kelly criterion fraction (confidence scale)
+
+        Volatility/trend mode (positional args):
+            new_position : float
+            current_portfolio : float
+            volatility : float
+            trend_strength : float
+
+        Returns
+        -------
         float
             Adaptive position size
         """
+        if portfolio_value is not None:
+            # Risk-based sizing mode
+            risk_capital = portfolio_value * (risk_per_trade if risk_per_trade else 0.02)
+            base_units = risk_capital / stop_loss_distance if stop_loss_distance else 0.0
+            if kelly_fraction is not None:
+                kelly_scale = max(0.0, min(1.0, kelly_fraction / 0.25))
+                base_units *= kelly_scale
+            return max(0.0, base_units)
+
+        # Legacy volatility/trend sizing mode
         base_size = new_position
 
         # Adjust based on volatility (inverse relationship)

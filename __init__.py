@@ -12,21 +12,25 @@ Implemented Modules:
 - Module 13: Algorithmic Trading (algo_trading/)
 - Module 14: Backtesting & Evaluation (backtesting/)
 
-Remaining Modules (1-7): Architecture defined but not yet implemented
+The quant_math/ package contains the newer refactored architecture
+(core, expectation, risk, monte_carlo, autonomous_research/AQDE).
 """
+
+from __future__ import annotations
 
 __version__ = "0.1.0"
 __author__ = "QUANT-MATH Team"
 __all__ = [
     # Expectation Calculation (Module 8)
-    'ExpectationCalculator',
+    'ReturnCalculator',
+    'ExpectationCalculator',  # backwards-compat alias of ReturnCalculator
     'DrawdownAnalyzer',
     'SharpeMetrics',
+    'StatisticalTests',
 
     # Risk Management (Module 9)
     'PositionSizer',
     'StopLoss',
-    'RiskManager',
     'ValueAtRisk',
     'ExpectedShortfall',
 
@@ -36,12 +40,15 @@ __all__ = [
     'AdaptiveSizer',
 
     # Execution Engine (Module 11)
-    'OrderExecutor',
-    'OrderTypes',
-    'OrderRouting',
+    'ExchangeManager',
+    'OrderType',
+    'Order',
+    'OrderRouter',
 
     # Order Management (Module 12)
     'OrderManager',
+    'OrderBook',
+    'ExecutionReport',
     'SlippageModel',
     'ExecutionStrategy',
     'TransactionCostModel',
@@ -56,15 +63,38 @@ __all__ = [
     # Backtesting & Evaluation (Module 14)
     'Backtester',
     'PerformanceMetrics',
+    'WalkForwardValidator',
+    'WalkForwardResult',
     'BacktestResult',
     'Trade',
 ]
 
 # Import aliases for backwards compatibility
-from expectation import ExpectationCalculator, DrawdownAnalyzer, SharpeMetrics
-from risk import PositionSizer, StopLoss, RiskManager, ValueAtRisk, ExpectedShortfall
+from expectation import (
+    ReturnCalculator,
+    DrawdownAnalyzer,
+    SharpeMetrics,
+    StatisticalTests,
+)
+ExpectationCalculator = ReturnCalculator
+
+from risk import PositionSizer, StopLoss, ValueAtRisk, ExpectedShortfall
 from optimization import KellyCriterion, MeanVarianceOptimizer, AdaptiveSizer
-from execution import OrderExecutor, OrderTypes, OrderRouting
-from order_management import OrderManager, SlippageModel, ExecutionStrategy, TransactionCostModel
+from execution import ExchangeManager, OrderType, Order, OrderRouter
+from order_management import (
+    OrderManager,
+    OrderBook,
+    ExecutionReport,
+    SlippageModel,
+    ExecutionStrategy,
+    TransactionCostModel,
+)
 from algo_trading import TWAP, VWAP, POV, AlgoTradingSystem, AlgoExecution
-from backtesting import Backtester, PerformanceMetrics, BacktestResult, Trade
+from backtesting import (
+    Backtester,
+    PerformanceMetrics,
+    WalkForwardValidator,
+    WalkForwardResult,
+    BacktestResult,
+    Trade,
+)

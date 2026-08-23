@@ -92,34 +92,48 @@ class SlippageModel:
         return slippage
 
     @staticmethod
-    def realized_slippage(order: Order, executed_price: float) -> float:
+    def realized_slippage(order, executed_price: float = None,
+                          quantity: float = 0.0) -> float:
         """
         Calculate realized slippage.
 
-        Parameters
-        ----------
-        order : Order
-            Original order
-        executed_price : float
-            Price at which order was executed
+        Two modes:
+
+        Order mode (legacy):
+            order : Order - Original order
+            executed_price : float - Price at which order was executed
+
+        Price mode (returns dollar cost):
+            order : float - Expected/reference price
+            executed_price : float - Actual execution price
+            quantity : float - Executed quantity
 
         Returns
         -------
         slippage : float
-            Realized slippage in percentage
+            Realized slippage (percentage in order mode,
+            dollar cost in price mode)
         """
-        if order.order_type == 'market':
-            if order.last_price is None:
+        if isinstance(order, Order):
+            if order.order_type == 'market':
+                if order.last_price is None:
+                    return 0.0
+                slippage = (executed_price - order.last_price) / order.last_price * 100
+                return slippage
+            elif order.order_type in ['limit', 'stop']:
+                if order.price is None:
+                    return 0.0
+                slippage = (executed_price - order.price) / order.price * 100
+                return slippage
+            else:
                 return 0.0
-            slippage = (executed_price - order.last_price) / order.last_price * 100
-            return slippage
-        elif order.order_type in ['limit', 'stop']:
-            if order.price is None:
-                return 0.0
-            slippage = (executed_price - order.price) / order.price * 100
-            return slippage
-        else:
+
+        # Price mode: expected_price, executed_price, quantity -> dollar cost
+        expected_price = order
+        if not expected_price:
             return 0.0
+        slippage_pct = (executed_price - expected_price) / expected_price
+        return slippage_pct * expected_price * quantity
 
     @staticmethod
     def _update_last_price(order: Order, executed_price: float):
@@ -316,27 +330,48 @@ class ExecutionStrategy:
     """
 
     @staticmethod
-    def vwap_execution(order: Order, order_book: OrderBook,
-                       total_volume: int, num_chunks: int = 10) -> List[Order]:
+    def vwap_execution(order=None, order_book=None, total_volume: int = None,
+                       num_chunks: int = 10, symbol: str = None,
+                       total_quantity: float = None, time_horizon: int = None,
+                       price_data=None) -> List[Order]:
         """
         Execute order using VWAP (Volume Weighted Average Price) strategy.
 
-        Parameters
-        ----------
-        order : Order
-            Order to execute
-        order_book : OrderBook
-            Current order book
-        total_volume : int
-            Total volume to execute
-        num_chunks : int
-            Number of execution chunks
+        Two call styles:
 
-        Returns
-        -------
-        chunks : List[Order]
-            Individual execution chunks
+        Order-based (legacy):
+            vwap_execution(order, order_book, total_volume, num_chunks)
+
+        Data-driven:
+            vwap_execution(symbol=..., total_quantity=...,
+                           time_horizon=..., price_data=np.ndarray)
         """
+        if isinstance(order, dict) or (symbol is not None and order is None):
+            # Data-driven mode
+            params = order if isinstance(order, dict) else {}
+            sym = symbol or params.get("symbol", "UNKNOWN")
+            qty = total_quantity if total_quantity is not None else params.get("total_quantity", 0.0)
+            horizon = time_horizon if time_horizon is not None else params.get("time_horizon", 3600)
+            prices = np.asarray(price_data if price_data is not None else params.get("price_data", []), dtype=float)
+            n_chunks = max(1, min(num_chunks, int(horizon // 60) if horizon >= 60 else num_chunks))
+            chunk_qty = qty / n_chunks
+            chunks = []
+            for i in range(n_chunks):
+                px = prices[min(i * max(1, len(prices) // n_chunks), len(prices) - 1)] if len(prices) else None
+                chunks.append(Order(
+                    order_id=f"VWAP-{i:04d}",
+                    symbol=sym,
+                    side='buy',
+                    quantity=chunk_qty,
+                    order_type='market',
+                    status='pending',
+                    price=px
+                ))
+            return chunks
+
+        if hasattr(order, 'quantity'):
+            total_volume = order.quantity if total_volume is None else total_volume
+
         chunks = []
         chunk_size = total_volume // num_chunks
 
@@ -398,33 +433,41 @@ class TransactionCostModel:
     Estimates transaction costs including commission and slippage.
     """
 
-    @staticmethod
-    def total_cost(order: Order, executed_price: float,
-                   market_vol: float) -> Tuple[float, float, float]:
+    def total_cost(order=None, executed_price: float = None,
+                   market_vol: float = None, order_value: float = None,
+                   slippage: float = 0.0, commission_rate: float = 0.001):
         """
         Calculate total transaction cost.
 
-        Parameters
-        ----------
-        order : Order
-            Order details
-        executed_price : float
-            Execution price
-        market_vol : float
-            Market volume
+        Two modes:
+
+        Order mode (legacy, returns tuple):
+            order : Order - Order details
+            executed_price : float - Execution price
+            market_vol : float - Market volume
+
+        Value mode (returns float):
+            order_value : float - Notional value of the order
+            slippage : float - Slippage cost in dollars
+            commission_rate : float - Commission rate (min $1 applies)
 
         Returns
         -------
-        total_cost : float
+        total_cost : float / tuple
         commission : float
         slippage : float
         """
+        if order_value is not None:
+            # Value mode: single total cost in dollars
+            commission = max(1.0, order_value * commission_rate)
+            return commission + (slippage or 0.0)
+
         trade_value = order.quantity * executed_price
         slippage_pct = SlippageModel.realized_slippage(order, executed_price)
-        slippage = trade_value * slippage_pct / 100
+        slippage_cost = trade_value * slippage_pct / 100
 
         commission = max(1.0, trade_value * 0.001)
 
-        total_cost = trade_value + commission + slippage
+        total_cost = trade_value + commission + slippage_cost
 
-        return total_cost, commission, slippage
+        return total_cost, commission, slippage_cost

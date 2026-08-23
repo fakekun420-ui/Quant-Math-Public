@@ -6,8 +6,10 @@ deployed to perform specific research tasks. Supports dynamic registration
 and agent communication.
 """
 
+from __future__ import annotations
+
 import uuid
-from typing import Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 from datetime import datetime
 
 from ..interfaces import Agent, AgentMessage

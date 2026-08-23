@@ -37,6 +37,17 @@ class PortfolioRiskResult:
     concentration_risk: float
     correlations: Dict[str, float]
 
+    def get(self, key: str, default=None):
+        """Dict-like access to result fields (e.g. 'var_95' -> total_var)."""
+        aliases = {
+            'var_95': 'total_var',
+            'var_99': 'total_var',
+            'expected_shortfall': 'total_expected_shortfall',
+            'concentration': 'concentration_risk',
+        }
+        name = aliases.get(key, key)
+        return getattr(self, name, default)
+
 
 class ValueAtRisk:
     """
@@ -57,29 +68,36 @@ class ValueAtRisk:
         self.confidence_level = confidence_level
         self.alpha = 1 - confidence_level
     
-    def parametric_normal(self, returns: np.ndarray) -> VaRResult:
+    def parametric_normal(self, returns=None, volatility: float = None,
+                          confidence_level: float = 0.95) -> Any:
         """
         Parametric VaR (assuming normal distribution).
-        
+
         Formula: VaR = mu - z_alpha * sigma
         where z_alpha = inv_norm(1 - alpha)
-        
-        Parameters
-        ----------
-        returns : np.ndarray
-            Historical returns
-        
-        Returns
-        -------
-        result : VaRResult
-            VaR calculation result
+
+        Two call styles:
+
+        Instance style:
+            ValueAtRisk(0.95).parametric_normal(returns) -> VaRResult
+
+        Class style (returns VaR in dollars):
+            ValueAtRisk.parametric_normal(portfolio_value, std, 0.95) -> float
         """
+        if not isinstance(self, ValueAtRisk):
+            # Class-style call: (portfolio_value, volatility, confidence_level)
+            portfolio_value = self
+            vol = returns if volatility is None else volatility
+            conf = volatility if volatility is not None else confidence_level
+            z_alpha = stats.norm.ppf(conf)
+            return float(abs(portfolio_value * z_alpha * vol))
+
         mu = np.mean(returns)
         sigma = np.std(returns)
         z_alpha = stats.norm.ppf(1 - self.alpha)
-        
+
         var = mu - z_alpha * sigma
-        
+
         return VaRResult(
             value_at_risk=var,
             confidence_level=self.confidence_level,
@@ -118,21 +136,32 @@ class ValueAtRisk:
             distribution="student_t"
         )
     
-    def historical(self, returns: np.ndarray) -> VaRResult:
+    def historical(self, returns=None, confidence: float = None,
+                   confidence_level: float = None, **kwargs) -> Any:
         """
         Historical VaR (empirical method).
-        
-        Parameters
-        ----------
-        returns : np.ndarray
-            Historical returns
-        
-        Returns
-        -------
-        result : VaRResult
-            VaR calculation result
+
+        Two call styles:
+
+        Instance style:
+            ValueAtRisk(0.99).historical(returns) -> VaRResult
+
+        Class style (returns VaR as a fraction of portfolio value):
+            ValueAtRisk.historical(returns, confidence=0.95) -> float
         """
-        var = np.percentile(returns, self.alpha * 100)
+        if not isinstance(self, ValueAtRisk):
+            # Class-style call: first positional arg is the returns array
+            arr = np.asarray(self, dtype=float)
+            conf = confidence if confidence is not None else (
+                confidence_level if confidence_level is not None else 0.95)
+            alpha = 1 - conf
+            return float(np.percentile(arr, alpha * 100))
+
+        if returns is None:
+            raise ValueError("returns array required")
+
+        arr = np.asarray(returns, dtype=float)
+        alpha = self.alpha
         
         return VaRResult(
             value_at_risk=var,
@@ -192,24 +221,37 @@ class ExpectedShortfall:
         self.confidence_level = confidence_level
         self.alpha = 1 - confidence_level
     
-    def historical(self, returns: np.ndarray) -> float:
+    def historical(self, returns=None, confidence: float = None,
+                   confidence_level: float = None) -> Any:
         """
         Historical ES calculation.
-        
-        Parameters
-        ----------
-        returns : np.ndarray
-            Historical returns
-        
-        Returns
-        -------
-        es : float
-            Expected Shortfall
+
+        Two call styles:
+
+        Instance style:
+            ExpectedShortfall(0.95).historical(returns) -> float
+
+        Class style (returns ES as a fraction of portfolio value):
+            ExpectedShortfall.historical(returns, confidence=0.95) -> float
         """
+        if not isinstance(self, ExpectedShortfall):
+            # Class-style call: first positional arg is the returns array
+            arr = np.asarray(self, dtype=float)
+            conf = confidence if confidence is not None else (
+                confidence_level if confidence_level is not None else 0.95)
+            alpha = 1 - conf
+            var = np.percentile(arr, alpha * 100)
+            tail = arr[arr <= var]
+            return float(np.mean(tail)) if len(tail) else float(var)
+
+        if returns is None:
+            raise ValueError("returns array required")
+
         alpha = self.alpha
-        var = np.percentile(returns, alpha * 100)
-        es = np.mean(returns[returns <= var])
-        
+        arr = np.asarray(returns, dtype=float)
+        var = np.percentile(arr, alpha * 100)
+        es = np.mean(arr[arr <= var])
+
         return es
     
     def parametric_normal(self, returns: np.ndarray) -> float:
@@ -290,33 +332,69 @@ class PortfolioRisk:
     def __init__(self, returns: np.ndarray, weights: np.ndarray):
         """
         Initialize portfolio risk analyzer.
-        
-        Parameters
-        ----------
-        returns : np.ndarray
-            Asset returns (n_observations x n_assets)
-        weights : np.ndarray
-            Portfolio weights (n_assets,)
+
+        Supports two modes:
+
+        Returns mode (legacy):
+            returns : np.ndarray - Asset returns (n_observations x n_assets)
+            weights : np.ndarray - Portfolio weights (n_assets,)
+
+        Covariance mode:
+            returns : np.ndarray - Covariance matrix (n_assets x n_assets,
+                       square and symmetric) or scalar proxy
+            weights : np.ndarray - Portfolio weights (n_assets,)
         """
-        self.returns = returns
         self.weights = weights
         self.n_assets = len(weights)
-        
-        # Compute portfolio statistics
-        self.portfolio_returns = returns @ weights
-        self.portfolio_mean = np.mean(self.portfolio_returns)
-        self.portfolio_std = np.std(self.portfolio_returns)
-        
-        # Compute covariance matrix
-        self.cov_matrix = np.cov(returns, rowvar=False)
-        
-        # Compute correlations
-        self.correlations = np.zeros((self.n_assets, self.n_assets))
-        for i in range(self.n_assets):
-            for j in range(self.n_assets):
-                self.correlations[i, j] = self.cov_matrix[i, j] / (
-                    np.sqrt(self.cov_matrix[i, i]) * np.sqrt(self.cov_matrix[j, j])
-                )
+
+        arr = np.asarray(returns, dtype=float)
+        is_covariance = (
+            arr.ndim == 2 and arr.shape[0] == arr.shape[1]
+            and arr.shape[0] == self.n_assets
+            and np.allclose(arr, arr.T)
+            and not np.allclose(np.cov(arr, rowvar=False), arr)
+        ) if arr.ndim == 2 and arr.shape[0] > 1 else False
+
+        # Single-asset covariance proxies like [[var]] are treated as covariance mode
+        if arr.ndim == 2 and arr.shape == (1, 1):
+            is_covariance = True
+
+        if is_covariance:
+            # Covariance mode: precomputed risk inputs, no raw observations
+            self.returns_mode = "covariance"
+            self.returns = None
+            self.cov_matrix = arr
+            self.portfolio_returns = None
+            self.portfolio_variance = float(weights @ arr @ weights)
+            self.portfolio_mean = 0.0
+            self.portfolio_std = float(np.sqrt(max(self.portfolio_variance, 0.0)))
+            self.correlations = self._correlations_from_cov(self.cov_matrix)
+        else:
+            self.returns_mode = "returns"
+            self.returns = arr
+
+            # Compute portfolio statistics
+            self.portfolio_returns = arr @ weights
+            self.portfolio_mean = np.mean(self.portfolio_returns)
+            self.portfolio_std = np.std(self.portfolio_returns)
+
+            # Compute covariance matrix
+            self.cov_matrix = np.cov(arr, rowvar=False)
+
+            # Compute correlations
+            self.correlations = np.zeros((self.n_assets, self.n_assets))
+            for i in range(self.n_assets):
+                for j in range(self.n_assets):
+                    self.correlations[i, j] = self.cov_matrix[i, j] / (
+                        np.sqrt(self.cov_matrix[i, i]) * np.sqrt(self.cov_matrix[j, j])
+                    )
+
+    @staticmethod
+    def _correlations_from_cov(cov: np.ndarray) -> np.ndarray:
+        """Derive the correlation matrix from a covariance matrix."""
+        std = np.sqrt(np.diag(cov))
+        std[std == 0] = 1.0
+        return cov / np.outer(std, std)
     
     def calculate_component_var(self, returns: np.ndarray, weights: np.ndarray,
                                  confidence_level: float = 0.95) -> Dict[str, float]:
@@ -420,7 +498,26 @@ class PortfolioRisk:
         """
         # VaR calculations
         es = ExpectedShortfall(confidence_level)
-        
+
+        if self.returns_mode == "covariance":
+            # Parametric-only mode from a precomputed covariance matrix
+            z = stats.norm.ppf(1 - confidence_level)
+            total_var = abs(z) * self.portfolio_std
+            total_es = (stats.norm.pdf(stats.norm.ppf(confidence_level))
+                        / (1 - confidence_level)) * self.portfolio_std
+            hhi = float(np.sum(np.asarray(self.weights) ** 2))
+            return PortfolioRiskResult(
+                total_var=total_var,
+                total_expected_shortfall=total_es,
+                component_var={f"asset_{i}": total_var * w
+                               for i, w in enumerate(self.weights)},
+                component_es={f"asset_{i}": total_es * w
+                              for i, w in enumerate(self.weights)},
+                diversification_benefit=1.0 - hhi,
+                concentration_risk=hhi,
+                correlations=self.correlations
+            )
+
         var_parametric = ValueAtRisk(confidence_level).parametric_normal(self.portfolio_returns)
         var_historical = ValueAtRisk(confidence_level).historical(self.portfolio_returns)
         var_es = ValueAtRisk(confidence_level).conditional_tail_expectation(self.portfolio_returns)
@@ -590,33 +687,39 @@ class StressTesting:
     Tests portfolio performance under extreme scenarios.
     """
     
-    def __init__(self, returns: np.ndarray):
+    def __init__(self, returns: np.ndarray = None):
         """
         Initialize stress tester.
-        
+
         Parameters
         ----------
-        returns : np.ndarray
-            Asset returns
+        returns : np.ndarray, optional
+            Asset returns (may also be provided per-call in historical_scenarios)
         """
         self.returns = returns
-    
-    def historical_scenarios(self, n_scenarios: int = 100) -> np.ndarray:
+
+    def historical_scenarios(self, data: np.ndarray = None,
+                             n_scenarios: int = 100) -> np.ndarray:
         """
         Generate historical scenarios (bootstrap).
-        
+
         Parameters
         ----------
+        data : np.ndarray, optional
+            Returns to bootstrap (defaults to constructor returns)
         n_scenarios : int
             Number of scenarios to generate
-        
+
         Returns
         -------
         scenarios : np.ndarray
             Historical scenarios
         """
-        n_obs = len(self.returns)
-        scenarios = np.random.choice(self.returns, size=(n_scenarios, n_obs))
+        source = data if data is not None else self.returns
+        if source is None:
+            raise ValueError("returns required (constructor or argument)")
+        n_obs = len(source)
+        scenarios = np.random.choice(source, size=(n_scenarios, n_obs))
         return scenarios
     
     def industry_scenarios(self, multiplier: float = 1.5) -> np.ndarray:

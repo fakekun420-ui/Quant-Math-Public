@@ -36,39 +36,55 @@ class TWAP:
     Splits order into equal time chunks for smooth execution.
     """
 
-    def __init__(self, time_chunks: int = 10, execution_delay: float = 1.0):
+    def __init__(self, time_chunks: int = 10, execution_delay: float = 1.0,
+                 total_quantity: float = None, time_horizon: int = None):
         """
         Initialize TWAP algorithm.
 
-        Parameters
-        ----------
-        time_chunks : int
-            Number of execution time chunks
-        execution_delay : float
-            Time delay between chunks (seconds)
+        Two modes:
+
+        Order-based (legacy):
+            time_chunks : int
+            execution_delay : float
+
+        Data-driven simulation:
+            total_quantity : float - Total quantity to execute
+            time_horizon : int - Execution horizon in seconds
         """
         self.time_chunks = time_chunks
         self.execution_delay = execution_delay
+        self.total_quantity = total_quantity
+        self.time_horizon = time_horizon
 
-    def execute(self, order: Order, order_manager: OrderManager,
-                market_price: float) -> AlgoExecution:
+    def execute(self, order=None, order_manager: "OrderManager" = None,
+                market_price: float = None, price_data=None,
+                current_price: float = None, **kwargs):
         """
-        Execute order using TWAP.
+        Execute using TWAP.
 
-        Parameters
-        ----------
-        order : Order
-            Order to execute
-        order_manager : OrderManager
-            Order manager instance
-        market_price : float
-            Current market price
-
-        Returns
-        -------
-        execution : AlgoExecution
-            Execution results
+        Order-based mode: execute(order, order_manager, market_price) -> AlgoExecution
+        Data-driven mode: execute(price_data=..., current_price=...) -> list of slices
         """
+        if price_data is not None or isinstance(order, np.ndarray) or (
+                order is not None and not hasattr(order, 'quantity')):
+            # Data-driven simulation mode
+            prices = np.asarray(price_data if price_data is not None else order,
+                                dtype=float)
+            n_slices = max(1, min(len(prices), int((self.time_horizon or 3600) // 60)))
+            slice_qty = self.total_quantity / n_slices
+            ref_price = current_price if current_price is not None else prices[0]
+            slices = []
+            for i in range(n_slices):
+                px = prices[min(i * max(1, len(prices) // n_slices), len(prices) - 1)]
+                slices.append({
+                    "slice": i + 1,
+                    "symbol": kwargs.get("symbol", "UNKNOWN"),
+                    "quantity": slice_qty,
+                    "price": float(px),
+                    "deviation_pct": (px - ref_price) / ref_price * 100,
+                })
+            return slices
+
         chunk_size = order.quantity // self.time_chunks
         executed_volume = 0
         total_slippage = 0
@@ -116,23 +132,70 @@ class VWAP:
     Splits order based on expected market volume profile.
     """
 
-    def __init__(self, execution_time: int = 60, interval: int = 1):
+    def __init__(self, execution_time: int = 60, interval: int = 1,
+                 total_quantity: float = None, time_horizon: int = None):
         """
         Initialize VWAP algorithm.
 
-        Parameters
-        ----------
-        execution_time : int
-            Total execution time in minutes
-        interval : int
-            Execution interval in minutes
+        Two modes:
+
+        Order-based (legacy):
+            execution_time : int - Total execution time in minutes
+            interval : int - Execution interval in minutes
+
+        Data-driven simulation:
+            total_quantity : float - Total quantity to execute
+            time_horizon : int - Execution horizon in seconds
         """
         self.execution_time = execution_time
         self.interval = interval
-        self.time_points = np.linspace(0, execution_time, int(execution_time / interval))
+        if execution_time and interval:
+            self.time_points = np.linspace(0, execution_time, max(1, int(execution_time / interval)))
+        else:
+            self.time_points = None
+        self.total_quantity = total_quantity
+        self.time_horizon = time_horizon
 
-    def execute(self, order: Order, order_manager: OrderManager,
-                market_price: float, market_vol_profile: List[float] = None) -> AlgoExecution:
+    def execute(self, order=None, order_manager: "OrderManager" = None,
+                market_price: float = None,
+                market_vol_profile: List[float] = None,
+                price_data=None, volume_data=None,
+                current_price: float = None, **kwargs):
+        """
+        Execute using VWAP.
+
+        Order-based mode: execute(order, order_manager, market_price) -> AlgoExecution
+        Data-driven mode: execute(price_data=..., volume_data=..., current_price=...) -> list of slices
+        """
+        if price_data is not None or isinstance(order, np.ndarray) or (
+                order is not None and not hasattr(order, 'quantity')):
+            prices = np.asarray(price_data if price_data is not None else order,
+                                dtype=float)
+            volumes = np.asarray(
+                volume_data if volume_data is not None else market_vol_profile,
+                dtype=float)
+            n_slices = max(1, min(len(prices), int((self.time_horizon or 3600) // 60)))
+            ref_price = current_price if current_price is not None else prices[0]
+            weights = volumes / volumes.sum() if volumes.sum() > 0 else np.full(len(prices), 1 / len(prices))
+            slices = []
+            for i in range(n_slices):
+                idx = min(i * max(1, len(prices) // n_slices), len(prices) - 1)
+                px = prices[idx]
+                qty = self.total_quantity * weights[idx] * n_slices
+                slices.append({
+                    "slice": i + 1,
+                    "symbol": kwargs.get("symbol", "UNKNOWN"),
+                    "quantity": float(qty),
+                    "price": float(px),
+                    "deviation_pct": (px - ref_price) / ref_price * 100,
+                })
+            return slices
+
+        return self._execute_order_based(order, order_manager, market_price, market_vol_profile)
+
+    def _execute_order_based(self, order: Order, order_manager: OrderManager,
+                             market_price: float,
+                             market_vol_profile: List[float] = None) -> AlgoExecution:
         """
         Execute order using VWAP.
 
@@ -204,22 +267,66 @@ class POV:
     Splits order based on available market volume percentage.
     """
 
-    def __init__(self, volume_pct: float = 0.2, max_slippage: float = 0.01):
+    def __init__(self, volume_pct: float = 0.2, max_slippage: float = 0.01,
+                 total_quantity: float = None, participation_rate: float = None):
         """
         Initialize POV algorithm.
 
-        Parameters
-        ----------
-        volume_pct : float
-            Target volume as percentage of market volume (20% default)
-        max_slippage : float
-            Maximum acceptable slippage (1% default)
+        Two modes:
+
+        Order-based (legacy):
+            volume_pct : float - Target volume as percentage (0-1)
+            max_slippage : float
+
+        Data-driven simulation:
+            total_quantity : float
+            participation_rate : float - Fraction of market volume per slice
         """
         self.volume_pct = volume_pct
         self.max_slippage = max_slippage
+        self.total_quantity = total_quantity
+        self.participation_rate = participation_rate if participation_rate is not None else volume_pct
 
-    def execute(self, order: Order, order_manager: OrderManager,
-                market_price: float, available_volume: float) -> AlgoExecution:
+    def execute(self, order=None, order_manager: "OrderManager" = None,
+                market_price: float = None, available_volume: float = None,
+                price_data=None, volume_data=None,
+                current_price: float = None, **kwargs):
+        """
+        Execute using POV.
+
+        Order-based mode: execute(order, order_manager, market_price, available_volume) -> AlgoExecution
+        Data-driven mode: execute(price_data=..., volume_data=..., current_price=...) -> list of slices
+        """
+        if price_data is not None or isinstance(order, np.ndarray) or (
+                order is not None and not hasattr(order, 'quantity')):
+            prices = np.asarray(price_data if price_data is not None else order,
+                                dtype=float)
+            volumes = np.asarray(
+                volume_data if volume_data is not None else available_volume,
+                dtype=float)
+            ref_price = current_price if current_price is not None else prices[0]
+            remaining = self.total_quantity
+            slices = []
+            i = 0
+            while remaining > 1e-12 and i < len(prices):
+                market_vol = volumes[i] if len(volumes) else 100.0
+                qty = min(remaining, market_vol * self.participation_rate)
+                px = prices[i]
+                slices.append({
+                    "slice": i + 1,
+                    "symbol": kwargs.get("symbol", "UNKNOWN"),
+                    "quantity": float(qty),
+                    "price": float(px),
+                    "deviation_pct": (px - ref_price) / ref_price * 100,
+                })
+                remaining -= qty
+                i += 1
+            return slices
+
+        return self._execute_order_based(order, order_manager, market_price, available_volume)
+
+    def _execute_order_based(self, order: Order, order_manager: OrderManager,
+                             market_price: float, available_volume: float) -> AlgoExecution:
         """
         Execute order using POV.
 
@@ -294,14 +401,14 @@ class AlgoTradingSystem:
     Main orchestrator for algorithmic trading strategies.
     """
 
-    def __init__(self, order_manager: OrderManager):
+    def __init__(self, order_manager: OrderManager = None):
         """
         Initialize algo trading system.
 
         Parameters
         ----------
-        order_manager : OrderManager
-            Order manager instance
+        order_manager : OrderManager, optional
+            Order manager instance (created on demand if omitted)
         """
         self.order_manager = order_manager
         self.algos = {

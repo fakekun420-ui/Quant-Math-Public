@@ -57,7 +57,8 @@ class AQDERunner:
         lookback_days: int = 365,
         hypotheses_per_symbol: int = 15,
         feedback_iterations: int = 10,
-        dry_run: bool = False
+        dry_run: bool = False,
+        force_real_data: bool = False
     ):
         self.exchange_id = exchange_id
         self.knowledge_base_path = knowledge_base_path
@@ -67,6 +68,10 @@ class AQDERunner:
         self.lookback_days = lookback_days
         self.hypotheses_per_symbol = hypotheses_per_symbol
         self.feedback_iterations = feedback_iterations
+        # dry_run controls ONLY the execution mode convenience switches.
+        # force_real_data=True keeps market data REAL even when dry_run=True
+        # (used by the orchestrator: dry_run never means synthetic data).
+        self.force_real_data = force_real_data
         self.dry_run = dry_run
 
         # Initialize components
@@ -564,7 +569,7 @@ class AQDERunner:
         start_date = end_date - timedelta(days=self.lookback_days)
 
         print(f"\n  Fetching market data for {symbol} ({self.lookback_days} days, {self.timeframe})...")
-        if self.dry_run:
+        if self.dry_run and not self.force_real_data:
             market_data = self.adapter.generate_synthetic_data(symbol, n_candles=1000)
         else:
             market_data = self.adapter.fetch_market_data(symbol, start_date, end_date, self.timeframe)
@@ -590,13 +595,17 @@ class AQDERunner:
                 sharpe = getattr(result, "sharpe_ratio", 0)
                 sortino = getattr(result, "sortino_ratio", 0)
                 max_dd = getattr(result, "max_drawdown", 0)
+                total_return_pct = getattr(result, "total_return_pct", 0)
 
                 result_data = {
                     "hypothesis_id": hyp_id,
                     "symbol": symbol,
                     "n_trades": n_trades,
                     "win_rate": win_rate,
+                    # PnL absoluto en USD (final - initial), NO porcentaje
                     "total_return": total_return,
+                    # Cambio real de capital en % ((final-initial)/initial*100)
+                    "total_return_pct": total_return_pct,
                     "sharpe_ratio": sharpe,
                     "sortino_ratio": sortino,
                     "max_drawdown": max_dd,
@@ -604,7 +613,7 @@ class AQDERunner:
                 }
                 results.append(result_data)
 
-                print(f"    Trades: {n_trades}, Win Rate: {win_rate:.2f}%, Return: {total_return:.2f}%, Sharpe: {sharpe:.2f}")
+                print(f"    Trades: {n_trades}, Win Rate: {win_rate:.2f}%, Return: {total_return_pct:.2f}% (${total_return:,.2f}), Sharpe: {sharpe:.2f}")
 
             except Exception as e:
                 print(f"    Error: {e}")
@@ -628,7 +637,7 @@ class AQDERunner:
         # Fetch market data once
         end_date = datetime.now()
         start_date = end_date - timedelta(days=self.lookback_days)
-        if self.dry_run:
+        if self.dry_run and not self.force_real_data:
             market_data = self.adapter.generate_synthetic_data(symbol, n_candles=1000)
         else:
             market_data = self.adapter.fetch_market_data(symbol, start_date, end_date, self.timeframe)
@@ -1084,7 +1093,7 @@ class AQDERunner:
                 name = hyp.name if hyp else r['hypothesis_id']
                 print(f"  {i}. {name} ({r['symbol']})")
                 print(f"      Score: {r.get('final_score', 0):.2%}, Trades: {r['n_trades']}, "
-                      f"Win%: {r['win_rate']:.1f}%, Return: {r['total_return']:.2f}%, Sharpe: {r['sharpe_ratio']:.2f}")
+                      f"Win%: {r['win_rate']:.1f}%, Return: {r.get('total_return_pct', 0):.2f}%, Sharpe: {r['sharpe_ratio']:.2f}")
 
         # Save final comprehensive results
         final_output = {

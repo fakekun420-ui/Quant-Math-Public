@@ -174,6 +174,26 @@ class Normalizer:
             print(f"NORMALIZATION: {method.upper()}")
             print(f"{'='*60}")
 
+        if isinstance(df, np.ndarray):
+            arr = np.asarray(df, dtype=float).copy()
+            if method == 'zscore':
+                mean = np.nanmean(arr, axis=0)
+                std = np.nanstd(arr, axis=0)
+                std[std == 0] = 1.0
+                return (arr - mean) / std
+            elif method == 'minmax':
+                mn = np.nanmin(arr, axis=0)
+                mx = np.nanmax(arr, axis=0)
+                rng = np.where((mx - mn) == 0, 1.0, mx - mn)
+                return (arr - mn) / rng
+            elif method == 'robust':
+                median = np.nanmedian(arr, axis=0)
+                q75, q25 = np.nanpercentile(arr, [75, 25], axis=0)
+                iqr = np.where((q75 - q25) == 0, 1.0, q75 - q25)
+                return (arr - median) / iqr
+            else:
+                raise ValueError(f"Unknown normalization method: {method}")
+
         df_norm = df.copy()
 
         numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()

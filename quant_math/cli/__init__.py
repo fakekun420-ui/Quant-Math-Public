@@ -1,0 +1,1 @@
+"""Quant-Math interactive CLI."""

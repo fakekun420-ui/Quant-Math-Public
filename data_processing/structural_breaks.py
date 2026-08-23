@@ -128,6 +128,10 @@ class StructuralBreakDetector:
         Returns:
             Series indicating regime change points
         """
+        # Accept a plain 1D array of values as well as a DataFrame
+        if isinstance(df, np.ndarray):
+            df = pd.DataFrame({col: np.asarray(df, dtype=float)})
+
         regime_changes = pd.Series(False, index=df.index)
         prev_mean = df[col].iloc[0]
         prev_std = df[col].iloc[1:].std()

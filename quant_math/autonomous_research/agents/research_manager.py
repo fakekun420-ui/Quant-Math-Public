@@ -26,6 +26,7 @@ from ..interfaces import (
     StatisticalValidator,
     RiskManager,
 )
+from .agent_registry import AgentRegistry
 
 
 class ResearchPhase(Enum):
