@@ -1,0 +1,26 @@
+{
+  "state": "RUNNING",
+  "cycles_completed": 6,
+  "hypotheses_generated": 18,
+  "hypotheses_evaluated": 18,
+  "signals": 0,
+  "no_entry": 6,
+  "skipped_position": 0,
+  "paper_trades_taken": 0,
+  "started_at": 1787454871.008986,
+  "last_cycle_at": 1787455180.93504,
+  "config": {
+    "symbols": [
+      "BTC/USDT"
+    ],
+    "initial_capital": 10000.0,
+    "entry_pct": 0.05,
+    "timeframe": "1h",
+    "take_profit_pct": 0.02,
+    "lookback_days": 30,
+    "min_paper_trades": 3,
+    "hypotheses_per_cycle": 3,
+    "exchange_id": "bybit",
+    "mode": "paper"
+  }
+}

@@ -110,15 +110,38 @@ class RuntimeState:
         )
         self.process.start()
 
-    def stop(self, timeout: float = 30.0) -> bool:
-        if not self.running:
+    def stop(self, timeout: float = 25.0) -> bool:
+        if self.process is None:
+            return False
+        was_running = self.running
+        if not was_running and self.process.exitcode is not None:
             return False
         self.process.send_signal(signal.SIGINT)
-        self.process.join(timeout=timeout)
+        self.process.join(timeout=10)
         if self.process.is_alive():
             self.process.terminate()
             self.process.join(timeout=5)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(timeout=5)
+        self._force_stats_stopped()
         return True
+
+    def _force_stats_stopped(self):
+        """Best-effort: reflect STOPPED in runtime_stats.json."""
+        if not self.config_dict:
+            return
+        stats_path = os.path.join(self.config_dict["state_dir"], "runtime_stats.json")
+        try:
+            if os.path.exists(stats_path):
+                with open(stats_path) as fh:
+                    data = json.load(fh)
+                if data.get("state") != "STOPPED":
+                    data["state"] = "STOPPED"
+                    with open(stats_path, "w") as fh:
+                        json.dump(data, fh, ensure_ascii=False, indent=2)
+        except (OSError, json.JSONDecodeError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +338,6 @@ def monitor_loop(runtime: RuntimeState):
                   screen=False, redirect_stdout=False, redirect_stderr=False) as live:
             while True:
                 live.update(render_monitor(runtime))
-                # Non-blocking ESC check
                 import select
                 import termios
                 import tty
@@ -334,8 +356,8 @@ def monitor_loop(runtime: RuntimeState):
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
     except KeyboardInterrupt:
         raise
-    except Exception as exc:  # non-tty fallback
-        console.print(f"[yellow]Monitor no disponible sin TTY interactivo: {exc}[/yellow]")
+    except Exception as exc:
+        console.print(f"[yellow]Monitor cerrado: {exc}[/yellow]")
 
 
 # ---------------------------------------------------------------------------
@@ -355,13 +377,18 @@ def view_log():
         chunk = lines[page * page_size:(page + 1) * page_size]
         text = "".join(chunk) or "(vacía)"
         console.print(Panel(text, title=f"quant_math.log — página {page + 1}/{total_pages}"))
-        choice = questionary.select(
-            "Log:",
-            choices=[
-                questionary.Choice("Siguiente página →", value="next"),
-                questionary.Choice("← Página anterior", value="prev"),
-                questionary.Choice("Volver al menú (ESC)", value="back"),
-            ]).ask()
+        try:
+            choice = questionary.select(
+                "Log:",
+                choices=[
+                    questionary.Choice("Siguiente página →", value="next", shortcut_key="n"),
+                    questionary.Choice("← Página anterior", value="prev", shortcut_key="p"),
+                    questionary.Choice("Volver al menú (ESC)", value="back", shortcut_key="v"),
+                ],
+                use_shortcuts=True,
+            ).ask()
+        except (KeyboardInterrupt, AttributeError):
+            return
         if choice in (None, "back"):
             return
         if choice == "next" and page < total_pages - 1:
@@ -386,22 +413,29 @@ def main():
     runtime = RuntimeState()
     try:
         while True:
-            action = questionary.select(
-                "QUANT-MATH — Menú principal",
-                choices=[
-                    questionary.Choice("Iniciar Quant-Math",
-                                       value="start",
-                                       disabled="ya está corriendo" if runtime.running else None),
-                    questionary.Choice("Detener investigación",
-                                       value="stop",
-                                       disabled="no está corriendo" if not runtime.running else None),
-                    questionary.Choice("Monitor",
-                                       value="monitor"),
-                    questionary.Choice("Ver log",
-                                       value="log"),
-                    questionary.Choice("Salir", value="quit"),
-                ],
-            ).ask()
+            try:
+                action = questionary.select(
+                    "QUANT-MATH — Menú principal  (usa atajos 1-5)",
+                    choices=[
+                        questionary.Choice("Iniciar Quant-Math",
+                                           value="start",
+                                           shortcut_key="1",
+                                           disabled="ya está corriendo" if runtime.running else None),
+                        questionary.Choice("Detener investigación",
+                                           value="stop",
+                                           shortcut_key="2",
+                                           disabled="no está corriendo" if not runtime.running else None),
+                        questionary.Choice("Monitor", value="monitor", shortcut_key="3"),
+                        questionary.Choice("Ver log", value="log", shortcut_key="4"),
+                        questionary.Choice("Salir", value="quit", shortcut_key="5"),
+                    ],
+                    use_shortcuts=True,
+                ).ask()
+            except KeyboardInterrupt:
+                # Ctrl+C en el menú principal -> cierre total
+                print()
+                shutdown(runtime)
+                return 0
 
             if action is None:  # ESC on main menu
                 if runtime.running:
@@ -409,37 +443,47 @@ def main():
                                   "Usa 'Salir' o 'Detener investigación' para cerrar.[/dim]")
                 continue
 
-            if action == "start":
-                cfg = wizard()
-                if cfg is None:
-                    console.print("[dim]Wizard cancelado.[/dim]")
-                    continue
-                runtime.start(cfg)
-                console.print(f"[green]Orchestrator iniciado en proceso de fondo "
-                              f"(pid={runtime.process.pid}). Logs: {LOG_PATH}[/green]")
-                questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").ask()
-
-            elif action == "stop":
-                if runtime.stop():
-                    console.print("[green]Investigación detenida.[/green]")
-                else:
-                    console.print("[yellow]No hay proceso activo.[/yellow]")
-
-            elif action == "monitor":
-                monitor_loop(runtime)
-
-            elif action == "log":
-                view_log()
-
-            elif action == "quit":
-                shutdown(runtime)
-                return 0
-
+            try:
+                _dispatch(runtime, action)
+            except KeyboardInterrupt:
+                console.print("\n[dim]Vuelta al menú (sub-pantalla cancelada). "
+                              "El sistema sigue activo.[/dim]")
     except KeyboardInterrupt:
         print()
         shutdown(runtime)
         return 0
     return 0
+
+
+def _dispatch(runtime: RuntimeState, action: str):
+    if action == "start":
+        cfg = wizard()
+        if cfg is None:
+            console.print("[dim]Wizard cancelado.[/dim]")
+            return
+        runtime.start(cfg)
+        console.print(f"[green]Orchestrator iniciado en proceso de fondo "
+                      f"(pid={runtime.process.pid}). Logs: {LOG_PATH}[/green]")
+        try:
+            questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").ask()
+        except (KeyboardInterrupt, AttributeError):
+            pass
+
+    elif action == "stop":
+        if runtime.stop():
+            console.print("[green]Investigación detenida.[/green]")
+        else:
+            console.print("[yellow]No hay proceso activo.[/yellow]")
+
+    elif action == "monitor":
+        monitor_loop(runtime)
+
+    elif action == "log":
+        view_log()
+
+    elif action == "quit":
+        shutdown(runtime)
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":
