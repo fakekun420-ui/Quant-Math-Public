@@ -48,6 +48,7 @@ class DecisionEngine:
         min_paper_trades: int = DEFAULT_MIN_PAPER_TRADES,
         knowledge_base=None,
         data_provider: Optional[Callable[[str], List[List]]] = None,
+        use_postgres: bool = True,
     ):
         self.symbols = list(symbols)
         self.kb_path = kb_path
@@ -74,6 +75,18 @@ class DecisionEngine:
 
         # JSONL persistence layer over the KB
         self.hypotheses: Dict[str, Dict[str, Any]] = {}
+        self.storage = None
+        if use_postgres:
+            try:
+                from quant_math.autonomous_research.adapters.postgres_kb import \
+                    KBPersistence
+                self.storage = KBPersistence(kb_path)
+            except Exception as exc:
+                logger.warning(
+                    "[kb-storage] inicialización PostgreSQL falló (%s) — "
+                    "usando JSONL puro: %s", exc.__class__.__name__, kb_path)
+        else:
+            logger.info("[kb-storage] backend=jsonl (use_postgres=False)")
         self._load_jsonl()
 
         self.positions_path = os.path.join(state_dir, "positions.jsonl")
@@ -96,7 +109,14 @@ class DecisionEngine:
     # Knowledge Base (JSONL)
     # ------------------------------------------------------------------
 
+    @property
+    def storage_mode(self) -> str:
+        return self.storage.mode if self.storage is not None else "jsonl"
+
     def _load_jsonl(self):
+        if self.storage is not None:
+            self.hypotheses = self.storage.load_all()
+            return
         if not os.path.exists(self.kb_path):
             return
         with open(self.kb_path, "r", encoding="utf-8") as fh:
@@ -116,6 +136,9 @@ class DecisionEngine:
     def _save_hypothesis(self, record: Dict[str, Any]):
         hid = record["hypothesis_id"]
         self.hypotheses[hid] = record
+        if self.storage is not None:
+            self.storage.save(record)
+            return
         with open(self.kb_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 

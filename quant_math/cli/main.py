@@ -276,9 +276,17 @@ def _read_paper_trades(state_dir: str):
     return trades
 
 
+def _count_open_positions(state_dir: str) -> int:
+    path = os.path.join(state_dir, "positions.jsonl")
+    if not os.path.exists(path):
+        return 0
+    return sum(1 for line in open(path, encoding="utf-8") if line.strip())
+
+
 def render_monitor(runtime: RuntimeState):
     stats = runtime.stats
     cfg = stats.get("config", {})
+    state_dir = cfg.get("state_dir", "runtime/state")
     state = "RUNNING" if runtime.running else "STOPPED"
 
     header = Table.grid(padding=(0, 2))
@@ -289,19 +297,24 @@ def render_monitor(runtime: RuntimeState):
     generated = stats.get("hypotheses_generated", 0)
     evaluated = stats.get("hypotheses_evaluated", 0)
 
-    # Paper trade P&L (mark-to-market vs real prices, throttled)
+    open_pos = _count_open_positions(state_dir)
+
+    # Single pass: MtM P&L + closed-trade classification (one price lookup
+    # per symbol per render; _get_current_price throttles the exchange API)
+    trades = _read_paper_trades(state_dir) if runtime.config_dict else []
+    total_closed = len(trades)
     wins = losses = 0
     unrealized = 0.0
-    trades = _read_paper_trades(runtime.config_dict["state_dir"]) \
-        if runtime.config_dict else []
     for t in trades:
         cur = _get_current_price(t["symbol"], cfg.get("exchange_id", "bybit"))
         ref = cur if cur is not None else t["entry_price"]
         direction = 1 if t["side"] == "buy" else -1
         pnl = t["quantity"] * (ref - t["entry_price"]) * direction
         unrealized += pnl
-        wins += pnl >= 0
-        losses += pnl < 0
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
 
     equity = cfg.get("initial_capital", 0.0) + unrealized
 
@@ -312,8 +325,10 @@ def render_monitor(runtime: RuntimeState):
     body.add_row("Ciclos completados", str(cycles))
     body.add_row("Hipótesis generadas", str(generated))
     body.add_row("Hipótesis evaluadas", str(evaluated))
-    body.add_row("Operaciones tomadas",
-                 f"[green]{wins} positivas[/green] / [red]{losses} negativas[/red]")
+    body.add_row("Operaciones abiertas", str(open_pos))
+    body.add_row("Operaciones cerradas", str(total_closed))
+    body.add_row("Positivas", f"[green]{wins}[/green]")
+    body.add_row("Negativas", f"[red]{losses}[/red]")
     pnl_style = "green" if unrealized >= 0 else "red"
     body.add_row("Beneficio/Pérdida (MtM)", Text(f"{unrealized:+,.2f} USD", style=pnl_style))
     body.add_row("Equity", f"${equity:,.2f}")

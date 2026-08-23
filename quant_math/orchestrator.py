@@ -53,6 +53,7 @@ class OrchestratorConfig:
     interval_seconds: int = 3600            # period between continuous cycles
     exchange_id: str = "bybit"              # REAL data source, always
     dry_run: bool = True                    # True=paper trading ONLY (no live path yet)
+    use_postgres: bool = True               # KB storage: PG if reachable, JSONL fallback
 
     def __post_init__(self):
         if not self.symbols:
@@ -99,6 +100,8 @@ class Orchestrator:
     def _write_stats(self):
         try:
             os.makedirs(self.config.state_dir, exist_ok=True)
+            kb_backend = getattr(getattr(self, "engine", None),
+                                 "storage_mode", "jsonl")
             with open(self.stats_path, "w", encoding="utf-8") as fh:
                 json.dump({**self.stats,
                            "config": {
@@ -112,6 +115,7 @@ class Orchestrator:
                                "hypotheses_per_cycle": self.config.hypotheses_per_cycle,
                                "exchange_id": self.config.exchange_id,
                                "mode": "paper" if self.config.dry_run else "live",
+                               "kb_backend": kb_backend,
                            }}, fh, ensure_ascii=False, indent=2)
         except OSError:
             logger.warning("No se pudo escribir runtime_stats.json")
@@ -132,7 +136,23 @@ class Orchestrator:
             lookback_days=self.config.lookback_days,
             dry_run=self.config.dry_run,
             force_real_data=True,
+            hypothesis_ranker=self._rank_hypotheses,
         )
+
+    def _rank_hypotheses(self, templates: List[Dict], symbol: str) -> List[Dict]:
+        """Advisory ML reordering of candidate hypotheses (gate untouched)."""
+        try:
+            from quant_math.ml.hypothesis_prior import build_prior_from_kb
+            top_n = self.config.hypotheses_per_cycle
+            prior = build_prior_from_kb(self.config.kb_path)
+            ordered, info = prior.rank_templates(templates, symbol, top_n)
+            print(f"  [ml-prior] modo={info['mode']} registros={info['total']} "
+                  f"rate_global={info['global_rate']} "
+                  f"reordenado={info['reordered']}")
+            return ordered
+        except Exception as exc:
+            logger.warning("[ml-prior] fallo (%s); orden original", exc)
+            return templates
 
     def _build_engine(self) -> DecisionEngine:
         return DecisionEngine(
@@ -142,6 +162,7 @@ class Orchestrator:
             exchange_id=self.config.exchange_id,
             timeframe=self.config.timeframe,
             min_paper_trades=self.config.min_paper_trades,
+            use_postgres=self.config.use_postgres,
         )
 
     # ------------------------------------------------------------------
@@ -236,8 +257,6 @@ class Orchestrator:
     def _publish_to_kb(self, records: List[Dict]):
         for record in records:
             self.engine.register_hypothesis(record)
-        if records:
-            self.engine._load_jsonl()
 
     def _execute_paper_trade(self, signal: Dict) -> Dict:
         """Fill a paper trade at the signal price with configured sizing/TP."""

@@ -58,7 +58,8 @@ class AQDERunner:
         hypotheses_per_symbol: int = 15,
         feedback_iterations: int = 10,
         dry_run: bool = False,
-        force_real_data: bool = False
+        force_real_data: bool = False,
+        hypothesis_ranker=None
     ):
         self.exchange_id = exchange_id
         self.knowledge_base_path = knowledge_base_path
@@ -73,6 +74,9 @@ class AQDERunner:
         # (used by the orchestrator: dry_run never means synthetic data).
         self.force_real_data = force_real_data
         self.dry_run = dry_run
+        # Optional advisory callable(templates, symbol) -> reordered templates.
+        # Applied BEFORE top-N selection; NEVER touches the decision gate.
+        self.hypothesis_ranker = hypothesis_ranker
 
         # Initialize components
         self.adapter = QuantMathAdapter(
@@ -544,6 +548,12 @@ class AQDERunner:
             # Get feedback from previous iteration
             feedback = self.analyze_performance(symbol)
             templates = self.generate_adaptive_hypotheses(symbol, feedback)
+
+        if self.hypothesis_ranker is not None:
+            try:
+                templates = self.hypothesis_ranker(templates, symbol)
+            except Exception as exc:
+                print(f"  [ml-prior] ranker error ({exc}); orden original")
 
         # Select top N hypotheses
         for i, template in enumerate(templates[:self.hypotheses_per_symbol]):
