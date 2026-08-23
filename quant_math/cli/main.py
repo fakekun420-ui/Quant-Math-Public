@@ -81,7 +81,6 @@ class RuntimeState:
     def __init__(self):
         self.process: Optional[mp.Process] = None
         self.config_dict: Optional[Dict] = None
-
     @property
     def running(self) -> bool:
         return self.process is not None and self.process.is_alive()
@@ -110,20 +109,26 @@ class RuntimeState:
         )
         self.process.start()
 
-    def stop(self, timeout: float = 25.0) -> bool:
+    def stop(self, timeout: float = 15.0) -> bool:
+        """Aggressive escalating stop: SIGINT -> SIGTERM -> SIGKILL, <10s worst case."""
         if self.process is None:
             return False
         was_running = self.running
         if not was_running and self.process.exitcode is not None:
             return False
-        self.process.send_signal(signal.SIGINT)
-        self.process.join(timeout=10)
+        # SpawnProcess no soporta send_signal(); usar os.kill directamente
+        try:
+            os.kill(self.process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        self.process.join(timeout=2)
         if self.process.is_alive():
+            # Mid-network-call: SIGTERM mata inmediatamente
             self.process.terminate()
-            self.process.join(timeout=5)
+            self.process.join(timeout=2)
         if self.process.is_alive():
             self.process.kill()
-            self.process.join(timeout=5)
+            self.process.join(timeout=3)
         self._force_stats_stopped()
         return True
 
@@ -150,7 +155,7 @@ class RuntimeState:
 
 def ask_float(label: str, default: str, lo: float = None, hi: float = None) -> float:
     while True:
-        raw = questionary.text(f"{label}:", default=default).ask()
+        raw = questionary.text(f"{label}:", default=default).unsafe_ask()
         if raw is None:  # ESC
             raise KeyboardInterrupt
         try:
@@ -168,7 +173,7 @@ def ask_float(label: str, default: str, lo: float = None, hi: float = None) -> f
 
 def ask_int(label: str, default: str, lo: int = None) -> int:
     while True:
-        raw = questionary.text(f"{label}:", default=default).ask()
+        raw = questionary.text(f"{label}:", default=default).unsafe_ask()
         if raw is None:
             raise KeyboardInterrupt
         try:
@@ -189,7 +194,7 @@ def wizard() -> Optional[Dict]:
     try:
         symbols_raw = questionary.text(
             "Símbolos a operar (separados por coma):",
-            default="BTC/USDT").ask()
+            default="BTC/USDT").unsafe_ask()
         if symbols_raw is None:
             return None
         symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
@@ -201,7 +206,7 @@ def wizard() -> Optional[Dict]:
         entry_pct = ask_float("% de capital por entrada (0-1]", "0.05", hi=1)
         timeframe = questionary.select(
             "Timeframe:", choices=["1m", "5m", "15m", "1h", "4h", "1d"],
-            default="1h").ask()
+            default="1h").unsafe_ask()
         if timeframe is None:
             return None
         take_profit_pct = ask_float("Take-profit % (ej. 0.02 = 2%)", "0.02")
@@ -226,8 +231,9 @@ def wizard() -> Optional[Dict]:
             "exchange_id": "bybit",
             "dry_run": True,                # paper trading only
         }
-    except (KeyboardInterrupt, AttributeError):
-        # ESC / Ctrl+C during wizard -> back to menu
+    except (AttributeError):
+        # ESC / pregunta cancelada -> volver al menú.
+        # KeyboardInterrupt NO se captura: Ctrl+C = cierre total del sistema.
         return None
 
 
@@ -322,9 +328,13 @@ def render_monitor(runtime: RuntimeState):
         if key in cfg:
             config_panel.add_row(key, str(cfg[key]))
 
+    outer = Table.grid()
+    outer.add_row(header)
+    outer.add_row(body)
+    outer.add_row(Panel(config_panel, title="Config activa"))
+
     return Panel(
-        Table.grid().add_row(body).add_row(
-            Panel(config_panel, title="Config activa")),
+        outer,
         title="Monitor en vivo (ESC para volver)",
         border_style="cyan" if state == "RUNNING" else "red",
     )
@@ -367,7 +377,7 @@ def monitor_loop(runtime: RuntimeState):
 def view_log():
     if not os.path.exists(LOG_PATH):
         console.print("[yellow]Sin logs todavía (quant_math.log no existe)[/yellow]")
-        return questionary.press_any_key_to_continue().ask()
+        return questionary.press_any_key_to_continue().unsafe_ask()
     with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
         lines = fh.readlines()
     page_size = 40
@@ -379,15 +389,15 @@ def view_log():
         console.print(Panel(text, title=f"quant_math.log — página {page + 1}/{total_pages}"))
         try:
             choice = questionary.select(
-                "Log:",
+                "Log:  (↑/↓ + Enter)",
                 choices=[
-                    questionary.Choice("Siguiente página →", value="next", shortcut_key="n"),
-                    questionary.Choice("← Página anterior", value="prev", shortcut_key="p"),
-                    questionary.Choice("Volver al menú (ESC)", value="back", shortcut_key="v"),
+                    questionary.Choice("Siguiente página →", value="next"),
+                    questionary.Choice("← Página anterior", value="prev"),
+                    questionary.Choice("Volver al menú (ESC)", value="back"),
                 ],
-                use_shortcuts=True,
-            ).ask()
-        except (KeyboardInterrupt, AttributeError):
+            ).unsafe_ask()
+        except (AttributeError):
+            # ESC -> volver al menú; Ctrl+C propaga (cierre total)
             return
         if choice in (None, "back"):
             return
@@ -404,7 +414,7 @@ def view_log():
 def shutdown(runtime: RuntimeState):
     if runtime.running:
         console.print("[yellow]Deteniendo orchestrator...[/yellow]")
-        runtime.stop(timeout=45)
+        runtime.stop()
         console.print("[green]Orchestrator detenido.[/green]")
     console.print("[bold]Hasta luego.[/bold]")
 
@@ -415,22 +425,19 @@ def main():
         while True:
             try:
                 action = questionary.select(
-                    "QUANT-MATH — Menú principal  (usa atajos 1-5)",
+                    "QUANT-MATH — Menú principal  (↑/↓ + Enter)",
                     choices=[
                         questionary.Choice("Iniciar Quant-Math",
                                            value="start",
-                                           shortcut_key="1",
                                            disabled="ya está corriendo" if runtime.running else None),
                         questionary.Choice("Detener investigación",
                                            value="stop",
-                                           shortcut_key="2",
                                            disabled="no está corriendo" if not runtime.running else None),
-                        questionary.Choice("Monitor", value="monitor", shortcut_key="3"),
-                        questionary.Choice("Ver log", value="log", shortcut_key="4"),
-                        questionary.Choice("Salir", value="quit", shortcut_key="5"),
+                        questionary.Choice("Monitor", value="monitor"),
+                        questionary.Choice("Ver log", value="log"),
+                        questionary.Choice("Salir", value="quit"),
                     ],
-                    use_shortcuts=True,
-                ).ask()
+                ).unsafe_ask()
             except KeyboardInterrupt:
                 # Ctrl+C en el menú principal -> cierre total
                 print()
@@ -443,11 +450,8 @@ def main():
                                   "Usa 'Salir' o 'Detener investigación' para cerrar.[/dim]")
                 continue
 
-            try:
-                _dispatch(runtime, action)
-            except KeyboardInterrupt:
-                console.print("\n[dim]Vuelta al menú (sub-pantalla cancelada). "
-                              "El sistema sigue activo.[/dim]")
+            # Ctrl+C en cualquier sub-pantalla propaga -> cierre total (outer)
+            _dispatch(runtime, action)
     except KeyboardInterrupt:
         print()
         shutdown(runtime)
@@ -465,8 +469,8 @@ def _dispatch(runtime: RuntimeState, action: str):
         console.print(f"[green]Orchestrator iniciado en proceso de fondo "
                       f"(pid={runtime.process.pid}). Logs: {LOG_PATH}[/green]")
         try:
-            questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").ask()
-        except (KeyboardInterrupt, AttributeError):
+            questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").unsafe_ask()
+        except (AttributeError):
             pass
 
     elif action == "stop":
