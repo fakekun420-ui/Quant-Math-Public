@@ -271,6 +271,7 @@ class Orchestrator:
 
         trade = {
             "mode": "paper",
+            "key": f"{signal['hypothesis_id']}:{signal['symbol']}",
             "symbol": signal["symbol"],
             "side": side,
             "quantity": quantity,
@@ -299,6 +300,7 @@ class Orchestrator:
     def run_cycle(self) -> Dict:
         """generate -> persist -> decide -> paper execute -> feedback."""
         self.cycle_count += 1
+        self.runner.invalidate_market_cache()   # datos frescos por ciclo
         cfg = self.config
         print(f"\n{'=' * 60}")
         print(f"ORCHESTRATOR CYCLE {self.cycle_count} "
@@ -318,6 +320,15 @@ class Orchestrator:
 
         # 3. Publish to shared JSONL KB
         self._publish_to_kb(records)
+
+        # SL/TP primero para TODAS las posiciones abiertas (incluye huerfas
+        # de simbolos fuera de la config actual); riesgo antes que entradas.
+        exits = self.engine.check_exits_all()
+        for closure in exits:
+            print(f"  [exit] {closure['motivo_cierre'].upper()} "
+                  f"{closure['symbol']} exit={closure['exit_price']:.8g} "
+                  f"pnl={closure['pnl']:+.4f}")
+        summary["exits"] = len(exits)
 
         # 4-5. Decide per symbol; execute paper trades; engine handles feedback
         for symbol in cfg.symbols:

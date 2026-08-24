@@ -98,6 +98,35 @@ class AQDERunner:
         self.all_hypotheses: Dict[str, Hypothesis] = {}
         self.performance_history: List[Dict] = []
         self.iteration = 0
+        # Cache INTRA-CICLO de datos de mercado: clave (symbol, timeframe,
+        # lookback_days). El orchestrator la invalida al inicio de cada ciclo;
+        # nunca persiste entre ciclos.
+        self._mkt_cache: Dict[Any, Any] = {}
+
+    def invalidate_market_cache(self):
+        """Fuerza re-descarga en el siguiente acceso (inicio de ciclo nuevo)."""
+        self._mkt_cache.clear()
+
+    def get_or_fetch_market_data(self, symbol: str):
+        """Datos de mercado para backtesting con cache intra-ciclo: si
+        (symbol, timeframe, lookback_days) ya se descargo en este ciclo, se
+        reutiliza para TODAS las hipotesis en lugar de repetir ~130 peticiones
+        (caso 1m/90d)."""
+        key = (symbol, self.timeframe, self.lookback_days)
+        if key in self._mkt_cache:
+            print(f"  [cache] {symbol} {self.timeframe}/{self.lookback_days}d "
+                  f"reutilizado del ciclo actual")
+            return self._mkt_cache[key]
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=self.lookback_days)
+        if self.dry_run and not self.force_real_data:
+            market_data = self.adapter.generate_synthetic_data(
+                symbol, n_candles=1000)
+        else:
+            market_data = self.adapter.fetch_market_data(
+                symbol, start_date, end_date, self.timeframe)
+        self._mkt_cache[key] = market_data
+        return market_data
 
     def fetch_top_symbols(self) -> List[CryptoSymbol]:
         """Fetch top N symbols by volume from Bybit"""
@@ -604,14 +633,7 @@ class AQDERunner:
         results = []
 
         # Fetch market data once
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=self.lookback_days)
-
-        print(f"\n  Fetching market data for {symbol} ({self.lookback_days} days, {self.timeframe})...")
-        if self.dry_run and not self.force_real_data:
-            market_data = self.adapter.generate_synthetic_data(symbol, n_candles=1000)
-        else:
-            market_data = self.adapter.fetch_market_data(symbol, start_date, end_date, self.timeframe)
+        market_data = self.get_or_fetch_market_data(symbol)
 
         print(f"  Data fetched: {market_data['count']} candles")
 
@@ -673,13 +695,8 @@ class AQDERunner:
         print(f"\n  Running Walk-Forward Validation for {symbol}...")
         wfv_results = {}
         
-        # Fetch market data once
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=self.lookback_days)
-        if self.dry_run and not self.force_real_data:
-            market_data = self.adapter.generate_synthetic_data(symbol, n_candles=1000)
-        else:
-            market_data = self.adapter.fetch_market_data(symbol, start_date, end_date, self.timeframe)
+        # Datos con cache intra-ciclo (misma descarga que el backtest)
+        market_data = self.get_or_fetch_market_data(symbol)
         
         # Convert market data to format expected by WalkForwardValidator
         # market_data contains 'data' key with DataFrame
