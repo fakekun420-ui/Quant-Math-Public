@@ -502,60 +502,52 @@ class AQDERunner:
                 }
                 hypotheses.append(hyp)
 
-        # === 6. NEW STRATEGY TYPES (Exploration) ===
-        # Add strategies not yet tried for this symbol
-        tried_types = set()
-        for best in best_strategies:
-            tried_types.add(best.get('strategy_type'))
-        for worst in worst_strategies:
-            tried_types.add(worst.get('strategy_type'))
+        # === 6. EXPLORACION CON ROTACION POR CICLO ===
+        # Sin feedback suficiente, explora familias/parametros que ROTAN con
+        # self.iteration en vez de repetir el mismo set fijo cada ciclo.
+        it = int(getattr(self, "iteration", 0) or 0)
+        sym = symbol.replace("/", "")
 
-        untried = [s for s in [StrategyType.BREAKOUT, StrategyType.MOMENTUM, StrategyType.CUSTOM] if s not in tried_types]
+        dw_all = [10, 15, 20, 25, 30]
+        dw = dw_all[it % len(dw_all)]
+        hypotheses.append({
+            "name": f"Breakout_{dw}_{sym}_c{it}",
+            "description": f"Donchian breakout {dw} (exploracion ciclo {it})",
+            "strategy_type": StrategyType.BREAKOUT,
+            "parameters": {"strategy_type": "donchian_breakout",
+                           "donchian_window": dw, "symbol": symbol},
+        })
 
-        if StrategyType.BREAKOUT in untried:
-            for dw in [10, 15, 20, 25, 30]:
-                hyp = {
-                    "name": f"Breakout_{dw}_{symbol.replace('/', '')}",
-                    "description": f"Donchian breakout {dw} for {symbol}",
-                    "strategy_type": StrategyType.BREAKOUT,
-                    "parameters": {
-                        "strategy_type": "donchian_breakout",
-                        "donchian_window": dw,
-                        "symbol": symbol,
-                    }
-                }
-                hypotheses.append(hyp)
+        macd_pairs = [(8, 21), (9, 26), (12, 30), (10, 28)]
+        fs, ls = macd_pairs[it % len(macd_pairs)]
+        hypotheses.append({
+            "name": f"MACD_{fs}_{ls}_{sym}_c{it}",
+            "description": f"MACD {fs}/{ls} (exploracion ciclo {it})",
+            "strategy_type": StrategyType.MOMENTUM,
+            "parameters": {"strategy_type": "macd", "short_window": fs,
+                           "long_window": ls, "signal_window": 9,
+                           "symbol": symbol},
+        })
 
-        if StrategyType.MOMENTUM in untried:
-            hyp = {
-                "name": f"MACD_{symbol.replace('/', '')}",
-                "description": f"MACD momentum for {symbol}",
-                "strategy_type": StrategyType.MOMENTUM,
-                "parameters": {
-                    "strategy_type": "macd",
-                    "short_window": 12,
-                    "long_window": 26,
-                    "signal_window": 9,
-                    "symbol": symbol,
-                }
-            }
-            hypotheses.append(hyp)
-
-        if StrategyType.CUSTOM in untried:
-            for atr_w in [10, 14, 20]:
-                for atr_f in [2.0, 2.5, 3.0, 3.5]:
-                    hyp = {
-                        "name": f"ATI_{atr_w}_{atr_f}_{symbol.replace('/', '')}",
-                        "description": f"ATR Trend {atr_w} factor {atr_f} for {symbol}",
-                        "strategy_type": StrategyType.TREND_FOLLOWING,
-                        "parameters": {
-                            "strategy_type": "ati_trend",
-                            "atr_window": atr_w,
-                            "atr_factor": atr_f,
-                            "symbol": symbol,
-                        }
-                    }
-                    hypotheses.append(hyp)
+        if it % 2 == 1:   # ciclos impares: rotar tambien mean-reversion
+            rsi_p = [14, 10, 18][(it // 2) % 3]
+            hypotheses.append({
+                "name": f"RSIrev_{rsi_p}_{sym}_c{it}",
+                "description": f"RSI reversion p={rsi_p} (ciclo {it})",
+                "strategy_type": StrategyType.MEAN_REVERSION,
+                "parameters": {"strategy_type": "rsi_reversion",
+                               "rsi_period": rsi_p, "rsi_oversold": 30,
+                               "rsi_overbought": 70, "symbol": symbol},
+            })
+            bb_p = [20, 16, 24][(it // 2) % 3]
+            hypotheses.append({
+                "name": f"BB_{bb_p}_{sym}_c{it}",
+                "description": f"Bollinger reversion p={bb_p} (ciclo {it})",
+                "strategy_type": StrategyType.MEAN_REVERSION,
+                "parameters": {"strategy_type": "bb_reversion",
+                               "bb_period": bb_p, "bb_std": 2.0,
+                               "symbol": symbol},
+            })
 
         # Deduplicate by name
         seen = set()

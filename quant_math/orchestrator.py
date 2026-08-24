@@ -177,20 +177,57 @@ class Orchestrator:
         symbols = self.config.symbols
         n = self.config.hypotheses_per_cycle
 
+        # Firmas ya publicadas en el KB: evita regenerar la misma hipotesis
+        # identica ciclo tras ciclo (mismo tipo+simbolo+parametros).
+        import json as _json
+        seen = set()
+        for h in self.engine.hypotheses.values():
+            sig = _json.dumps(
+                [h.get("strategy_type"), h.get("symbol"),
+                 sorted((h.get("parameters") or {}).items())],
+                sort_keys=True)
+            seen.add(sig)
+
         made = 0
         for i, symbol in enumerate(symbols):
             if made >= n:
                 break
 
+            # El contador de iteracion alimenta la rotacion de exploracion
+            self.runner.iteration = self.cycle_count
+
             # Reuse AQDE generation logic (base templates on first pass,
             # adaptive on later cycles via iteration counter)
             hyp_ids = self.runner.create_hypotheses_for_symbol(symbol, self.cycle_count)
-            if not hyp_ids:
+
+            # Dedupe contra el KB: solo hipotesis NUEVAS van a backtest
+            fresh = []
+            for hid in hyp_ids:
+                hyp = self.runner.all_hypotheses.get(hid)
+                if hyp is None:
+                    continue
+                params = getattr(hyp, "parameters", {}) or {}
+                st = getattr(hyp.strategy_type, "value", None)
+                if not isinstance(st, str):
+                    st = str(hyp.strategy_type)
+                sig = _json.dumps([st, symbol, sorted(params.items())],
+                                  sort_keys=True)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                fresh.append(hid)
+            skipped = len(hyp_ids) - len(fresh)
+            if skipped:
+                print(f"  [dedupe] {skipped} duplicadas omitidas "
+                      f"(ya existen en el KB)")
+            if not fresh:
                 continue
 
-            # Backtest on REAL Bybit data (force_real_data=True upstream)
-            batch = hyp_ids[: max(1, n - made)]
+            # Backtest on REAL Bybit data (force_real_data=True upstream);
+            # resultados alimentan el feedback adaptativo del runner
+            batch = fresh[: max(1, n - made)]
             results = self.runner.run_backtest_for_symbol(symbol, batch)
+            self.runner.performance_history.extend(results)
 
             for result in results:
                 record = self._result_to_kb_record(result, symbol)
