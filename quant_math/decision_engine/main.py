@@ -24,6 +24,13 @@ QUERYABLE_STATUSES = ("validated", "backtested", "monte_carlo_tested", "failed")
 NO_ENTRY_REASON = "sin hipótesis de expectativa positiva disponible"
 DEFAULT_MIN_PAPER_TRADES = 3
 
+# LEARN MODE: cuando esta activo, el gate expectancy>0 se desactiva TEMPORAL-
+# MENTE para que el sistema opere tambien hipotesis negativas y aprenda de
+# sus errores (solo paper: el sistema nunca implementa ejecucion real).
+# Default "0" (gate intacto); la ruta del CLI lo activa con setdefault.
+def _learn_mode_default() -> bool:
+    return os.environ.get("QUANTMATH_LEARN_MODE", "0") == "1"
+
 
 class DecisionEngine:
     """
@@ -50,6 +57,7 @@ class DecisionEngine:
         data_provider: Optional[Callable[[str], List[List]]] = None,
         use_postgres: bool = True,
         take_profit_pct: Optional[float] = None,
+        learn_mode: Optional[bool] = None,
     ):
         self.symbols = list(symbols)
         self.kb_path = kb_path
@@ -60,6 +68,13 @@ class DecisionEngine:
         self.min_paper_trades = min_paper_trades
         self.take_profit_pct = (
             float(take_profit_pct) if take_profit_pct is not None else None)
+        self.learn_mode = (_learn_mode_default() if learn_mode is None
+                           else bool(learn_mode))
+        if self.learn_mode:
+            logger.warning(
+                "[LEARN MODE] gate expectancy>0 DESACTIVADO temporalmente — "
+                "el sistema operara tambien hipotesis negativas (paper) para "
+                "alimentar el aprendizaje no supervisado")
 
         os.makedirs(os.path.dirname(kb_path) or ".", exist_ok=True)
         os.makedirs(state_dir, exist_ok=True)
@@ -144,7 +159,8 @@ class DecisionEngine:
             self.storage.save(record)
             return
         with open(self.kb_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(record, ensure_ascii=False,
+                                default=str) + "\n")
 
     def register_hypothesis(self, record: Dict[str, Any]) -> str:
         """Register/overwrite a hypothesis record in the JSONL KB."""
@@ -275,13 +291,61 @@ class DecisionEngine:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if rec.get("key") == key and "motivo_cierre" not in rec:
-                        qty = float(rec.get("quantity", qty))
-                        notional = float(rec.get("notional_usd",
-                                                 qty * float(
-                                                     rec.get("entry_price",
-                                                             0.0))))
+                    if (rec.get("key") or f"{rec.get('hypothesis_id')}:"
+                            f"{rec.get('symbol')}") != key \
+                            or "motivo_cierre" in rec:
+                        continue
+                    qty = float(rec.get("quantity", qty))
+                    notional = float(rec.get("notional_usd",
+                                             qty * float(
+                                                 rec.get("entry_price",
+                                                         0.0))))
         return qty, notional
+
+    def _entry_stop_loss_from_ledger(self, key: str) -> Optional[float]:
+        """SL vigente EN el momento de la entrada para key, derivado del
+        take_profit_price registrado en el libro (SL obligatorio = TP/2).
+        Devuelve None si no hay entrada con TP en el libro."""
+        sl = None
+        if os.path.exists(self.ledger_path):
+            with open(self.ledger_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"closure"' in line[:24]:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    rec_key = rec.get("key") or (
+                        f"{rec.get('hypothesis_id')}:{rec.get('symbol')}")
+                    if rec_key != key or "motivo_cierre" in rec:
+                        continue
+                    entry = float(rec.get("entry_price", 0.0))
+                    tp_px = rec.get("take_profit_price")
+                    if entry > 0 and tp_px is not None:
+                        tp_frac = abs(float(tp_px) - entry) / entry
+                        sl = tp_frac / 2.0
+        return sl
+
+    def _position_exit_thresholds(self, pos: Dict[str, Any]):
+        """Umbrales TP/SL de la posicion. Prioridad: los guardados al abrir
+        la posicion -> los del libro en la entrada -> los configurados ahora.
+        Evita que un cambio de config mueva retroactivamente el SL."""
+        entry = float(pos["entry_price"])
+        tp = pos.get("take_profit_pct")
+        if tp is None and self.take_profit_pct is not None:
+            tp = self.take_profit_pct
+        sl = pos.get("stop_loss_pct")
+        if sl is None:
+            key = pos.get("key")
+            sl = self._entry_stop_loss_from_ledger(key) if key else None
+        if sl is None:
+            sl = self.stop_loss_pct
+        return (
+            float(tp) if tp is not None else None,
+            float(sl) if sl is not None else None,
+        )
 
     # ------------------------------------------------------------------
     # TP/SL sobre posiciones abiertas (SL obligatorio = TP/2, ratio 2:1)
@@ -292,24 +356,25 @@ class DecisionEngine:
         simbolo y cierra por SL o TP. SL primero (riesgo antes que nada)."""
         keys = [k for k, p in self.open_positions.items()
                 if k.endswith(f":{symbol}")]
-        if not keys or self.take_profit_pct is None:
+        if not keys:
             return []
         candles = self.fetch_real_data(symbol)
         cur = float(candles[-1]["close"])
         closed = []
-        tp = self.take_profit_pct
-        sl = self.stop_loss_pct
         for key in keys:
             pos = self.open_positions[key]
             side = pos.get("side", "buy")
             entry = float(pos["entry_price"])
+            tp, sl = self._position_exit_thresholds(pos)
+            if sl is None and tp is None:
+                continue
             hyp_id = key.rsplit(f":{symbol}", 1)[0]
             if side == "buy":
-                hit_sl = cur <= entry * (1 - sl)
-                hit_tp = cur >= entry * (1 + tp)
+                hit_sl = sl is not None and cur <= entry * (1 - sl)
+                hit_tp = tp is not None and cur >= entry * (1 + tp)
             else:
-                hit_sl = cur >= entry * (1 + sl)
-                hit_tp = cur <= entry * (1 - tp)
+                hit_sl = sl is not None and cur >= entry * (1 + sl)
+                hit_tp = tp is not None and cur <= entry * (1 - tp)
             if hit_sl:
                 closed.append(self.close_position(hyp_id, symbol,
                                                   motivo="sl",
@@ -319,6 +384,21 @@ class DecisionEngine:
                                                   motivo="tp",
                                                   exit_price=cur))
         return closed
+
+    def check_exits_all(self):
+        """SL/TP para TODAS las posiciones abiertas, incluidas las de simbolos
+        que ya no estan en la configuracion (posiciones huerfas tras un cambio
+        de universo). Sin esto quedan abiertas para siempre."""
+        symbols = sorted({k.rsplit(":", 1)[-1]
+                          for k in self.open_positions})
+        closed = []
+        for symbol in symbols:
+            try:
+                closed.extend(self._check_exits(symbol))
+            except Exception as exc:
+                logger.warning("[exits] fallo revisando %s: %s",
+                               symbol, exc.__class__.__name__)
+        return [c for c in closed if c is not None]
 
     # ------------------------------------------------------------------
     # Market data (REAL Bybit data only)
@@ -391,8 +471,9 @@ class DecisionEngine:
         closed = self._check_exits(symbol)
 
         best = self.select_best_hypothesis(symbol)
+        exp = float(best.get("expectancy", 0.0)) if best else 0.0
 
-        if best is None or float(best.get("expectancy", 0.0)) <= 0:
+        if best is None or (exp <= 0 and not self.learn_mode):
             logger.info("[no_entry] %s — %s", symbol, NO_ENTRY_REASON)
             return {
                 "action": "no_entry",
@@ -424,7 +505,8 @@ class DecisionEngine:
             "symbol": symbol,
             "side": side,
             "hypothesis_id": hypothesis_id,
-            "expectancy": float(best.get("expectancy", 0.0)),
+            "expectancy": exp,
+            "learn_entry": bool(self.learn_mode and exp <= 0),
             "scientific_score": float(best.get("scientific_score", 0.0)),
             "timestamp": time.time(),
             "price": candles[-1]["close"],
@@ -433,6 +515,9 @@ class DecisionEngine:
         key = self._position_key(hypothesis_id, symbol)
         position = {"key": key, "opened_at": signal["timestamp"],
                     "side": side, "entry_price": signal["price"]}
+        if self.take_profit_pct is not None:
+            position["take_profit_pct"] = self.take_profit_pct
+            position["stop_loss_pct"] = self.stop_loss_pct
         self.open_positions[key] = position
         self._append_state(self.positions_path, position)
 

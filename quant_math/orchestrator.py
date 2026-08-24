@@ -150,10 +150,44 @@ class Orchestrator:
             print(f"  [ml-prior] modo={info['mode']} registros={info['total']} "
                   f"rate_global={info['global_rate']} "
                   f"reordenado={info['reordered']}")
-            return ordered
         except Exception as exc:
             logger.warning("[ml-prior] fallo (%s); orden original", exc)
-            return templates
+            ordered = templates
+
+        # SIS no supervisado: refuerza familias con exito historico en el
+        # regimen actual; nunca altera el gate.
+        try:
+            from quant_math.ml.regime_learning import load_loop
+            loop = load_loop(self.config.kb_path, self.config.state_dir)
+            s = loop.summary()
+            regime = None
+            for t in ordered:
+                r = (t.get("parameters") or {}).get("_regime")
+                if r:
+                    regime = r
+                    break
+            fams = loop.rank_families(symbol, regime)
+            if fams and loop.mode == "active":
+                def prio(t):
+                    st = str(getattr(t.get("strategy_type"), "value",
+                                     t.get("strategy_type", "")))
+                    for i, f in enumerate(fams):
+                        if f in st:
+                            return i
+                    return len(fams)
+                boosted = sorted(enumerate(ordered),
+                                 key=lambda kv: (prio(kv[1]), kv[0]))
+                ordered = [t for _, t in boosted]
+                print(f"[sis] modo={s['mode']} ops={s['rows']} familias="
+                      f"{fams[:3]} reordenado_advisory=True")
+            else:
+                print(f"[sis] modo={s['mode']} ops={s['rows']} (recolectando)")
+            self._explore_burst = (
+                loop.should_explore() if loop.mode == "active" else False)
+        except Exception as exc:
+            logger.warning("[sis] fallo (%s); sin boost", exc)
+            self._explore_burst = False
+        return ordered
 
     def _build_engine(self) -> DecisionEngine:
         return DecisionEngine(
@@ -211,7 +245,7 @@ class Orchestrator:
                 if not isinstance(st, str):
                     st = str(hyp.strategy_type)
                 sig = _json.dumps([st, symbol, sorted(params.items())],
-                                  sort_keys=True)
+                                  sort_keys=True, default=str)
                 if sig in seen:
                     continue
                 seen.add(sig)
@@ -224,8 +258,12 @@ class Orchestrator:
                 continue
 
             # Backtest on REAL Bybit data (force_real_data=True upstream);
-            # resultados alimentan el feedback adaptativo del runner
-            batch = fresh[: max(1, n - made)]
+            # resultados alimentan el feedback adaptativo del runner.
+            # En rafaga de exploracion (rachas de perdidas) se permite
+            # backtestear TODAS las candidatas nuevas, no solo el top-N.
+            cap = len(fresh) if getattr(self, "_explore_burst", False) \
+                else max(1, n - made)
+            batch = fresh[:cap]
             results = self.runner.run_backtest_for_symbol(symbol, batch)
             self.runner.performance_history.extend(results)
 

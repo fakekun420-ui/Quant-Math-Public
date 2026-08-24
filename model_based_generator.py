@@ -47,8 +47,8 @@ def analyze_series(closes) -> dict:
     if _HAS_TS and len(closes) >= MIN_CLOSES:
         try:
             fit = ARIMA(closes, order=(1, 1, 0)).fit()
-            fc = float(fit.forecast(1)[0])
-            out["forecast_up"] = fc > closes[-1]
+            fc = float(np.asarray(fit.forecast(1)).ravel()[0])
+            out["forecast_up"] = bool(fc > float(closes[-1]))
         except Exception as exc:
             logger.debug("ARIMA fallo: %s", exc)
     if _HAS_GARCH and len(closes) >= MIN_CLOSES:
@@ -57,7 +57,7 @@ def analyze_series(closes) -> dict:
             res = arch_model(rets, vol="GARCH", p=1, q=1,
                              rescale=False).fit(disp="off")
             cond = res.conditional_volatility
-            out["vol_pct"] = float((cond[-1] >= cond).mean() * 100.0)
+            out["vol_pct"] = float((cond[-1] >= cond).mean()) * 100.0
         except Exception as exc:
             logger.debug("GARCH fallo: %s", exc)
     return out
@@ -75,7 +75,16 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
         return []
     info = analyze_series(closes)
     sym = symbol.replace("/", "")
+    # Contexto de mercado persistente: viaja dentro de parameters hasta el
+    # KB para que el aprendizaje no supervisado pueda usarlo como feature.
+    regime = {"vol_pct": info.get("vol_pct"),
+              "forecast_up": info.get("forecast_up")}
     out = []
+
+    def _attach(params):
+        p = dict(params)
+        p["_regime"] = regime
+        return p
 
     from quant_math.autonomous_research.interfaces import StrategyType
 
@@ -88,8 +97,8 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
             "description": (f"GARCH vol_p={vol:.0f}% ARIMA_up={up} -> "
                             f"donchian {window} para {symbol}"),
             "strategy_type": StrategyType.BREAKOUT,
-            "parameters": {"strategy_type": "donchian_breakout",
-                           "donchian_window": window, "symbol": symbol},
+            "parameters": _attach({"strategy_type": "donchian_breakout",
+                           "donchian_window": window, "symbol": symbol}),
         })
     elif vol is not None and vol <= 30:
         out.append({
@@ -97,9 +106,9 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
             "description": (f"GARCH vol_p={vol:.0f}% baja -> RSI "
                             f"reversion bandas 25/75 para {symbol}"),
             "strategy_type": StrategyType.MEAN_REVERSION,
-            "parameters": {"strategy_type": "rsi_reversion", "rsi_period": 14,
-                           "rsi_oversold": 25, "rsi_overbought": 75,
-                           "symbol": symbol},
+            "parameters": _attach({"strategy_type": "rsi_reversion",
+                           "rsi_period": 14, "rsi_oversold": 25,
+                           "rsi_overbought": 75, "symbol": symbol}),
         })
     if len(out) < max_hypotheses and up is not None:
         fast, slow = (8, 21) if up else (13, 34)
@@ -108,7 +117,8 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
             "description": (f"ARIMA forecast_up={up} -> MACD {fast}/{slow} "
                             f"para {symbol}"),
             "strategy_type": StrategyType.MOMENTUM,
-            "parameters": {"strategy_type": "macd", "short_window": fast,
-                           "long_window": slow, "symbol": symbol},
+            "parameters": _attach({"strategy_type": "macd",
+                           "short_window": fast, "long_window": slow,
+                           "symbol": symbol}),
         })
     return out[:max_hypotheses]

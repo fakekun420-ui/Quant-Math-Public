@@ -177,6 +177,9 @@ class RuntimeState:
 
     def start(self, config_dict: Dict):
         self._ensure_pg_vm()
+        # Confirmado por el operador: el sistema opera a proposito con
+        # perdidas iniciales para alimentar el aprendizaje (solo paper).
+        os.environ.setdefault("QUANTMATH_LEARN_MODE", "1")
         self.config_dict = config_dict
         ctx = mp.get_context("spawn")
         self.process = ctx.Process(
