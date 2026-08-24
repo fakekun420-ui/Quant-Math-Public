@@ -19,6 +19,8 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import socket
+import subprocess
 import sys
 import time
 from typing import Dict, Optional
@@ -81,6 +83,51 @@ class RuntimeState:
     def __init__(self):
         self.process: Optional[mp.Process] = None
         self.config_dict: Optional[Dict] = None
+
+    @staticmethod
+    def _pg_alive(timeout=1.5) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", 15432), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _ensure_pg_vm(self):
+        """Arranca la microVM de PostgreSQL si no responde; si falla, sigue
+        con fallback a JSONL dejando el motivo claro en consola."""
+        if os.environ.get("QUANTMATH_PG_DISABLE") == "1":
+            console.print("[dim]PG deshabilitado (QUANTMATH_PG_DISABLE=1) — "
+                          "KB en modo JSONL[/dim]")
+            return
+        if self._pg_alive():
+            return
+        boot = os.environ.get(
+            "QUANTMATH_PG_BOOT", "/var/lib/quantmath-pgvm/boot_pg_vm.py")
+        if not os.path.exists(boot):
+            console.print("[yellow]PostgreSQL no disponible y no hay script "
+                          f"de arranque ({boot}) — fallback a JSONL[/yellow]")
+            return
+        console.print("[cyan]PostgreSQL VM no responde — iniciando microVM "
+                      "(puede tardar unos minutos)...[/cyan]")
+        try:
+            logf = open("/var/lib/quantmath-pgvm/autostart.log", "ab")
+            subprocess.Popen(
+                [sys.executable, "-u", boot, "normal"],
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                start_new_session=True)
+        except Exception as exc:
+            console.print(f"[yellow]No se pudo lanzar la VM ({exc}) — "
+                          "fallback a JSONL[/yellow]")
+            return
+        timeout_s = int(os.environ.get("QUANTMATH_PG_BOOT_TIMEOUT", "480"))
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._pg_alive():
+                console.print("[green]PostgreSQL VM lista.[/green]")
+                return
+            time.sleep(5)
+        console.print(f"[yellow]VM no respondio en {timeout_s}s — "
+                      "fallback a JSONL[/yellow]")
     @property
     def running(self) -> bool:
         return self.process is not None and self.process.is_alive()
@@ -99,6 +146,7 @@ class RuntimeState:
             return {}
 
     def start(self, config_dict: Dict):
+        self._ensure_pg_vm()
         self.config_dict = config_dict
         ctx = mp.get_context("spawn")
         self.process = ctx.Process(
@@ -436,6 +484,99 @@ def view_log():
 
 
 # ---------------------------------------------------------------------------
+# Historial de operaciones (libro permanente)
+# ---------------------------------------------------------------------------
+
+def _read_closures(state_dir: str):
+    path = os.path.join(state_dir, "paper_executions.jsonl")
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "motivo_cierre" in rec:
+                out.append(rec)
+    return out
+
+
+def view_history(runtime: RuntimeState):
+    state_dir = (runtime.config_dict or {}).get(
+        "state_dir", os.path.join(PROJECT_ROOT, "runtime", "state"))
+    closures = _read_closures(state_dir)
+    if not closures:
+        console.print("[yellow]Sin operaciones cerradas todavia "
+                      "(libro permanente vacio)[/yellow]")
+        try:
+            questionary.press_any_key_to_continue().unsafe_ask()
+        except AttributeError:
+            pass
+        return
+
+    def fmt_ts(ts):
+        return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+    page_size = 12
+    total_pages = max(1, (len(closures) + page_size - 1) // page_size)
+    page = 0
+    while True:
+        chunk = closures[page * page_size:(page + 1) * page_size]
+        table = Table(show_header=True, header_style="bold magenta",
+                     expand=True)
+        for col in ("Entrada", "Cierre", "Simbolo", "Hipotesis", "Side",
+                    "P.entrada", "P.salida", "PnL USD", "PnL %", "Motivo"):
+            table.add_column(col)
+        for c in chunk:
+            pnl = float(c.get("pnl", 0.0))
+            style = "green" if pnl > 0 else "red"
+            table.add_row(
+                fmt_ts(c.get("entry_time")), fmt_ts(c.get("exit_time")),
+                c.get("symbol", ""), str(c.get("hypothesis_id", ""))[:14],
+                (c.get("side") or "").upper(),
+                f"{c.get('entry_price', 0):g}", f"{c.get('exit_price', 0):g}",
+                Text(f"{pnl:+.2f}", style=style),
+                Text(f"{c.get('pnl_pct', 0):+.2f}%", style=style),
+                str(c.get("motivo_cierre", "")))
+        pnls = [float(c.get("pnl", 0.0)) for c in closures]
+        wins = sum(1 for p in pnls if p > 0)
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(justify="right")
+        summary.add_column()
+        summary.add_row("Operaciones cerradas:", str(len(closures)))
+        summary.add_row("Positivas / Negativas:",
+                        f"[green]{wins}[/green] / [red]{len(pnls)-wins}[/red]")
+        summary.add_row("PnL total:",
+                        Text(f"{sum(pnls):+,.2f} USD",
+                             style="green" if sum(pnls) >= 0 else "red"))
+        console.print(Panel(table, title=f"Historial — pagina "
+                          f"{page+1}/{total_pages}"))
+        console.print(Panel(summary, title="Resumen"))
+
+        try:
+            choice = questionary.select(
+                "Historial:",
+                choices=[
+                    questionary.Choice("Siguiente pagina →", value="next"),
+                    questionary.Choice("← Pagina anterior", value="prev"),
+                    questionary.Choice("Volver al menu (ESC)", value="back"),
+                ]).unsafe_ask()
+        except (AttributeError, KeyboardInterrupt):
+            return
+        if choice in (None, "back"):
+            return
+        if choice == "next" and page < total_pages - 1:
+            page += 1
+        elif choice == "prev" and page > 0:
+            page -= 1
+
+
+# ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
 
@@ -463,6 +604,8 @@ def main():
                                            disabled="no está corriendo" if not runtime.running else None),
                         questionary.Choice("Monitor", value="monitor"),
                         questionary.Choice("Ver log", value="log"),
+                        questionary.Choice("Historial de operaciones",
+                                           value="history"),
                         questionary.Choice("Salir", value="quit"),
                     ],
                 ).unsafe_ask()
@@ -512,6 +655,9 @@ def _dispatch(runtime: RuntimeState, action: str):
 
     elif action == "log":
         view_log()
+
+    elif action == "history":
+        view_history(runtime)
 
     elif action == "quit":
         shutdown(runtime)

@@ -538,6 +538,19 @@ class AQDERunner:
 
         return unique[:self.hypotheses_per_symbol * 2]  # Return more candidates, runner will select top N
 
+    def _recent_closes(self, symbol, limit=300):
+        """Closes recientes REALES para los modelos; cache por ciclo."""
+        cached = getattr(self, "_closes_cache", None)
+        now = time.time()
+        if cached and cached[0] == symbol and now - cached[1] < 300:
+            return cached[2]
+        from data_acquisition.data_sources.exchanges import ExchangeAPI
+        ex = ExchangeAPI(exchange_id=self.exchange_id)
+        ohlcv = ex.fetch_ohlcv(symbol, self.timeframe, limit=limit)
+        closes = [c[4] for c in (ohlcv or []) if c and c[4] is not None]
+        self._closes_cache = (symbol, now, closes)
+        return closes
+
     def create_hypotheses_for_symbol(self, symbol: str, iteration: int) -> List[str]:
         """Create and register hypotheses for a symbol"""
         hypothesis_ids = []
@@ -554,6 +567,22 @@ class AQDERunner:
                 templates = self.hypothesis_ranker(templates, symbol)
             except Exception as exc:
                 print(f"  [ml-prior] ranker error ({exc}); orden original")
+
+        # Generacion basada en modelos cientificos (ARIMA/GARCH) como fuente
+        # ADICIONAL de candidatos; su ausencia nunca rompe el flujo.
+        try:
+            from model_based_generator import (HAS_MODEL_BASED_GENERATOR,
+                                               generate_model_hypotheses)
+            if HAS_MODEL_BASED_GENERATOR:
+                closes = self._recent_closes(symbol)
+                sci = generate_model_hypotheses(symbol, closes,
+                                                max_hypotheses=2)
+                if sci:
+                    templates = sci + templates
+                    print(f"  [model-gen] +{len(sci)} hipotesis cientificas "
+                          f"para {symbol}")
+        except Exception as exc:
+            print(f"  [model-gen] no disponible ({type(exc).__name__}: {exc})")
 
         # Select top N hypotheses
         for i, template in enumerate(templates[:self.hypotheses_per_symbol]):
