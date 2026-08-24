@@ -110,6 +110,7 @@ class Orchestrator:
                                "entry_pct": self.config.entry_pct,
                                "timeframe": self.config.timeframe,
                                "take_profit_pct": self.config.take_profit_pct,
+                               "stop_loss_pct": self.config.take_profit_pct / 2,
                                "lookback_days": self.config.lookback_days,
                                "min_paper_trades": self.config.min_paper_trades,
                                "hypotheses_per_cycle": self.config.hypotheses_per_cycle,
@@ -163,6 +164,7 @@ class Orchestrator:
             timeframe=self.config.timeframe,
             min_paper_trades=self.config.min_paper_trades,
             use_postgres=self.config.use_postgres,
+            take_profit_pct=self.config.take_profit_pct,
         )
 
     # ------------------------------------------------------------------

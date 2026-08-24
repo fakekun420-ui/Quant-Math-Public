@@ -299,24 +299,34 @@ def render_monitor(runtime: RuntimeState):
 
     open_pos = _count_open_positions(state_dir)
 
-    # Single pass: MtM P&L + closed-trade classification (one price lookup
-    # per symbol per render; _get_current_price throttles the exchange API)
+    # Libro permanente: cierres realizados (motivo_cierre) + MtM solo de
+    # entradas que siguen vivas (sin closure posterior para su key)
     trades = _read_paper_trades(state_dir) if runtime.config_dict else []
-    total_closed = len(trades)
-    wins = losses = 0
+    closed_keys = set()
+    total_closed = wins = losses = 0
+    realized = 0.0
+    open_entries = []
+    for rec in trades:
+        if "motivo_cierre" in rec:
+            total_closed += 1
+            pnl = float(rec.get("pnl", 0.0))
+            realized += pnl
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+            if rec.get("key"):
+                closed_keys.add(rec["key"])
+        else:
+            open_entries.append(rec)
     unrealized = 0.0
-    for t in trades:
+    for t in open_entries:
         cur = _get_current_price(t["symbol"], cfg.get("exchange_id", "bybit"))
         ref = cur if cur is not None else t["entry_price"]
         direction = 1 if t["side"] == "buy" else -1
-        pnl = t["quantity"] * (ref - t["entry_price"]) * direction
-        unrealized += pnl
-        if pnl > 0:
-            wins += 1
-        else:
-            losses += 1
+        unrealized += t["quantity"] * (ref - t["entry_price"]) * direction
 
-    equity = cfg.get("initial_capital", 0.0) + unrealized
+    equity = cfg.get("initial_capital", 0.0) + realized + unrealized
 
     body = Table(show_header=True, header_style="bold magenta", expand=True)
     body.add_column("Métrica")
@@ -331,6 +341,8 @@ def render_monitor(runtime: RuntimeState):
     body.add_row("Negativas", f"[red]{losses}[/red]")
     pnl_style = "green" if unrealized >= 0 else "red"
     body.add_row("Beneficio/Pérdida (MtM)", Text(f"{unrealized:+,.2f} USD", style=pnl_style))
+    real_style = "green" if realized >= 0 else "red"
+    body.add_row("PnL realizado (cierres)", Text(f"{realized:+,.2f} USD", style=real_style))
     body.add_row("Equity", f"${equity:,.2f}")
     body.add_row("Último ciclo",
                  time.strftime("%H:%M:%S", time.localtime(stats.get("last_cycle_at", 0)))
@@ -338,8 +350,9 @@ def render_monitor(runtime: RuntimeState):
 
     config_panel = Table.grid(padding=(0, 1))
     for key in ("symbols", "timeframe", "initial_capital", "entry_pct",
-                "take_profit_pct", "lookback_days", "min_paper_trades",
-                "hypotheses_per_cycle", "exchange_id", "mode"):
+                "take_profit_pct", "stop_loss_pct", "lookback_days",
+                "min_paper_trades", "hypotheses_per_cycle", "exchange_id",
+                "mode"):
         if key in cfg:
             config_panel.add_row(key, str(cfg[key]))
 

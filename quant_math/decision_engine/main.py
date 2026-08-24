@@ -49,6 +49,7 @@ class DecisionEngine:
         knowledge_base=None,
         data_provider: Optional[Callable[[str], List[List]]] = None,
         use_postgres: bool = True,
+        take_profit_pct: Optional[float] = None,
     ):
         self.symbols = list(symbols)
         self.kb_path = kb_path
@@ -57,6 +58,8 @@ class DecisionEngine:
         self.timeframe = timeframe
         self.candle_limit = candle_limit
         self.min_paper_trades = min_paper_trades
+        self.take_profit_pct = (
+            float(take_profit_pct) if take_profit_pct is not None else None)
 
         os.makedirs(os.path.dirname(kb_path) or ".", exist_ok=True)
         os.makedirs(state_dir, exist_ok=True)
@@ -91,6 +94,7 @@ class DecisionEngine:
 
         self.positions_path = os.path.join(state_dir, "positions.jsonl")
         self.paper_trades_path = os.path.join(state_dir, "paper_trades.jsonl")
+        self.ledger_path = os.path.join(state_dir, "paper_executions.jsonl")
         self.open_positions: Dict[str, Dict[str, Any]] = {}
         self.paper_trade_counts: Dict[str, int] = {}
         self.feedback_delivered: Dict[str, bool] = {}
@@ -187,6 +191,19 @@ class DecisionEngine:
                         self.open_positions[rec["key"]] = rec
                     else:
                         self.paper_trade_counts[rec["key"]] = rec["count"]
+        if self.open_positions:
+            logger.info(
+                "[posiciones] recuperadas %d posicion(es) abierta(s) del "
+                "estado previo: %s", len(self.open_positions),
+                ", ".join(self.open_positions.keys()))
+
+    def _persist_positions(self):
+        """Reescribe positions.jsonl con las posiciones vivas (atomico)."""
+        tmp = self.positions_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for rec in self.open_positions.values():
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        os.replace(tmp, self.positions_path)
 
     def _append_state(self, path: str, record: Dict[str, Any]):
         with open(path, "a", encoding="utf-8") as fh:
@@ -196,11 +213,112 @@ class DecisionEngine:
     def _position_key(hypothesis_id: str, symbol: str) -> str:
         return f"{hypothesis_id}:{symbol}"
 
+    @property
+    def stop_loss_pct(self) -> Optional[float]:
+        """SL obligatorio 2:1 — siempre take_profit_pct / 2, sin excepcion."""
+        if self.take_profit_pct is None:
+            return None
+        return self.take_profit_pct / 2.0
+
     def has_open_position(self, hypothesis_id: str, symbol: str) -> bool:
         return self._position_key(hypothesis_id, symbol) in self.open_positions
 
-    def close_position(self, hypothesis_id: str, symbol: str):
-        self.open_positions.pop(self._position_key(hypothesis_id, symbol), None)
+    def close_position(self, hypothesis_id: str, symbol: str,
+                       motivo: str = "manual",
+                       exit_price: Optional[float] = None):
+        """Cierra una posicion: la quita del estado vivo y la registra en el
+        libro de operaciones permanente (paper_executions.jsonl,
+        append-only: este archivo NUNCA se trunca ni se resetea)."""
+        key = self._position_key(hypothesis_id, symbol)
+        pos = self.open_positions.pop(key, None)
+        if pos is None:
+            return None
+        self._persist_positions()
+        entry_price = float(pos.get("entry_price", 0.0))
+        side = pos.get("side", "buy")
+        direction = 1 if side == "buy" else -1
+        qty, notional = self._last_entry_sizing(key)
+        exit_px = float(exit_price) if exit_price is not None else entry_price
+        pnl = qty * (exit_px - entry_price) * direction
+        pnl_pct = (pnl / notional * 100.0) if notional else 0.0
+        closure = {
+            "type": "closure",
+            "key": key,
+            "symbol": symbol,
+            "hypothesis_id": hypothesis_id,
+            "side": side,
+            "entry_price": entry_price,
+            "exit_price": exit_px,
+            "quantity": qty,
+            "pnl": round(pnl, 10),
+            "pnl_pct": round(pnl_pct, 6),
+            "entry_time": pos.get("opened_at"),
+            "exit_time": time.time(),
+            "motivo_cierre": motivo,
+        }
+        self._append_state(self.ledger_path, closure)
+        logger.info("[cierre] %s %s motivo=%s exit=%.8g pnl=%.4f (%+.3f%%)",
+                    side.upper(), symbol, motivo, exit_px, pnl, pnl_pct)
+        return closure
+
+    def _last_entry_sizing(self, key: str):
+        """Cantidad/notional de la ultima entrada abierta para key segun el
+        libro permanente; fallback 1.0 si no hay ejecucion registrada."""
+        qty, notional = 1.0, 0.0
+        if os.path.exists(self.ledger_path):
+            with open(self.ledger_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"closure"' in line[:24]:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("key") == key and "motivo_cierre" not in rec:
+                        qty = float(rec.get("quantity", qty))
+                        notional = float(rec.get("notional_usd",
+                                                 qty * float(
+                                                     rec.get("entry_price",
+                                                             0.0))))
+        return qty, notional
+
+    # ------------------------------------------------------------------
+    # TP/SL sobre posiciones abiertas (SL obligatorio = TP/2, ratio 2:1)
+    # ------------------------------------------------------------------
+
+    def _check_exits(self, symbol: str):
+        """Comprueba precio actual vs entrada para cada posicion abierta del
+        simbolo y cierra por SL o TP. SL primero (riesgo antes que nada)."""
+        keys = [k for k, p in self.open_positions.items()
+                if k.endswith(f":{symbol}")]
+        if not keys or self.take_profit_pct is None:
+            return []
+        candles = self.fetch_real_data(symbol)
+        cur = float(candles[-1]["close"])
+        closed = []
+        tp = self.take_profit_pct
+        sl = self.stop_loss_pct
+        for key in keys:
+            pos = self.open_positions[key]
+            side = pos.get("side", "buy")
+            entry = float(pos["entry_price"])
+            hyp_id = key.rsplit(f":{symbol}", 1)[0]
+            if side == "buy":
+                hit_sl = cur <= entry * (1 - sl)
+                hit_tp = cur >= entry * (1 + tp)
+            else:
+                hit_sl = cur >= entry * (1 + sl)
+                hit_tp = cur <= entry * (1 - tp)
+            if hit_sl:
+                closed.append(self.close_position(hyp_id, symbol,
+                                                  motivo="sl",
+                                                  exit_price=cur))
+            elif hit_tp:
+                closed.append(self.close_position(hyp_id, symbol,
+                                                  motivo="tp",
+                                                  exit_price=cur))
+        return closed
 
     # ------------------------------------------------------------------
     # Market data (REAL Bybit data only)
@@ -270,6 +388,8 @@ class DecisionEngine:
 
     def decide(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Run one decision cycle for a symbol."""
+        closed = self._check_exits(symbol)
+
         best = self.select_best_hypothesis(symbol)
 
         if best is None or float(best.get("expectancy", 0.0)) <= 0:
