@@ -128,6 +128,36 @@ class RuntimeState:
             time.sleep(5)
         console.print(f"[yellow]VM no respondio en {timeout_s}s — "
                       "fallback a JSONL[/yellow]")
+
+    def _stop_pg_vm(self, timeout: float = 25.0) -> bool:
+        """Apaga la microVM de PostgreSQL: 'quit' por el FIFO de control del
+        driver; si el FIFO no tiene lector (driver muerto), fallback a pkill
+        acotado a NUESTROS procesos. Devuelve True solo si el puerto quedo
+        caido."""
+        fifo = "/var/lib/quantmath-pgvm/cmd.fifo"
+        sent = False
+        try:
+            fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, b"quit\n")
+                sent = True
+            finally:
+                os.close(fd)
+        except OSError:
+            sent = False
+        if not sent:
+            subprocess.run(["pkill", "-9", "-f",
+                            "/var/lib/quantmath-pgvm/boot_pg_vm.py"],
+                           check=False)
+            subprocess.run(["pkill", "-9", "-f",
+                            "qemu-system-aarch64.*pgdata.qcow2"],
+                           check=False)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._pg_alive(timeout=1.0):
+                return True
+            time.sleep(1.5)
+        return False
     @property
     def running(self) -> bool:
         return self.process is not None and self.process.is_alive()
@@ -585,6 +615,32 @@ def shutdown(runtime: RuntimeState):
         console.print("[yellow]Deteniendo orchestrator...[/yellow]")
         runtime.stop()
         console.print("[green]Orchestrator detenido.[/green]")
+
+    stop_vm_env = os.environ.get("QUANTMATH_VM_STOP_ON_EXIT")
+    if runtime._pg_alive():
+        resp = False
+        if stop_vm_env == "1":
+            resp = True
+        elif stop_vm_env == "0" or not sys.stdin.isatty():
+            resp = False
+        else:
+            try:
+                resp = bool(questionary.confirm(
+                    "¿Detener también la VM PostgreSQL?",
+                    default=False).unsafe_ask())
+            except Exception:
+                resp = False            # ESC o Ctrl+C -> salir sin tocar VM
+        if resp:
+            console.print("[cyan]Deteniendo VM PostgreSQL...[/cyan]")
+            ok = runtime._stop_pg_vm()
+            if ok:
+                console.print("[green]VM PostgreSQL detenida.[/green]")
+            else:
+                console.print("[yellow]No se pudo confirmar el apagado de "
+                              "la VM (ver autostart.log)[/yellow]")
+        else:
+            console.print("[dim]La VM PostgreSQL sigue corriendo en "
+                          "segundo plano.[/dim]")
     console.print("[bold]Hasta luego.[/bold]")
 
 
