@@ -381,23 +381,34 @@ def render_monitor(runtime: RuntimeState):
     open_pos = _count_open_positions(state_dir)
 
     # Libro permanente: cierres realizados (motivo_cierre) + MtM solo de
-    # entradas que siguen vivas (sin closure posterior para su key)
+    # entradas que siguen vivas (sin closure posterior para su key).
+    # Operaciones PRE-integracion (entry < cutoff en learning_meta.json)
+    # se excluyen del MtM y del PnL nuevo: son historial, no exposicion.
+    from quant_math.ml.feature_store import integration_cutoff
+    cutoff = integration_cutoff(state_dir)
     trades = _read_paper_trades(state_dir) if runtime.config_dict else []
     closed_keys = set()
     total_closed = wins = losses = 0
-    realized = 0.0
+    realized = realized_legacy = 0.0
     open_entries = []
     for rec in trades:
+        key = rec.get("key")
         if "motivo_cierre" in rec:
             total_closed += 1
             pnl = float(rec.get("pnl", 0.0))
-            realized += pnl
+            is_legacy = cutoff and float(rec.get("exit_time") or 0) < cutoff
+            if is_legacy:
+                realized_legacy += pnl
+            else:
+                realized += pnl
             if pnl > 0:
                 wins += 1
             else:
                 losses += 1
-            if rec.get("key"):
-                closed_keys.add(rec["key"])
+            if key:
+                closed_keys.add(key)
+        elif cutoff and float(rec.get("timestamp") or 0) < cutoff:
+            continue                      # fantasma pre-integracion: no expone
         else:
             open_entries.append(rec)
     unrealized = 0.0
@@ -424,6 +435,9 @@ def render_monitor(runtime: RuntimeState):
     body.add_row("Beneficio/Pérdida (MtM)", Text(f"{unrealized:+,.2f} USD", style=pnl_style))
     real_style = "green" if realized >= 0 else "red"
     body.add_row("PnL realizado (cierres)", Text(f"{realized:+,.2f} USD", style=real_style))
+    if abs(realized_legacy) > 0.005:
+        body.add_row("PnL legacy (pre-integración)",
+                     Text(f"{realized_legacy:+,.2f} USD", style="dim"))
     body.add_row("Equity", f"${equity:,.2f}")
     body.add_row("Último ciclo",
                  time.strftime("%H:%M:%S", time.localtime(stats.get("last_cycle_at", 0)))
@@ -540,8 +554,10 @@ def _read_closures(state_dir: str):
 
 
 def view_history(runtime: RuntimeState):
+    from quant_math.ml.feature_store import integration_cutoff
     state_dir = (runtime.config_dict or {}).get(
         "state_dir", os.path.join(PROJECT_ROOT, "runtime", "state"))
+    cutoff = integration_cutoff(state_dir)
     closures = _read_closures(state_dir)
     if not closures:
         console.print("[yellow]Sin operaciones cerradas todavia "
@@ -575,7 +591,9 @@ def view_history(runtime: RuntimeState):
                 f"{c.get('entry_price', 0):g}", f"{c.get('exit_price', 0):g}",
                 Text(f"{pnl:+.2f}", style=style),
                 Text(f"{c.get('pnl_pct', 0):+.2f}%", style=style),
-                str(c.get("motivo_cierre", "")))
+                str(c.get("motivo_cierre", ""))
+                + ("·legacy" if cutoff and
+                   float(c.get("exit_time") or 0) < cutoff else ""))
         pnls = [float(c.get("pnl", 0.0)) for c in closures]
         wins = sum(1 for p in pnls if p > 0)
         summary = Table.grid(padding=(0, 2))
@@ -587,6 +605,14 @@ def view_history(runtime: RuntimeState):
         summary.add_row("PnL total:",
                         Text(f"{sum(pnls):+,.2f} USD",
                              style="green" if sum(pnls) >= 0 else "red"))
+        if cutoff:
+            legacy = [c for c in closures
+                      if float(c.get("exit_time") or 0) < cutoff]
+            if legacy:
+                lp = sum(float(c.get("pnl", 0)) for c in legacy)
+                summary.add_row(
+                    f"Legacy pre-integración ({len(legacy)} ops):",
+                    Text(f"{lp:+,.2f} USD", style="dim"))
         console.print(Panel(table, title=f"Historial — pagina "
                           f"{page+1}/{total_pages}"))
         console.print(Panel(summary, title="Resumen"))
