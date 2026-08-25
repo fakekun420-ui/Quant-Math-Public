@@ -122,8 +122,9 @@ def test_sl_close_writes_permanent_ledger():
         assert c["entry_time"] == 1700000000.0 and c["exit_time"] > 0
         assert not eng2.has_open_position("hyp_seed", "BTC/USDT")
 
-        positions_left = open(
-            os.path.join(tmp, "state", "positions.jsonl")).read().strip()
+        pos_path = os.path.join(tmp, "state", "positions.jsonl")
+        with open(pos_path) as pf:
+            positions_left = pf.read().strip()
         assert positions_left == ""
     print(f"PASS SL: cerrada en exit={sl_price} motivo='sl', pnl={c['pnl']:.4f}, "
           f"posiciones.jsonl limpio")

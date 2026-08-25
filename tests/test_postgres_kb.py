@@ -131,7 +131,8 @@ def test_fallback_to_jsonl_when_pg_down():
         assert loaded[hid]["expectancy"] == RECORD["expectancy"]
 
         assert kb.update_hypothesis(hid, {"status": "validated"}) is True
-        lines = [json.loads(l) for l in open(fallback)]
+        with open(fallback) as fh:
+            lines = [json.loads(l) for l in fh]
         assert lines[-1]["status"] == "validated"
 
         assert kb.retrieve_hypothesis(hid)["status"] == "validated"

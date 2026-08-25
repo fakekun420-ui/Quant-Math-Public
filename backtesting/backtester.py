@@ -489,9 +489,12 @@ class PerformanceMetrics:
 
         mean_return = np.mean(returns) * periods_per_year
         downside_returns = returns[returns < 0]
+        if downside_returns.size == 0:
+            # sin periodos perdedores: riesgo a la baja indefinidamente bajo
+            return float("inf") if returns.size else 0.0
         downside_std = np.std(downside_returns) * np.sqrt(periods_per_year)
 
-        if downside_std == 0:
+        if not np.isfinite(downside_std) or downside_std == 0:
             return 0.0
 
         sortino = (mean_return - risk_free_rate) / downside_std

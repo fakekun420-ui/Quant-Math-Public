@@ -72,6 +72,11 @@ include = ["quant_math*", "autonomous_research*", "algo_trading*", "backtesting*
 "" = "."
 
 [tool.pytest.ini_options]
+filterwarnings = [
+  # statsmodels aun no es compatible con la API de NumPy 2.5;
+  # el resultado numerico es correcto y el fix llegara con la libreria
+  "ignore:Setting the shape on a NumPy array has been deprecated:DeprecationWarning",
+]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]

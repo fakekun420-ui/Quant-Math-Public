@@ -54,7 +54,9 @@ class HiddenMarkovModel:
     def _update_parameters(self, returns, gamma, xi):
         n_obs = returns.shape[0]
         for i in range(self.n_regimes):
-            self.means[i] = np.mean(returns[gamma[:, i] > 0], axis=0)
+            mask = gamma[:, i] > 0
+            if mask.any():
+                self.means[i] = np.mean(returns[mask], axis=0)
 
     def predict(self, returns: np.ndarray) -> np.ndarray:
         return np.random.randint(0, self.n_regimes, size=len(returns))

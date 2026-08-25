@@ -16,31 +16,32 @@ from quant_math.ml.regime_learning import OperationLearningLoop
 
 def write_ledger(state_dir, rows):
     path = os.path.join(state_dir, "paper_executions.jsonl")
-    with open(path, "a", encoding="utf-8") as fh:
+    kb_path = os.path.join(state_dir, "kb.jsonl")
+    seen = set()
+    if os.path.exists(kb_path):
+        with open(kb_path, encoding="utf-8") as kf:
+            for line in kf:
+                if line.strip():
+                    seen.add(json.loads(line)["hypothesis_id"])
+    with open(path, "a", encoding="utf-8") as fh, \
+         open(kb_path, "a", encoding="utf-8") as kfh:
         for exit_time, sym, fam, pnl_pct, vol, fu in rows:
             hid = f"hyp_{sym.split('/')[0]}_{fam}_{int(exit_time)}"
+            if hid not in seen:
+                kfh.write(json.dumps({
+                    "hypothesis_id": hid, "symbol": sym,
+                    "strategy_type": fam,
+                    "parameters": {"donchian_window": 20,
+                                   "_regime": {"vol_pct": vol,
+                                               "forecast_up": bool(fu)}}},
+                    ensure_ascii=False) + "\n")
+                seen.add(hid)
             rec = {"type": "closure", "key": f"{hid}:{sym}",
                    "hypothesis_id": hid, "symbol": sym, "side": "buy",
-                   "entry_price": 100, "exit_price": 100 * (1 + pnl_pct/100),
+                   "entry_price": 100, "exit_price": 100 * (1 + pnl_pct / 100),
                    "quantity": 1.0, "pnl": pnl_pct, "pnl_pct": pnl_pct,
                    "entry_time": exit_time - 60, "exit_time": exit_time,
                    "motivo_cierre": "tp" if pnl_pct > 0 else "sl"}
-            with open(os.path.join(state_dir, "kb_tmp"), "w") as _:
-                pass
-            kb_path = os.path.join(state_dir, "kb.jsonl")
-            kb = {"hypothesis_id": hid, "symbol": sym,
-                  "strategy_type": fam,
-                  "parameters": {"donchian_window": 20,
-                                 "_regime": {"vol_pct": vol,
-                                             "forecast_up": bool(fu)}}}
-            if not os.path.exists(kb_path):
-                with open(kb_path, "w") as k:
-                    k.write(json.dumps(kb) + "\n")
-            else:
-                cur = [json.loads(l) for l in open(kb_path)]
-                if not any(x["hypothesis_id"] == hid for x in cur):
-                    with open(kb_path, "a") as k:
-                        k.write(json.dumps(kb) + "\n")
             fh.write(json.dumps(rec) + "\n")
 
 
