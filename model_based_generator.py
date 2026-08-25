@@ -39,10 +39,38 @@ except Exception:
 MIN_CLOSES = 80
 
 
+def _dominant_cycle(closes):
+    """Ciclo dominante en velas via FFT del paquete spectral_analysis
+    existente (sin duplicar implementacion). None si no hay pico claro."""
+    try:
+        import numpy as _np
+        from spectral_analysis.fft import FastFourierTransform
+        rets = _np.diff(_np.log(_np.asarray(closes, dtype=float)))
+        fft = FastFourierTransform(sampling_rate=1.0)
+        peak_freq, peak_mag = fft.find_peak_frequency(
+            rets, min_freq=1 / 120, max_freq=0.4)
+        if peak_freq <= 0 or peak_mag <= 0:
+            return None
+        cycle = int(round(1.0 / peak_freq))
+        return cycle if 5 <= cycle <= 120 else None
+    except Exception as exc:
+        logger.debug("FFT ciclo fallo: %s", exc)
+        return None
+
+
 def analyze_series(closes) -> dict:
     """ARIMA(1,1,0): signo del forecast; GARCH(1,1): percentil de la volatilidad
     condicional actual vs su propia historia. Todo explicable."""
-    out = {"n": len(closes), "forecast_up": None, "vol_pct": None}
+    out = {"n": len(closes), "forecast_up": None, "vol_pct": None,
+           "cycle_len": None, "k_slope": 0.0, "k_noise": 1.0}
+    try:
+        from quant_math.ml.kalman_feature import kalman_features
+        kf = kalman_features(list(closes))
+        out["k_slope"] = kf["kalman_slope_pct"]
+        out["k_noise"] = kf["kalman_noise"]
+    except Exception as exc:
+        logger.debug("kalman fallo: %s", exc)
+    out["cycle_len"] = _dominant_cycle(list(closes))
     closes = np.asarray(closes, dtype=float)
     if _HAS_TS and len(closes) >= MIN_CLOSES:
         try:
@@ -78,7 +106,10 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
     # Contexto de mercado persistente: viaja dentro de parameters hasta el
     # KB para que el aprendizaje no supervisado pueda usarlo como feature.
     regime = {"vol_pct": info.get("vol_pct"),
-              "forecast_up": info.get("forecast_up")}
+              "forecast_up": info.get("forecast_up"),
+              "cycle_len": info.get("cycle_len"),
+              "k_slope": info.get("k_slope"),
+              "k_noise": info.get("k_noise")}
     out = []
 
     def _attach(params):
@@ -91,7 +122,9 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
     up = info.get("forecast_up")
     vol = info.get("vol_pct")
     if up is not None and vol is not None and vol >= 70:
-        window = 10 if up else 20
+        cycle = info.get("cycle_len")
+        window = max(7, min(40, round(cycle / 2))) if cycle \
+            else (10 if up else 20)
         out.append({
             "name": f"MGARCH_Breakout_{window}_{sym}",
             "description": (f"GARCH vol_p={vol:.0f}% ARIMA_up={up} -> "

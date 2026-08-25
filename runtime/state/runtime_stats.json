@@ -1,26 +1,28 @@
 {
-  "state": "STOPPED",
-  "cycles_completed": 13,
-  "hypotheses_generated": 65,
-  "hypotheses_evaluated": 65,
+  "state": "RUNNING",
+  "cycles_completed": 48,
+  "hypotheses_generated": 131,
+  "hypotheses_evaluated": 131,
   "signals": 0,
-  "no_entry": 13,
-  "skipped_position": 0,
+  "no_entry": 0,
+  "skipped_position": 48,
   "paper_trades_taken": 0,
-  "started_at": 1787465778.247192,
-  "last_cycle_at": 1787467845.9253435,
+  "started_at": 1787630376.389855,
+  "last_cycle_at": 1787634951.2598279,
   "config": {
     "symbols": [
       "XRP/USDT"
     ],
-    "initial_capital": 10.0,
-    "entry_pct": 0.1,
+    "initial_capital": 1000000.0,
+    "entry_pct": 0.0001,
     "timeframe": "1m",
-    "take_profit_pct": 0.04,
-    "lookback_days": 90,
+    "take_profit_pct": 0.05,
+    "stop_loss_pct": 0.025,
+    "lookback_days": 30,
     "min_paper_trades": 3,
-    "hypotheses_per_cycle": 5,
+    "hypotheses_per_cycle": 3,
     "exchange_id": "bybit",
-    "mode": "paper"
+    "mode": "paper",
+    "kb_backend": "postgresql"
   }
 }

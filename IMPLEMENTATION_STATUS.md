@@ -27,18 +27,17 @@ Estado real verificado con la suite completa (58 tests, 0 warnings).
 | SIS clustering + recomendaciones | 30 cierres post-cutoff | creciendo (cutoff v1.0.1 fijado) |
 | Family feedback AQDE | 3 ops por familia×símbolo | disparando por múltiplos |
 
-## 📋 Propuestos (pendientes de aprobación — no implementados)
+## ✅ Implementados en v1.0.1 (ex-propuestas del README v0.x)
 
-Derivados del README original v0.x, evaluados como viables:
+| Sistema | Ubicación | Integración |
+|---|---|---|
+| Kalman filter features | `quant_math/ml/kalman_feature.py` | `_regime.k_slope/.k_noise` → SIS features |
+| Spectral FFT ciclo dominante | reutiliza `spectral_analysis.fft.find_peak_frequency` | `_regime.cycle_len` → ventana donchian adaptativa |
+| Prior Bayesiano formal (IC90) | `hypothesis_prior.beta_posterior()` | CI90 por celda en summary/logs |
+| Cross-symbol validation | `orchestrator._result_to_kb_record` | familia ganadora en otro símbolo eleva backtested→validated (nunca rescata failed) |
 
-1. **Kalman filters** — state estimation; encajaría como feature del SIS
-   (`feature_store`) y/o suavizado para regime_detection.
-2. **Spectral/Wavelet analysis** — ciclos dominantes → selección de ventanas
-   de estrategias; conectaría `spectral_analysis/` al model_based_generator.
-3. **Formalización bayesiana** — elevar el prior shrinkage a Beta/Bayes
-   explícito con posterior updating.
-4. **Multi-asset / multi-timeframe validation** — el orchestrator ya soporta
-   listas de símbolos; falta validación cruzada estructurada.
+Compat shim incluido: `spectral_analysis/wavelet_analysis.py` soporta
+scipy>=1.12 (cwt/ricker eliminadas upstream).
 5. **Visualización Python (matplotlib/plotly)** — hoy vive en webui Vue;
    opcional para reportes offline.
 

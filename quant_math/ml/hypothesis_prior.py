@@ -77,6 +77,31 @@ class HypothesisPrior:
     def is_active(self) -> bool:
         return self.mode == "active"
 
+    def beta_posterior(self, strategy_type: Any, symbol: str,
+                       ci_level: float = 0.10) -> Tuple[float, float, float]:
+        """Posterior Beta(a,b) de la celda (formalizacion bayesiana).
+
+        Devuelve (mean, ci_lo, ci_hi) al nivel 1-alpha usando scipy.stats
+        cuando esta disponible; celdas finas heredan el shrinkage del prior
+        global como en positive_rate()."""
+        st = _norm_type(strategy_type)
+        n_pos, n = self._cell_stats.get((st, symbol), (0.0, 0))
+        rate = self.positive_rate(st, symbol)
+        if n < MIN_CELL:
+            return rate, 0.0, 1.0          # sin datos suficientes: CI maxima
+        a = alpha_pos = n_pos * rate / max(rate, 1e-9) if False else None
+        # posterior Beta con conteos reales + prior uniforme
+        a = 1.0 + n_pos
+        b = 1.0 + (n - n_pos)
+        try:
+            from scipy import stats as sps
+            lo = float(sps.beta.ppf(ci_level / 2, a, b))
+            hi = float(sps.beta.ppf(1 - ci_level / 2, a, b))
+            mean = float(sps.beta.mean(a, b))
+            return mean, lo, hi
+        except Exception:
+            return rate, max(0.0, rate - 0.15), min(1.0, rate + 0.15)
+
     def positive_rate(self, strategy_type: Any, symbol: str) -> float:
         """Shrunk estimate of P(expectancy>0); fully explainable formula."""
         st = _norm_type(strategy_type)
@@ -130,15 +155,17 @@ class HypothesisPrior:
             (((st, sym), p / n) for (st, sym), (p, n) in
              self._cell_stats.items() if n),
             key=lambda kv: -kv[1])[:5]
+        cells_out = []
+        for (st, sym), r in top_cells:
+            mean, lo, hi = self.beta_posterior(st, sym)
+            cells_out.append({"strategy_type": st, "symbol": sym,
+                              "positive_rate": round(r, 3),
+                              "ci90": [round(lo, 3), round(hi, 3)]})
         return {
             "mode": self.mode,
             "total": self.total,
             "global_positive_rate": round(self.global_rate, 4),
-            "top_cells": [
-                {"strategy_type": st, "symbol": sym,
-                 "positive_rate": round(r, 3)}
-                for (st, sym), r in top_cells
-            ],
+            "top_cells": cells_out,
         }
 
 

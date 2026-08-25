@@ -311,6 +311,30 @@ class Orchestrator:
         if scientific_score <= 0.6:
             status = StrategyStatus.FAILED.value
 
+        # Validacion cruzada entre simbolos: una familia que ya rinde
+        # positivo en OTRO simbolo (>=MIN_CROSS_OPS ops, win_rate>=40%)
+        # eleva backtested->validated. Nunca degrada ni toca el gate.
+        cross_validated = False
+        min_kb_rows = int(os.environ.get("QUANTMATH_MIN_KB_ROWS", "100"))
+        if os.environ.get("QUANTMATH_CROSS_SYMBOL_VALIDATION", "1") == "1" \
+                and len(self.engine.hypotheses) >= min_kb_rows:
+            st_raw = getattr(hyp, "strategy_type", "")
+            st_val = getattr(st_raw, "value", None)
+            if not isinstance(st_val, str):
+                st_val = str(st_raw)
+            fam = str(st_val).split(".")[-1]
+            for rec in self.engine.hypotheses.values():
+                if rec.get("symbol") == symbol:
+                    continue
+                other_fam = str(rec.get("strategy_type", "")).split(".")[-1]
+                if (other_fam == fam
+                        and int(rec.get("n_trades") or 0) >= 5
+                        and float(rec.get("win_rate") or 0) >= 40.0):
+                    cross_validated = True
+                    if status == "backtested":
+                        status = "validated"
+                    break
+
         return {
             "hypothesis_id": hyp_id,
             "name": getattr(hyp, "name", hyp_id),
@@ -319,6 +343,7 @@ class Orchestrator:
                                      str(getattr(hyp, "strategy_type", ""))),
             "symbol": symbol,
             "status": status,
+            "cross_symbol_validated": cross_validated,
             "expectancy": expectancy,
             "scientific_score": scientific_score,
             "win_rate": win_rate,

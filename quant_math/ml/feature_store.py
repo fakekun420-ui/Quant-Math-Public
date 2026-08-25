@@ -75,11 +75,10 @@ def build_trade_dataset(kb_records: Dict[str, Dict[str, Any]],
         p_num = next((float(params[k]) for k in NUMERIC_PARAM_KEYS
                       if k in params and params[k] is not None), None)
         fu = regime.get("forecast_up")
+        st_raw = h.get("strategy_type")
+        st = getattr(st_raw, "value", None) or str(st_raw or "")
         rows.append({
-            "strategy_type": h.get("strategy_type",
-                                   c.get("hypothesis_id", "")).split("_")[0]
-                           if h.get("strategy_type") is None
-                           else str(h.get("strategy_type")),
+            "strategy_type": st.split(".")[-1],
             "symbol": c.get("symbol", ""),
             "motivo": c.get("motivo_cierre", ""),
             "pnl_pct": c.get("pnl_pct"),
@@ -88,6 +87,9 @@ def build_trade_dataset(kb_records: Dict[str, Dict[str, Any]],
             "p_window": p_num,
             "vol_pct": regime.get("vol_pct"),
             "forecast_up": (1.0 if fu else 0.0) if fu is not None else None,
+            "cycle_len": regime.get("cycle_len"),
+            "k_slope": regime.get("k_slope"),
+            "k_noise": regime.get("k_noise"),
         })
     return rows
 
@@ -105,7 +107,9 @@ def encode_row(row: Dict[str, Any]) -> List[float]:
             return -1.0
         return v
     return [fam, mot, num(row.get("pnl_pct")), num(row.get("p_window")),
-            num(row.get("vol_pct")), num(row.get("forecast_up"))]
+            num(row.get("vol_pct")), num(row.get("forecast_up")),
+            num(row.get("cycle_len")), num(row.get("k_slope")),
+            num(row.get("k_noise"))]
 
 
 def encode_dataset(rows: List[Dict[str, Any]]) -> List[List[float]]:

@@ -8,7 +8,28 @@ frequency analysis of time series data.
 import numpy as np
 from typing import Tuple, Optional
 import matplotlib.pyplot as plt
-from scipy.signal import cwt, ricker
+try:
+    from scipy.signal import cwt, ricker
+except ImportError:                      # scipy >= 1.12 elimino cwt/ricker
+    def ricker(points, a):
+        x = np.linspace(-(points - 1) / 2.0, (points - 1) / 2.0, points)
+        norm = 2.0 / (np.sqrt(3 * a) * np.pi ** 0.25)
+        return norm * (1 - (x / a) ** 2) * np.exp(-((x / a) ** 2) / 2)
+
+    def cwt(data, wavelet, widths):
+        out = np.empty((len(widths), len(data)))
+        n = len(data)
+        for i, w in enumerate(widths):
+            try:
+                wave = wavelet(min(10 * w, n), w)   # convencion scipy
+            except TypeError:
+                xs = np.linspace(-5 * w, 5 * w, min(10 * w, n))
+                wave = np.array([wavelet(v) for v in xs])  # lambdas 1-arg
+            if len(wave) > n:
+                wave = wave[:n]
+            conv = np.convolve(data, wave, mode="same")
+            out[i] = np.real(conv)
+        return out
 
 
 class ContinuousWaveletTransform:
@@ -89,14 +110,16 @@ class ContinuousWaveletTransform:
         else:
             coeffs = cwt(data, wavelet_func, self.scales)
         
-        self.coeffs = np.abs(coeffs)
+        self.coeffs = np.abs(np.asarray(coeffs, dtype=complex)).real \
+            if np.iscomplexobj(np.asarray(coeffs)) else np.asarray(coeffs)
         
         # Convert scales to frequencies
+        scales_arr = np.asarray(self.scales, dtype=float)
         if sampling_rate > 0:
             # Approximate relationship: f = 1 / scale
-            self.freqs = 1.0 / self.scales
+            self.freqs = 1.0 / scales_arr
         else:
-            self.freqs = self.scales.copy()
+            self.freqs = scales_arr.copy()
         
         return self.coeffs, self.freqs
     
