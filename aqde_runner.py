@@ -119,12 +119,22 @@ class AQDERunner:
             return self._mkt_cache[key]
         end_date = datetime.now()
         start_date = end_date - timedelta(days=self.lookback_days)
-        if self.dry_run and not self.force_real_data:
-            market_data = self.adapter.generate_synthetic_data(
-                symbol, n_candles=1000)
-        else:
-            market_data = self.adapter.fetch_market_data(
-                symbol, start_date, end_date, self.timeframe)
+        try:
+            if self.dry_run and not self.force_real_data:
+                market_data = self.adapter.generate_synthetic_data(
+                    symbol, n_candles=1000)
+            else:
+                market_data = self.adapter.fetch_market_data(
+                    symbol, start_date, end_date, self.timeframe)
+        except Exception as exc:
+            # F1: red inestable -> reutilizar datos previos del ciclo en vez
+            # de abortar todo el trabajo ya realizado.
+            stale = self._mkt_cache.get(key)
+            if stale is not None:
+                print(f"  [cache] descarga fallo ({type(exc).__name__}); "
+                      f"usando datos previos de {symbol}")
+                return stale
+            raise
         self._mkt_cache[key] = market_data
         return market_data
 
@@ -288,6 +298,13 @@ class AQDERunner:
         worst_strategies = feedback.get('worst_strategies', [])
         cross_symbol_insights = feedback.get('cross_symbol_insights', {})
 
+        # Jitter determinista por ciclo: los deltas de mutacion rotan para
+        # que las firmas no se repitan identicas y el dedupe no las coma.
+        it_j = int(getattr(self, "iteration", 0) or 0)
+        jit = ((it_j * 7) % 9) - 4          # rango -4..4
+        delta_pool = [(d + jit) for d in (-2, -1, 1, 2)]
+        delta_pool = [d if d != 0 else (jit or 1) for d in delta_pool]
+
         # === 1. PARAMETER MUTATION (Genetic Algorithm style) ===
         for best in best_strategies[:3]:
             base_params = best.get('parameters', {})
@@ -296,7 +313,7 @@ class AQDERunner:
             # Mutation 1: Fine-tune parameters
             if 'short_window' in base_params:
                 # Small perturbations for local search
-                for delta in [-2, -1, 1, 2]:
+                for delta in delta_pool:
                     hyp = {
                         "name": f"{best['name']}_Mut_{delta:+d}",
                         "description": f"Mutated {best['name']} (delta={delta:+d})",

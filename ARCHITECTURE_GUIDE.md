@@ -530,3 +530,10 @@ This ensures **zero breaking changes** for any external code.
 ---
 
 *End of ARCHITECTURE_GUIDE.md*
+## Riesgo: overshoot del Stop Loss (documentado)
+
+El TP/SL se comprueba una vez por ciclo contra el precio de cierre actual
+(vela real Bybit). Entre chequeos el precio puede sobrepasar el nivel, por
+lo que el movimiento de cierre real puede exceder el SL teorico
+(ej. SL 2.5% -> cierres observados 2.52-2.81%). Es slippage estructural del
+diseno, no un bug. Mitigacion futura posible: evaluar high/low intrabar.

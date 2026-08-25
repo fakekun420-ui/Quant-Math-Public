@@ -5,6 +5,7 @@ Provides unified interface to multiple cryptocurrency exchanges
 
 import ccxt
 from typing import List, Dict, Any, Optional
+import time
 from datetime import datetime
 import pandas as pd
 import logging
@@ -83,20 +84,29 @@ class ExchangeAPI:
         Returns:
             List of [timestamp, open, high, low, close, volume] lists
         """
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol,
-                timeframe,
-                since=since,
-                limit=limit
-            )
-
-            logger.info(f"Fetched {len(ohlcv)} candles for {symbol}")
-            return ohlcv
-
-        except Exception as e:
-            logger.error(f"Failed to fetch OHLCV: {e}")
-            raise
+        # Reintentos con backoff: un timeout transitorio de una pagina no
+        # debe abortar el ciclo completo del orchestrator (F1).
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(
+                    symbol,
+                    timeframe,
+                    since=since,
+                    limit=limit
+                )
+                logger.info(f"Fetched {len(ohlcv)} candles for {symbol}")
+                return ohlcv
+            except Exception as e:
+                last_err = e
+                if attempt < 3:
+                    wait_s = 2 ** attempt
+                    logger.warning(
+                        f"OHLCV intento {attempt}/3 fallo ({e}); reintento "
+                        f"en {wait_s}s")
+                    time.sleep(wait_s)
+        logger.error(f"Failed to fetch OHLCV tras 3 intentos: {last_err}")
+        raise last_err
 
     def fetch_order_book(
         self,

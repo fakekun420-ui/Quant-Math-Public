@@ -583,7 +583,7 @@ class Backtester:
 
     def __init__(self, initial_capital: float = 100000.0,
                  commission_rate: float = 0.001,
-                 min_commission: float = 1.0):
+                 min_commission: float = 0.0):
         """
         Initialize backtester.
 

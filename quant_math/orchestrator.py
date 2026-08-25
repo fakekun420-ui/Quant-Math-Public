@@ -214,13 +214,18 @@ class Orchestrator:
         # Firmas ya publicadas en el KB: evita regenerar la misma hipotesis
         # identica ciclo tras ciclo (mismo tipo+simbolo+parametros).
         import json as _json
-        seen = set()
+        # Firma -> ultimo ciclo publicado. Una firma conocida se puede
+        # re-backtestear cada K ciclos para refrescar expectancy con datos
+        # nuevos (evita el estancamiento generadas=0).
+        K = int(os.environ.get("QUANTMATH_SIG_REFRESH_CYCLES", "5"))
+        seen = {}
         for h in self.engine.hypotheses.values():
             sig = _json.dumps(
                 [h.get("strategy_type"), h.get("symbol"),
                  sorted((h.get("parameters") or {}).items())],
-                sort_keys=True)
-            seen.add(sig)
+                sort_keys=True, default=str)
+            last = int(h.get("orchestrator_cycle") or 0)
+            seen[sig] = max(seen.get(sig, 0), last)
 
         made = 0
         for i, symbol in enumerate(symbols):
@@ -246,9 +251,10 @@ class Orchestrator:
                     st = str(hyp.strategy_type)
                 sig = _json.dumps([st, symbol, sorted(params.items())],
                                   sort_keys=True, default=str)
-                if sig in seen:
+                last = seen.get(sig)
+                if last is not None and (self.cycle_count - last) < K:
                     continue
-                seen.add(sig)
+                seen[sig] = self.cycle_count
                 fresh.append(hid)
             skipped = len(hyp_ids) - len(fresh)
             if skipped:
