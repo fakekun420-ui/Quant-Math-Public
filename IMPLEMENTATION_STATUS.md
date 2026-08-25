@@ -1,6 +1,6 @@
 # QUANT-MATH Implementation Status — v1.0.1
 
-Estado real verificado con la suite completa (58 tests, 0 warnings).
+Estado real verificado con la suite completa (69 tests, 0 warnings).
 
 ## ✅ Núcleo en producción
 
@@ -13,7 +13,7 @@ Estado real verificado con la suite completa (58 tests, 0 warnings).
 | `backtesting/` | ✅ | Comisión proporcional 0.1% (fix wr=0%), sortino NaN-safe, WFV con cache intra-ciclo |
 | `regime_detection/` | ✅ | Clustering + features; conectable como feature SIS |
 | `quant_math/orchestrator.py` | ✅ | Ciclos, dedupe+refresh-K, publish KB, stats runtime |
-| `quant_math/decision_engine/` | ✅ | Gate expectancy, LEARN_MODE, TP/SL 2:1 por ciclo, recuperación de posiciones, feedback key+familia |
+| `quant_math/decision_engine/` | ✅ | Gate expectancy, LEARN_MODE, TP/SL 2:1 por ciclo, recuperación de posiciones, feedback key+familia, fallback al siguiente mejor candidato (P1), expectancy viva con shrinkage bayesiano (PA), auto-graduación de LEARN_MODE (PB) |
 | `quant_math/cli/main.py` | ✅ | Menú/wizard/monitor/historial, autoarranque VM PG, log rotativo |
 | `quant_math/ml/` | ✅ | Prior supervisado (active), SIS KMeans+regímenes, feature store con cutoff, reset base |
 | `model_based_generator.py` | ✅ | ARIMA/GARCH → candidatos ejecutables con contexto `_regime` |
@@ -26,6 +26,7 @@ Estado real verificado con la suite completa (58 tests, 0 warnings).
 | Prior supervisado → advisory ranking | 100 registros KB | activo (>900 históricos archivados; base nueva creciendo) |
 | SIS clustering + recomendaciones | 30 cierres post-cutoff | creciendo (cutoff v1.0.1 fijado) |
 | Family feedback AQDE | 3 ops por familia×símbolo | disparando por múltiplos |
+| Auto-graduación LEARN_MODE (PB) | 30 cierres con media > 0 (`QUANTMATH_GRAD_WINDOW`) | armada; decisión persistida en `runtime/state/graduation.json` |
 
 ## ✅ Implementados en v1.0.1 (ex-propuestas del README v0.x)
 
@@ -38,8 +39,14 @@ Estado real verificado con la suite completa (58 tests, 0 warnings).
 
 Compat shim incluido: `spectral_analysis/wavelet_analysis.py` soporta
 scipy>=1.12 (cwt/ricker eliminadas upstream).
-5. **Visualización Python (matplotlib/plotly)** — hoy vive en webui Vue;
-   opcional para reportes offline.
+
+## ✅ Implementados en v1.0.1 (mejoras de decisión, commits 6414e71 / d99d3cd)
+
+| Sistema | Ubicación | Efecto |
+|---|---|---|
+| P1: fallback de ranking | `decision_engine.main.ranked_candidates` + `decide` | si el mejor candidato tiene posición abierta, entra el siguiente mejor (gate por candidato); fin del idling por guard |
+| PA: expectancy viva | `decision_engine.main._refresh_live_expectancy` | tras cada cierre re-blendea la expectancy del registro hacia resultados reales (`est = (n·propia+3·familia)/(n+3)`; `exp = w·gen+(1-w)·est`, w=n/(n+5)); persiste en PG+JSONL; log `[exp-refresh]` |
+| PB: auto-graduación | `decision_engine.main._maybe_graduate` | con los últimos N cierres de media positiva desactiva LEARN_MODE y restaura el gate; persiste en `runtime/state/graduation.json`; flags `QUANTMATH_AUTO_GRADUATE` / `QUANTMATH_GRAD_WINDOW` |
 
 ## ❌ Descartados (no implementar)
 
@@ -55,5 +62,5 @@ python -m pytest test_integration.py tests/ \
     ml_quant/test_standalone.py order_management/test_standalone.py \
     portfolio_construction/test_standalone.py regime_detection/test_standalone.py \
     risk_management/test_standalone.py
-# 58 passed · 0 warnings
+# 69 passed · 0 warnings
 ```

@@ -22,7 +22,15 @@ AQDE Runner ── templates + ARIMA/GARCH candidates + adaptive mutations
 Orchestrator ── publish to Knowledge Base (PostgreSQL ⇄ JSONL fallback)
    │
    ▼
-Decision Engine ── expectancy gate (LEARN_MODE can bypass temporarily)
+Decision Engine ── ranked candidates (expectancy DESC, score DESC);
+   │                 falls back to next-best candidate when the top one
+   │                 already has an open position (P1)
+   │                 · expectancy gate (LEARN_MODE can bypass temporarily;
+   │                   auto-graduates when the last N closures turn net
+   │                   positive — PB)
+   │                 · live expectancy: after each closure the record's
+   │                   expectancy is re-blended toward realized results with
+   │                   Bayesian shrinkage (PA) so ranking self-improves
    │                 · TP = entry ± take_profit_pct
    │                 · SL = take_profit_pct / 2  (risk ratio 2:1, mandatory)
    │                 · checked each cycle against REAL close prices
@@ -48,7 +56,7 @@ loss-collection experiments, paper-only).
 # Interactive CLI (menu → wizard → orchestrator in background process)
 python -m quant_math.cli.main
 
-# Run the full test suite (58+ tests across all modules)
+# Run the full test suite (69 tests across all modules)
 python -m pytest test_integration.py tests/ \
     algo_trading/test_standalone.py backtesting/test_standalone.py \
     ml_quant/test_standalone.py order_management/test_standalone.py \
@@ -96,10 +104,13 @@ graphify update .
 | SIS Unsupervised | KMeans + regime tables | Closed paper operations (post-integration cutoff) | Family/regime priority for generation; exploration bursts on losing streaks |
 | Model-Based Generator | ARIMA(1,1,0) / GARCH(1,1) | Real price series at generation time | Adds executable candidates (breakout/rsi/macd variants) chosen by regime |
 | Adaptive Mutations | Evolutionary | Backtest results (best/worst strategies) | Parameter mutations toward winners, counter-strategies vs losers |
+| Live Expectancy (PA) | Bayesian shrinkage blend | Realized paper PnL per closed trade (`[exp-refresh]`) | Re-scores hypothesis records after every closure; ranking self-improves toward what actually works |
+| Auto-Graduation (PB) | Rolling-window rule | Mean of last N closures | Automatically disables LEARN_MODE when learning succeeds; decision persisted in `graduation.json` |
 
-All learning is **advisory**: it biases *what gets generated*, never whether
-a trade happens. Data-starvation safe: below minimum sample thresholds every
-learner stays in "collecting" mode.
+All generation-side learning is **advisory**: it biases *what gets generated*,
+never whether a trade happens. PA changes *which ranked candidate is best*
+(the gate itself stays sacred); PB only flips the gate back on. Data-starvation
+safe: below minimum sample thresholds every learner stays in "collecting" mode.
 
 ## Environment Flags
 
@@ -113,6 +124,8 @@ learner stays in "collecting" mode.
 | `QUANTMATH_SIG_REFRESH_CYCLES` | `5` | Cycles before a known hypothesis signature is re-backtested |
 | `QUANTMATH_SIS_MIN_ROWS` | `30` | Closed ops required before SIS activates |
 | `QUANTMATH_ML_MIN_RECORDS` | `100` | Records required before the prior activates |
+| `QUANTMATH_AUTO_GRADUATE` | `1` | Enable PB auto-graduation of LEARN_MODE (`0` to disable) |
+| `QUANTMATH_GRAD_WINDOW` | `30` | Closures in the rolling window that must average positive to graduate |
 
 ## Data Policy
 
@@ -147,10 +160,11 @@ visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
 
 ## Testing
 
-58 tests, zero warnings: integration workflow, decision-engine gate
-behavior, SIS clustering/recommendations, family feedback buckets,
-SL 2:1 exactness, position recovery, KB round-trip + fallback, prior
-activation thresholds, model-based generator contracts.
+69 tests, zero warnings: integration workflow, decision-engine gate
+behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
+auto-graduation persistence (PB), SIS clustering/recommendations, family
+feedback buckets, SL 2:1 exactness, position recovery, KB round-trip +
+fallback, prior activation thresholds, model-based generator contracts.
 
 ## License
 
