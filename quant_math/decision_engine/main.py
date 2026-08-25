@@ -566,12 +566,16 @@ class DecisionEngine:
                 except Exception as exc:
                     logger.warning("family feedback KB update fallo (%s)", exc)
                 self._save_hypothesis(merged)
-            if targets:
+            last_bucket = getattr(self, "_family_last_bucket", {})
+            if targets and bucket > last_bucket.get((fam, symbol), 0):
                 delivered.append((fam, n, round(mean_pnl, 4)))
                 logger.info(
                     "[family-feedback] %s/%s ops=%d wins=%d mean_pnl_pct=%.4f "
                     "-> %d registros del KB", fam, symbol, n, wins, mean_pnl,
                     len(targets))
+                self._family_last_bucket = getattr(
+                    self, "_family_last_bucket", {})
+                self._family_last_bucket[(fam, symbol)] = bucket
         return delivered
 
     # ------------------------------------------------------------------

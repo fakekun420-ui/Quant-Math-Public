@@ -127,14 +127,17 @@ class AQDERunner:
                 market_data = self.adapter.fetch_market_data(
                     symbol, start_date, end_date, self.timeframe)
         except Exception as exc:
-            # F1: red inestable -> reutilizar datos previos del ciclo en vez
-            # de abortar todo el trabajo ya realizado.
+            # F1: red inestable -> reutilizar datos previos del ciclo si
+            # existen; si nunca se descargaron, devolver None para que el
+            # ciclo continue con otros simbolos en vez de abortar entero.
             stale = self._mkt_cache.get(key)
             if stale is not None:
                 print(f"  [cache] descarga fallo ({type(exc).__name__}); "
                       f"usando datos previos de {symbol}")
                 return stale
-            raise
+            print(f"  [datos] {symbol} sin red y sin cache: backtests "
+                  f"omitidos este ciclo")
+            return None
         self._mkt_cache[key] = market_data
         return market_data
 
@@ -641,8 +644,12 @@ class AQDERunner:
         """Run backtests for all hypotheses of a symbol"""
         results = []
 
-        # Fetch market data once
+        # Fetch market data once (None si red/caida sin cache)
         market_data = self.get_or_fetch_market_data(symbol)
+        if market_data is None:
+            print(f"  [datos] {symbol}: omitidos {len(hypothesis_ids)} "
+                  f"backtests este ciclo")
+            return results
 
         print(f"  Data fetched: {market_data['count']} candles")
 
@@ -706,6 +713,9 @@ class AQDERunner:
         
         # Datos con cache intra-ciclo (misma descarga que el backtest)
         market_data = self.get_or_fetch_market_data(symbol)
+        if market_data is None:
+            print(f"  [datos] {symbol}: WFV omitido este ciclo")
+            return {}
         
         # Convert market data to format expected by WalkForwardValidator
         # market_data contains 'data' key with DataFrame
