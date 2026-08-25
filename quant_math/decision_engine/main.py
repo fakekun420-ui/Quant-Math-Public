@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,13 @@ logger = logging.getLogger(__name__)
 QUERYABLE_STATUSES = ("validated", "backtested", "monte_carlo_tested", "failed")
 NO_ENTRY_REASON = "sin hipótesis de expectativa positiva disponible"
 DEFAULT_MIN_PAPER_TRADES = 3
+
+# PA (expectancy viva): al cerrar operaciones se recalcula la expectancy del
+# registro mezclando el valor estatico de generacion con el resultado real,
+# con shrinkage bayesiano: primero la media propia hacia la media de familia,
+# y luego el estimador realizado hacia la expectancy original.
+LIVE_SHRINK_E = 5.0      # peso del dato propio vs expectancy de generacion
+FAMILY_SHRINK_K = 3.0    # shrinkage de la media propia hacia la de familia
 
 # LEARN MODE: cuando esta activo, el gate expectancy>0 se desactiva TEMPORAL-
 # MENTE para que el sistema opere tambien hipotesis negativas y aprenda de
@@ -58,6 +66,8 @@ class DecisionEngine:
         use_postgres: bool = True,
         take_profit_pct: Optional[float] = None,
         learn_mode: Optional[bool] = None,
+        auto_graduate: Optional[bool] = None,
+        graduate_window: Optional[int] = None,
     ):
         self.symbols = list(symbols)
         self.kb_path = kb_path
@@ -75,6 +85,38 @@ class DecisionEngine:
                 "[LEARN MODE] gate expectancy>0 DESACTIVADO temporalmente — "
                 "el sistema operara tambien hipotesis negativas (paper) para "
                 "alimentar el aprendizaje no supervisado")
+
+        # PB (auto-graduacion): cuando los ultimos N cierres tienen media
+        # positiva, LEARN_MODE se desactiva solo y el gate expectancy>0
+        # vuelve; la decision queda registrada y sobrevive reinicios.
+        self.graduated = False
+        self.graduation_path = os.path.join(state_dir, "graduation.json")
+        _ag = (os.environ.get("QUANTMATH_AUTO_GRADUATE", "1") != "0"
+               if auto_graduate is None else bool(auto_graduate))
+        _gw = (graduate_window if graduate_window is not None
+               else int(os.environ.get("QUANTMATH_GRAD_WINDOW", "30")))
+        self.auto_graduate = _ag
+        self.graduate_window = max(1, int(_gw))
+        _prev = {}
+        if os.path.exists(self.graduation_path):
+            try:
+                with open(self.graduation_path, encoding="utf-8") as fh:
+                    _prev = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                _prev = {}
+        if _prev.get("graduated"):
+            self.graduated = True
+            if self.learn_mode:
+                self.learn_mode = False
+                logger.warning(
+                    "[graduacion] previa detectada (%s) — gate "
+                    "expectancy>0 permanece restaurado",
+                    time.strftime("%Y-%m-%d %H:%M",
+                                  time.localtime(_prev.get("at") or 0)))
+        elif self.learn_mode and self.auto_graduate:
+            logger.info("[graduacion] automatica armada: se desactivara "
+                        "LEARN_MODE con %d cierres de media positiva",
+                        self.graduate_window)
 
         os.makedirs(os.path.dirname(kb_path) or ".", exist_ok=True)
         os.makedirs(state_dir, exist_ok=True)
@@ -289,6 +331,8 @@ class DecisionEngine:
         self._append_state(self.ledger_path, closure)
         logger.info("[cierre] %s %s motivo=%s exit=%.8g pnl=%.4f (%+.3f%%)",
                     side.upper(), symbol, motivo, exit_px, pnl, pnl_pct)
+        self._refresh_live_expectancy(hypothesis_id, symbol)
+        self._maybe_graduate()
         return closure
 
     def _last_entry_sizing(self, key: str):
@@ -489,6 +533,128 @@ class DecisionEngine:
             if fam in st:
                 return fam
         return st or "unknown"
+
+    def _own_ops(self, hypothesis_id: str, symbol: str):
+        """Cierres de UNA hipotesis+simbolo segun el libro permanente."""
+        ops = []
+        if not os.path.exists(self.ledger_path):
+            return ops
+        with open(self.ledger_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ("motivo_cierre" in rec
+                        and rec.get("hypothesis_id") == hypothesis_id
+                        and rec.get("symbol") == symbol):
+                    ops.append(rec)
+        return ops
+
+    def _refresh_live_expectancy(self, hypothesis_id: str, symbol: str):
+        """PA: expectancy viva con shrinkage bayesiano doble.
+
+        1) est = (n*media_propia + K_fam*media_familia) / (n + K_fam)
+        2) exp_new = w*exp_generacion + (1-w)*est,  w = n/(n + E)
+
+        Con pocos datos domina la expectancy de generacion; con muchos,
+        el resultado real. Persiste en KB (o JSONL) y actualiza la copia
+        en memoria, por lo que el ranking de decide() se auto-mejora."""
+        rec = self.hypotheses.get(hypothesis_id)
+        if rec is None or rec.get("symbol", rec.get("asset")) != symbol:
+            return
+        own = self._own_ops(hypothesis_id, symbol)
+        n = len(own)
+        if n == 0:
+            return
+        own_mean = sum(float(o.get("pnl_pct") or 0.0) for o in own) / n
+
+        fam_ops = self._family_ops(self._family_of(hypothesis_id), symbol)
+        fam_mean = None
+        if fam_ops:
+            fam_mean = sum(float(o.get("pnl_pct") or 0.0)
+                           for o in fam_ops) / len(fam_ops)
+            est = ((n * own_mean + FAMILY_SHRINK_K * fam_mean)
+                   / (n + FAMILY_SHRINK_K))
+        else:
+            est = own_mean
+
+        exp_gen = float(rec.get("expectancy", 0.0))
+        w = n / (n + LIVE_SHRINK_E)
+        exp_new = w * exp_gen + (1.0 - w) * est
+        if abs(exp_new - exp_gen) < 1e-9:
+            return
+
+        updates = {
+            "expectancy": round(exp_new, 8),
+            "expectancy_source": "live_shrunk",
+            "live_expectancy_updated_at": time.time(),
+            "live_expectancy_n": n,
+        }
+        delivered = False
+        if self._kb is not None and hasattr(self._kb, "update_hypothesis"):
+            try:
+                delivered = bool(
+                    self._kb.update_hypothesis(hypothesis_id, updates))
+            except Exception as exc:
+                logger.warning("[exp-refresh] fallo KB para %s: %s",
+                               hypothesis_id, exc.__class__.__name__)
+        rec.update(updates)
+        # persistencia SIEMPRE: ademas del KB (PG), el JSONL local queda
+        # sincronizado como fuente de carga del engine (ultimo registro gana)
+        merged = dict(rec)
+        merged.update(updates)
+        self._save_hypothesis(merged)
+        logger.info("[exp-refresh] %s/%s exp %.4f -> %.4f "
+                    "(n=%d fam_mean=%s)",
+                    hypothesis_id, symbol, exp_gen, exp_new, n,
+                    f"{fam_mean:.4f}" if fam_mean is not None else "-")
+
+    def _maybe_graduate(self):
+        """PB: desactiva LEARN_MODE cuando los ultimos N cierres del libro
+        tienen media positiva. Se ejecuta una unica vez; la decision queda
+        en runtime/state/graduation.json y sobrevive reinicios."""
+        if (self.graduated or not self.learn_mode or not self.auto_graduate
+                or not os.path.exists(self.ledger_path)):
+            return
+        tail = deque(maxlen=self.graduate_window)
+        with open(self.ledger_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "motivo_cierre" in rec:
+                    tail.append(float(rec.get("pnl_pct") or 0.0))
+        if len(tail) < self.graduate_window:
+            return
+        mean = sum(tail) / len(tail)
+        if mean <= 0:
+            return
+        self.learn_mode = False
+        self.graduated = True
+        payload = {
+            "graduated": True,
+            "at": time.time(),
+            "window": self.graduate_window,
+            "mean_pnl_pct": round(mean, 6),
+        }
+        try:
+            with open(self.graduation_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            logger.warning("[graduacion] no se pudo persistir: %s",
+                           exc.__class__.__name__)
+        logger.warning(
+            "[graduacion] LEARN_MODE DESACTIVADO automaticamente — media "
+            "de ultimos %d cierres = %+.3f%% > 0; gate expectancy>0 "
+            "restaurado", self.graduate_window, mean)
 
     def _family_ops_all(self, symbol: str):
         """Cierres del simbolo en el libro (todas las familias)."""
