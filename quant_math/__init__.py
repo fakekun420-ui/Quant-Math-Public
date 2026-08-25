@@ -10,7 +10,7 @@ A modular research framework for quantitative trading systems with core modules:
 - Autonomous Research (AQDE)
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.1"
 __author__ = "QUANT-MATH Team"
 
 # Core types and protocols

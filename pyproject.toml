@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-math"
-version = "0.1.0"
+version = "1.0.1"
 description = "Quantitative Mathematics Framework for Algorithmic Trading"
 readme = "README.md"
 authors = [
