@@ -169,6 +169,20 @@ class DecisionEngine:
         self._save_hypothesis(record)
         return hid
 
+    def ranked_candidates(self, symbol: str) -> List[Dict[str, Any]]:
+        """Todos los candidatos consultables ordenados por
+        (expectancy DESC, scientific_score DESC)."""
+        candidates = [
+            h for h in self.hypotheses.values()
+            if h.get("symbol", h.get("asset")) == symbol
+            and h.get("status") in QUERYABLE_STATUSES
+        ]
+        return sorted(
+            candidates,
+            key=lambda h: (-float(h.get("expectancy", 0.0)),
+                           -float(h.get("scientific_score", 0.0))),
+        )
+
     def select_best_hypothesis(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Best hypothesis for symbol by (expectancy DESC, scientific_score DESC)."""
         candidates = [
@@ -588,10 +602,36 @@ class DecisionEngine:
         # feedback por familia tras cada posible cierre (fuente: ledger)
         self._maybe_deliver_family_feedback(symbol)
 
-        best = self.select_best_hypothesis(symbol)
-        exp = float(best.get("expectancy", 0.0)) if best else 0.0
+        # P1: ranking completo con fallback — si el mejor candidato tiene
+        # posicion abierta, se prueba el siguiente mejor (gate por candidato).
+        candidates = self.ranked_candidates(symbol)
+        chosen = None
+        first_guard_hyp = None
 
-        if best is None or (exp <= 0 and not self.learn_mode):
+        for cand in candidates:
+            exp_c = float(cand.get("expectancy", 0.0))
+            if exp_c <= 0 and not self.learn_mode:
+                break                      # el resto tambien es <= 0
+            cand_id = cand["hypothesis_id"]
+            if self.has_open_position(cand_id, symbol):
+                if first_guard_hyp is None:
+                    first_guard_hyp = cand_id
+                continue                   # probar siguiente mejor
+            chosen = cand
+            break
+
+        if chosen is None:
+            if first_guard_hyp is not None:
+                logger.info(
+                    "[skip] %s/%s — posicion ya abierta para esta hipotesis "
+                    "(sin candidatos libres)", first_guard_hyp, symbol)
+                return {
+                    "action": "skip_position_guard",
+                    "symbol": symbol,
+                    "hypothesis_id": first_guard_hyp,
+                    "reason": "posicion_abierta",
+                    "signal": None,
+                }
             logger.info("[no_entry] %s — %s", symbol, NO_ENTRY_REASON)
             return {
                 "action": "no_entry",
@@ -600,20 +640,9 @@ class DecisionEngine:
                 "signal": None,
             }
 
+        best = chosen
+        exp = float(best.get("expectancy", 0.0))
         hypothesis_id = best["hypothesis_id"]
-
-        if self.has_open_position(hypothesis_id, symbol):
-            logger.info(
-                "[skip] %s/%s — posición ya abierta para esta hipótesis",
-                hypothesis_id, symbol,
-            )
-            return {
-                "action": "skip_position_guard",
-                "symbol": symbol,
-                "hypothesis_id": hypothesis_id,
-                "reason": "posicion_abierta",
-                "signal": None,
-            }
 
         candles = self.fetch_real_data(symbol)
         side = self._evaluate_direction(best, candles)
