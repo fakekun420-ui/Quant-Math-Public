@@ -463,12 +463,126 @@ class DecisionEngine:
         )
 
     # ------------------------------------------------------------------
+    # Feedback agregado por FAMILIA x SIMBOLO (opcion B)
+    # ------------------------------------------------------------------
+
+    def _family_of(self, hypothesis_id: str) -> str:
+        rec = self.hypotheses.get(hypothesis_id) or {}
+        st = rec.get("strategy_type", "")
+        st = getattr(st, "value", None) or str(st)
+        for fam in ("breakout", "mean_reversion", "momentum",
+                    "trend_following"):
+            if fam in st:
+                return fam
+        return st or "unknown"
+
+    def _family_ops_all(self, symbol: str):
+        """Cierres del simbolo en el libro (todas las familias)."""
+        out = []
+        if not os.path.exists(self.ledger_path):
+            return out
+        with open(self.ledger_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "motivo_cierre" in rec and rec.get("symbol") == symbol:
+                    out.append(rec)
+        return out
+
+    def _family_ops(self, family: str, symbol: str):
+        """Operaciones cerradas de la familia+simbolo segun el libro
+        permanente (fuente durable; sobrevive reinicios)."""
+        ops = []
+        if not os.path.exists(self.ledger_path):
+            return ops
+        with open(self.ledger_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "motivo_cierre" not in rec or rec.get("symbol") != symbol:
+                    continue
+                hid = rec.get("hypothesis_id", "")
+                if self._family_of(hid) == family:
+                    ops.append(rec)
+        ops.sort(key=lambda r: float(r.get("exit_time") or 0))
+        return ops
+
+    def _maybe_deliver_family_feedback(self, symbol: str,
+                                       family: Optional[str] = None):
+        """Entrega feedback AGREGADO por familia cuando las operaciones de esa
+        familia cruzan multiplos del umbral — resuelve la rotacion de keys que
+        impedaba llegar a min_paper_trades individual."""
+        if not self.ledger_path or self.min_paper_trades < 1:
+            return []
+        delivered = []
+        families = {family} if family else {
+            self._family_of(r.get("hypothesis_id", ""))
+            for r in self._family_ops_all(symbol)}
+        for fam in list(families):
+            if not fam or fam == "unknown":
+                continue
+            ops = self._family_ops(fam, symbol)
+            n = len(ops)
+            bucket = n // self.min_paper_trades
+            if bucket == 0:
+                continue
+            mean_pnl = sum(float(o.get("pnl_pct") or 0) for o in ops) / n
+            wins = sum(1 for o in ops
+                       if float(o.get("pnl_pct") or 0) > 0)
+            updates = {
+                "feedback_family": fam,
+                "feedback_family_ops": n,
+                "feedback_family_wins": wins,
+                "feedback_family_mean_pnl_pct": round(mean_pnl, 6),
+                "aqde_family_feedback_at": time.time(),
+                "status": None,
+            }
+            targets = [hid for hid, rec in self.hypotheses.items()
+                       if rec.get("symbol") == symbol
+                       and self._family_of(hid) == fam]
+            for hid in targets:
+                merged = dict(self.hypotheses[hid])
+                merged.pop("status", None)          # no pisar estado real
+                merged.update({k: v for k, v in updates.items()
+                               if k != "status"})
+                merged["status"] = self.hypotheses[hid].get("status")
+                try:
+                    if self._kb is not None and hasattr(
+                            self._kb, "update_hypothesis"):
+                        self._kb.update_hypothesis(hid, {
+                            k: v for k, v in updates.items() if k != "status"})
+                        self._save_hypothesis(merged)
+                        continue
+                except Exception as exc:
+                    logger.warning("family feedback KB update fallo (%s)", exc)
+                self._save_hypothesis(merged)
+            if targets:
+                delivered.append((fam, n, round(mean_pnl, 4)))
+                logger.info(
+                    "[family-feedback] %s/%s ops=%d wins=%d mean_pnl_pct=%.4f "
+                    "-> %d registros del KB", fam, symbol, n, wins, mean_pnl,
+                    len(targets))
+        return delivered
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     def decide(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Run one decision cycle for a symbol."""
         closed = self._check_exits(symbol)
+        # feedback por familia tras cada posible cierre (fuente: ledger)
+        self._maybe_deliver_family_feedback(symbol)
 
         best = self.select_best_hypothesis(symbol)
         exp = float(best.get("expectancy", 0.0)) if best else 0.0
@@ -526,6 +640,8 @@ class DecisionEngine:
         self._append_state(self.paper_trades_path, {"key": key, "count": count})
 
         self._maybe_deliver_feedback(best, symbol)
+        fam = self._family_of(hypothesis_id)
+        self._maybe_deliver_family_feedback(symbol, family=fam)
 
         logger.info("[entry] %s %s (hyp=%s, expectancy=%.4f)",
                     side.upper(), symbol, hypothesis_id, signal["expectancy"])
