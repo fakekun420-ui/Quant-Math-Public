@@ -229,7 +229,16 @@ class ResearchManager:
             "status": StrategyStatus.BACKTESTED.value
         })
 
-        print(f"[ResearchManager] Backtest complete: {result}")
+        try:
+            n_tr = getattr(result, "num_trades", None) or getattr(
+                result, "total_trades", 0)
+            wr = float(getattr(result, "win_rate", 0) or 0)
+            ret = float(getattr(result, "total_return_pct", 0) or 0)
+            sh = float(getattr(result, "sharpe_ratio", 0) or 0)
+            print(f"[ResearchManager] Backtest complete: trades={n_tr} "
+                  f"wr={wr:.2f}% ret={ret:.2f}% sharpe={sh:.2f}")
+        except Exception:
+            print("[ResearchManager] Backtest complete")
         return result
 
     def run_monte_carlo(self, hypothesis_id: str, n_iterations: int = 1000) -> MonteCarloResult:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import multiprocessing as mp
 import os
 import signal
@@ -45,13 +46,41 @@ console = Console()
 def _orchestrator_process_main(cfg_dict: Dict):
     """Child process: run the orchestrator loop with all output to quant_math.log."""
     # Route ALL stdout/stderr to the log file before importing heavy modules
-    log_fh = open(LOG_PATH, "a", buffering=1)
-    sys.stdout = log_fh
-    sys.stderr = log_fh
+    class _CappedStream:
+        """stdout del hijo con techo de tamano: rota a .1 al superar max_mb."""
+
+        def __init__(self, path, max_mb=150):
+            self.path = path
+            self.max_bytes = int(max_mb * 1024 * 1024)
+            self.fh = open(path, "a", buffering=1)
+
+        def write(self, data):
+            try:
+                if self.fh.tell() > self.max_bytes:
+                    self.fh.close()
+                    bak = self.path + ".1"
+                    if os.path.exists(bak):
+                        os.remove(bak)
+                    os.replace(self.path, bak)
+                    self.fh = open(self.path, "a", buffering=1)
+            except OSError:
+                pass
+            return self.fh.write(data)
+
+        def flush(self):
+            try:
+                self.fh.flush()
+            except OSError:
+                pass
+
+    cap = _CappedStream(LOG_PATH, max_mb=150)
+    sys.stdout = cap
+    sys.stderr = cap
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH)],
+        handlers=[RotatingFileHandler(LOG_PATH, maxBytes=100 * 1024 * 1024,
+                                      backupCount=3)],
         force=True,
     )
 
