@@ -1,5 +1,20 @@
 # System Dependency Map — Quant-Math + AQDE Ecosystem
 
+> ⚠️ **SNAPSHOT HISTÓRICO — era Termux (2026-08-05).** Este audit fue
+> generado en el entorno anterior (`/data/data/com.termux/...`) y refleja
+> 84 archivos Python pre-reconstrucción. La arquitectura y dependencias
+> VIGENTES de Quant-Math v1.0.1 están en `ARCHITECTURE.md`.
+>
+> **Δ principal desde este snapshot:** nuevo stack ML/SIS
+> (`quant_math/ml/`: prior, feature_store, regime_learning, kalman,
+> learning_reset), Knowledge Base PostgreSQL persistente con fallback
+> JSONL (`adapters/postgres_kb.py`), model-based generator ARIMA/GARCH,
+> CLI completa con historial, SL 2:1 + libro permanente, cache intra-ciclo.
+
+---
+
+# System Dependency Map — Quant-Math + AQDE Ecosystem
+
 **Generated:** 2026-08-05  
 **Audit Method:** Static analysis + import testing + cross-reference verification  
 **Scope:** `/data/data/com.termux/files/home/quant-math/` (excluding `autonomous-research/`) + `/data/data/com.termux/files/home/quant-math/autonomous-research/`

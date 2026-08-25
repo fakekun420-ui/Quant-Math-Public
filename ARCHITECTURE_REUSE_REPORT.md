@@ -1,5 +1,15 @@
 # Quant-Math Architecture Reuse Analysis Report
 
+> ✅ **RE-VERIFICADO 2026-08-24 (v1.0.1): el hallazgo central SIGUE VIGENTE** —
+> `webui/backend/webui/api/routes.py` continúa sirviendo datos mock sin
+> importar `quant_math`. La integración real hoy ocurre vía la CLI
+> (`quant_math/cli/main.py`) sobre el orchestrator; el WebUI permanece como
+> interfaz secundaria pendiente de conectar. Análisis original abajo.
+
+---
+
+# Quant-Math Architecture Reuse Analysis Report
+
 ## Executive Summary
 
 **Finding: The WebUI backend is NOT reusing existing quant-math modules.** The backend API routes (`webui/backend/webui/api/routes.py`) return mock/hardcoded data instead of connecting to the mature quant-math library. The `QuantMathAdapter` in `quant_math/autonomous_research/adapters/quant_math_adapter.py` exists and properly wraps quant-math components but is **not integrated** into the WebUI backend.
