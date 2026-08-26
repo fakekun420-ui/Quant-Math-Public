@@ -3,3 +3,7 @@ quant_math.log
 __pycache__/
 *.pyc
 quant_math.log*
+
+# Runtime data (KB, logs, state)
+runtime/
+*.jsonl
