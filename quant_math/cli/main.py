@@ -37,6 +37,8 @@ from rich.text import Text
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOG_PATH = os.path.join(PROJECT_ROOT, "quant_math.log")
+BURST_LOG_PATH = os.path.join(PROJECT_ROOT, "quant_math_burst.log")
+BURST_STATE_DIR = os.path.join(PROJECT_ROOT, "runtime", "state_burst")
 
 console = Console()
 
@@ -47,6 +49,7 @@ console = Console()
 
 def _orchestrator_process_main(cfg_dict: Dict):
     """Child process: run the orchestrator loop with all output to quant_math.log."""
+    log_path = cfg_dict.get("log_path", LOG_PATH)
     # Route ALL stdout/stderr to the log file before importing heavy modules
     class _CappedStream:
         """stdout del hijo con techo de tamano: rota a .1 al superar max_mb."""
@@ -75,13 +78,13 @@ def _orchestrator_process_main(cfg_dict: Dict):
             except OSError:
                 pass
 
-    cap = _CappedStream(LOG_PATH, max_mb=150)
+    cap = _CappedStream(log_path, max_mb=150)
     sys.stdout = cap
     sys.stderr = cap
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[RotatingFileHandler(LOG_PATH, maxBytes=100 * 1024 * 1024,
+        handlers=[RotatingFileHandler(log_path, maxBytes=100 * 1024 * 1024,
                                       backupCount=3)],
         force=True,
     )
@@ -372,6 +375,7 @@ def wizard() -> Optional[Dict]:
             "hypotheses_per_cycle": hypotheses_per_cycle,
             "kb_path": os.path.join(PROJECT_ROOT, "runtime", "hypotheses.jsonl"),
             "state_dir": state_dir,
+            "log_path": LOG_PATH,
             "interval_seconds": 60,
             "exchange_id": "bybit",
             "dry_run": True,                # paper trading only
@@ -463,6 +467,7 @@ def burst_wizard() -> Optional[Dict]:
             "hypotheses_per_cycle": hyp_per_cycle,
             "kb_path": os.path.join(PROJECT_ROOT, "runtime", "hypotheses_burst.jsonl"),
             "state_dir": state_dir,
+            "log_path": BURST_LOG_PATH,
             "interval_seconds": 15,
             "exchange_id": "bybit",
             "dry_run": True,
@@ -799,10 +804,15 @@ def monitor_loop(runtime: RuntimeState):
 # ---------------------------------------------------------------------------
 
 def view_log():
-    if not os.path.exists(LOG_PATH):
-        console.print("[yellow]Sin logs todavía (quant_math.log no existe)[/yellow]")
+    view_log_path(LOG_PATH)
+
+
+def view_log_path(log_path: str):
+    title = os.path.basename(log_path)
+    if not os.path.exists(log_path):
+        console.print(f"[yellow]Sin logs todavía ({title} no existe)[/yellow]")
         return questionary.press_any_key_to_continue().unsafe_ask()
-    with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
+    with open(log_path, encoding="utf-8", errors="replace") as fh:
         lines = fh.readlines()
     page_size = 40
     total_pages = max(1, (len(lines) + page_size - 1) // page_size)
@@ -810,7 +820,7 @@ def view_log():
     while True:
         chunk = lines[page * page_size:(page + 1) * page_size]
         text = "".join(chunk) or "(vacía)"
-        console.print(Panel(text, title=f"quant_math.log — página {page + 1}/{total_pages}"))
+        console.print(Panel(text, title=f"{title} — página {page + 1}/{total_pages}"))
         try:
             choice = questionary.select(
                 "Log:  (↑/↓ + Enter)",
@@ -821,7 +831,6 @@ def view_log():
                 ],
             ).unsafe_ask()
         except (AttributeError):
-            # ESC -> volver al menú; Ctrl+C propaga (cierre total)
             return
         if choice in (None, "back"):
             return
@@ -937,6 +946,265 @@ def view_history(runtime: RuntimeState):
 
 
 # ---------------------------------------------------------------------------
+# Historial Burst (libro permanente de burst)
+# ---------------------------------------------------------------------------
+
+def view_burst_history():
+    state_dir = BURST_STATE_DIR
+    closures = _read_closures(state_dir)
+    if not closures:
+        console.print("[yellow]Sin operaciones burst cerradas todavia "
+                      "(libro burst vacio)[/yellow]")
+        try:
+            questionary.press_any_key_to_continue().unsafe_ask()
+        except AttributeError:
+            pass
+        return
+
+    def fmt_ts(ts):
+        return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+    page_size = 12
+    total_pages = max(1, (len(closures) + page_size - 1) // page_size)
+    page = 0
+    while True:
+        chunk = closures[page * page_size:(page + 1) * page_size]
+        table = Table(show_header=True, header_style="bold magenta",
+                      expand=True)
+        for col in ("Entrada", "Cierre", "Simbolo", "Side",
+                    "P.entrada", "P.salida", "PnL USD", "PnL %",
+                    "Margin", "Lev", "Motivo"):
+            table.add_column(col)
+        for c in chunk:
+            pnl = float(c.get("pnl", 0.0))
+            style = "green" if pnl > 0 else "red"
+            margin = c.get("margin_usd", c.get("margin", ""))
+            lev = c.get("leverage", "")
+            table.add_row(
+                fmt_ts(c.get("entry_time")), fmt_ts(c.get("exit_time")),
+                c.get("symbol", ""),
+                (c.get("side") or "").upper(),
+                f"{c.get('entry_price', 0):g}", f"{c.get('exit_price', 0):g}",
+                Text(f"{pnl:+.2f}", style=style),
+                Text(f"{c.get('pnl_pct', 0):+.2f}%", style=style),
+                f"${margin}" if margin else "-",
+                f"{lev}×" if lev else "-",
+                str(c.get("motivo_cierre", "")))
+        pnls = [float(c.get("pnl", 0.0)) for c in closures]
+        wins = sum(1 for p in pnls if p > 0)
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(justify="right")
+        summary.add_column()
+        summary.add_row("Operaciones burst cerradas:", str(len(closures)))
+        summary.add_row("Positivas / Negativas:",
+                        f"[green]{wins}[/green] / [red]{len(pnls)-wins}[/red]")
+        summary.add_row("PnL total burst:",
+                        Text(f"{sum(pnls):+,.2f} USD",
+                             style="green" if sum(pnls) >= 0 else "red"))
+        console.print(Panel(table, title=f"Historial Burst — pagina "
+                          f"{page+1}/{total_pages}"))
+        console.print(Panel(summary, title="Resumen Burst"))
+
+        try:
+            choice = questionary.select(
+                "Historial Burst:",
+                choices=[
+                    questionary.Choice("Siguiente página →", value="next"),
+                    questionary.Choice("← Página anterior", value="prev"),
+                    questionary.Choice("Volver al menú (ESC)", value="back"),
+                ],
+            ).unsafe_ask()
+        except (AttributeError, KeyboardInterrupt):
+            return
+        if choice in (None, "back"):
+            return
+        if choice == "next" and page < total_pages - 1:
+            page += 1
+        elif choice == "prev" and page > 0:
+            page -= 1
+
+
+# ---------------------------------------------------------------------------
+# Burst Monitor (panel dedicado para burst scalping)
+# ---------------------------------------------------------------------------
+
+def _burst_read_paper_trades():
+    return _read_paper_trades(BURST_STATE_DIR)
+
+
+def _burst_count_open_positions():
+    return _count_open_positions(BURST_STATE_DIR)
+
+
+def render_burst_monitor(runtime: RuntimeState):
+    stats = runtime.stats
+    cfg = stats.get("config", {})
+    state_dir = cfg.get("state_dir", BURST_STATE_DIR)
+    state = "RUNNING" if runtime.running else "STOPPED"
+
+    header = Table.grid(padding=(0, 2))
+    header.add_column(justify="left")
+    header.add_row(Text("BURST SCALPING MONITOR", style="bold cyan"))
+    status = Text(f"● {state}", style="bold green" if state == "RUNNING" else "bold red")
+    cycles = stats.get("cycles_completed", 0)
+    generated = stats.get("hypotheses_generated", 0)
+
+    open_pos = _burst_count_open_positions()
+    trades = _burst_read_paper_trades()
+    closed_keys = set()
+    total_closed = wins = losses = 0
+    total_pnl = 0.0
+    mtm_pnl = 0.0
+    for t in trades:
+        key = t.get("key")
+        if "motivo_cierre" in t:
+            if key:
+                closed_keys.add(key)
+            total_closed += 1
+            pnl = float(t.get("pnl", 0.0))
+            total_pnl += pnl
+            if pnl > 0:
+                wins += 1
+            elif pnl < 0:
+                losses += 1
+        elif key and key not in closed_keys:
+            mtm_pnl += float(t.get("pnl", 0.0))
+    win_rate = (wins / total_closed * 100) if total_closed else 0.0
+
+    # Burst-specific stats
+    b = stats.get("burst_stats", {})
+    entries_this_cycle = b.get("entries_this_cycle", 0)
+    total_entries = b.get("total_entries", 0)
+    total_closures_burst = b.get("total_closures", 0)
+    wins_burst = b.get("wins", 0)
+    losses_burst = b.get("losses", 0)
+    win_rate_burst = b.get("win_rate", 0.0)
+    cooldown_remaining = b.get("cooldown_remaining", 0)
+    consecutive_losses = b.get("consecutive_losses", 0)
+
+    # Exposure
+    margin_locked = sum(float(t.get("margin_usd", t.get("margin", 0)) or 0)
+                        for t in trades
+                        if "motivo_cierre" not in t and t.get("key") not in closed_keys)
+    notional_exposed = sum(
+        float(t.get("margin_usd", t.get("margin", 0)) or 0) *
+        float(t.get("leverage", 1) or 1)
+        for t in trades
+        if "motivo_cierre" not in t and t.get("key") not in closed_keys)
+
+    body = Table.grid(padding=(0, 1))
+    body.add_column(style="bold")
+    body.add_column()
+    body.add_row("Status", status)
+    body.add_row("Ciclos completados", str(cycles))
+    body.add_row("Hipótesis generadas", str(generated))
+    body.add_row("Posiciones abiertas", str(open_pos))
+    body.add_row("Exposición margin",
+                 Text(f"${margin_locked:,.2f}", style="yellow"))
+    body.add_row("Exposición notional",
+                 Text(f"${notional_exposed:,.2f}", style="dim"))
+
+    # --- PnL ---
+    pnl_style = "green" if total_pnl >= 0 else "red"
+    body.add_row("PnL total (cerradas)",
+                 Text(f"${total_pnl:+,.2f}", style=pnl_style))
+    body.add_row("PnL MtM (abiertas)",
+                 Text(f"${mtm_pnl:+,.2f}",
+                      style="green" if mtm_pnl >= 0 else "red"))
+    body.add_row("Operaciones cerradas", str(total_closed))
+    body.add_row("Win/Loss (global)",
+                 f"[green]{wins}[/green] / [red]{losses}[/red]")
+    body.add_row("Win rate (global)",
+                 Text(f"{win_rate:.0f}%", style="green" if win_rate >= 50 else "red"))
+
+    # --- Burst metrics ---
+    body.add_row("── BURST ──", "")
+    body.add_row("Entries (ciclo/total)",
+                 f"{entries_this_cycle} / {total_entries}")
+    body.add_row("Cierres burst",
+                 f"{total_closures_burst} "
+                 f"(W:{wins_burst} L:{losses_burst})")
+    body.add_row("Win rate burst",
+                 Text(f"{win_rate_burst:.0f}%",
+                      style="green" if win_rate_burst >= 50 else "red"))
+    cd_style = "yellow" if cooldown_remaining > 0 else "dim"
+    body.add_row("Cooldown restante",
+                 Text(f"{cooldown_remaining} ciclos", style=cd_style))
+    if consecutive_losses > 0:
+        body.add_row("Pérdidas consecutivas",
+                     Text(str(consecutive_losses), style="red"))
+
+    # --- Hypothesis trajectory ---
+    kb_path = cfg.get("kb_path", os.path.join(PROJECT_ROOT, "runtime",
+                                                "hypotheses_burst.jsonl"))
+    if os.path.exists(kb_path):
+        try:
+            with open(kb_path) as f:
+                lines_k = f.readlines()
+        except OSError:
+            lines_k = []
+        total_hyp = len(lines_k)
+        if total_hyp > 0:
+            pcts = []
+            for ln in lines_k[-20:]:
+                try:
+                    d = json.loads(ln)
+                    pcts.append(float(d.get("pnl_pct", 0.0)))
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
+            if pcts:
+                prom = sum(pcts) / len(pcts)
+                style_p = "green" if prom > 0 else "red"
+                body.add_row("PnL prom. últimas hip.",
+                             Text(f"{prom:+.2f}%", style=style_p))
+            body.add_row("Total hipótesis en KB", str(total_hyp))
+
+    # --- Graduation attempt ---
+    grad_path = os.path.join(state_dir, "graduation.json")
+    if os.path.exists(grad_path):
+        try:
+            with open(grad_path) as f:
+                grad = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            grad = None
+        if grad:
+            g_at = grad.get("at")
+            body.add_row("Graduación PB",
+                         time.strftime("%d-%m-%Y %H:%M",
+                                       time.localtime(g_at)) if g_at else "-")
+
+    config_panel = Table.grid(padding=(0, 1))
+    for key in ("symbols", "timeframe", "initial_capital",
+                "take_profit_pct", "stop_loss_pct", "lookback_days",
+                "min_paper_trades", "hypotheses_per_cycle", "exchange_id",
+                "mode", "burst_margin", "burst_leverage"):
+        if key in cfg:
+            config_panel.add_row(key, str(cfg[key]))
+
+    outer = Table.grid()
+    outer.add_row(header)
+    outer.add_row(body)
+    outer.add_row(Panel(config_panel, title="Config Burst"))
+
+    return Panel(
+        outer,
+        title="[bold]BURST SCALPING — Monitor[/bold]",
+        border_style="cyan",
+    )
+
+
+def burst_monitor_loop(runtime: RuntimeState):
+    with Live(render_burst_monitor(runtime), console=console,
+              refresh_per_second=1) as live:
+        try:
+            while True:
+                live.update(render_burst_monitor(runtime))
+                time.sleep(2)
+        except KeyboardInterrupt:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
 
@@ -979,6 +1247,7 @@ def main():
     try:
         while True:
             try:
+                is_burst = (runtime.config_dict or {}).get("mode") == "burst"
                 action = questionary.select(
                     "QUANT-MATH — Menú principal  (↑/↓ + Enter)",
                     choices=[
@@ -995,6 +1264,12 @@ def main():
                         questionary.Choice("Iniciar Burst Scalping",
                                            value="start_burst",
                                            disabled="ya está corriendo" if runtime.running else None),
+                        questionary.Choice("Historial Burst",
+                                           value="burst_history",
+                                           disabled=None if is_burst else "solo disponible con Burst activo"),
+                        questionary.Choice("Ver log Burst",
+                                           value="burst_log",
+                                           disabled=None if is_burst else "solo disponible con Burst activo"),
                         questionary.Choice("Salir", value="quit"),
                     ],
                 ).unsafe_ask()
@@ -1046,20 +1321,43 @@ def _dispatch(runtime: RuntimeState, action: str):
             return
         runtime.start(cfg)
         console.print(f"[green]Burst Scalping iniciado (pid={runtime.process.pid}). "
-                      f"Logs: {LOG_PATH}[/green]")
+                      f"Logs: {BURST_LOG_PATH}[/green]")
         try:
             questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").unsafe_ask()
         except (AttributeError):
             pass
 
     elif action == "monitor":
-        monitor_loop(runtime)
+        is_burst = (runtime.config_dict or {}).get("mode") == "burst"
+        if is_burst:
+            burst_monitor_loop(runtime)
+        else:
+            monitor_mode = questionary.select(
+                "¿Qué monitor?",
+                choices=[
+                    questionary.Choice("Quant-Math", value="classic"),
+                    questionary.Choice("Burst Scalping", value="burst"),
+                ]).unsafe_ask()
+            if monitor_mode == "burst":
+                burst_monitor_loop(runtime)
+            else:
+                monitor_loop(runtime)
 
     elif action == "log":
-        view_log()
+        is_burst = (runtime.config_dict or {}).get("mode") == "burst"
+        if is_burst:
+            view_log_path(BURST_LOG_PATH)
+        else:
+            view_log()
 
     elif action == "history":
         view_history(runtime)
+
+    elif action == "burst_history":
+        view_burst_history()
+
+    elif action == "burst_log":
+        view_log_path(BURST_LOG_PATH)
 
     elif action == "quit":
         shutdown(runtime)
