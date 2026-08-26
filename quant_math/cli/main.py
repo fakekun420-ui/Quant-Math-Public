@@ -304,15 +304,38 @@ def wizard() -> Optional[Dict]:
                         "Los datos de mercado son SIEMPRE reales (Bybit). "
                         "El modo es paper trading.", expand=False))
     try:
-        symbols_raw = questionary.text(
-            "Símbolos a operar (separados por coma):",
-            default="BTC/USDT").unsafe_ask()
-        if symbols_raw is None:
+        # V2: selector interactivo Top-20 o manual
+        use_top = questionary.select(
+            "Selección de símbolos:",
+            choices=[
+                questionary.Choice("Top-20 por volumen (recomendado)",
+                                   value="top20"),
+                questionary.Choice("Ingresar manualmente", value="manual"),
+            ]).unsafe_ask()
+        if use_top is None:
             return None
-        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
-        if not symbols:
-            console.print("[red]Se requiere al menos un símbolo[/red]")
-            return None
+
+        if use_top == "top20":
+            console.print("[cyan]Obteniendo Top-20 por volumen...[/cyan]")
+            top_assets = fetch_top_volume_assets("bybit", 20)
+            selected = questionary.checkbox(
+                "Selecciona símbolos (espacio marcar, Enter confirmar):",
+                choices=[questionary.Choice(s, value=s) for s in top_assets]
+            ).unsafe_ask()
+            if not selected:
+                console.print("[red]Debes seleccionar al menos un símbolo[/red]")
+                return None
+            symbols = list(selected)
+        else:
+            symbols_raw = questionary.text(
+                "Símbolos (separados por coma):",
+                default="BTC/USDT").unsafe_ask()
+            if symbols_raw is None:
+                return None
+            symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+            if not symbols:
+                console.print("[red]Se requiere al menos un símbolo[/red]")
+                return None
 
         initial_capital = ask_float("Capital inicial (USD)", "10000", lo=0)
         entry_pct = ask_float("% de capital por entrada (0-1]", "0.05", hi=1)
