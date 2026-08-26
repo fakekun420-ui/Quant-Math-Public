@@ -269,11 +269,11 @@ class RuntimeState:
 # Config wizard
 # ---------------------------------------------------------------------------
 
-def ask_float(label: str, default: str, lo: float = None, hi: float = None) -> float:
+def ask_float(label: str, default: str, lo: float = None, hi: float = None):
     while True:
         raw = questionary.text(f"{label}:", default=default).unsafe_ask()
-        if raw is None:  # ESC
-            raise KeyboardInterrupt
+        if raw is None:  # ESC -> back
+            return None
         try:
             val = float(raw)
             if lo is not None and val <= lo:
@@ -287,11 +287,11 @@ def ask_float(label: str, default: str, lo: float = None, hi: float = None) -> f
             console.print("[red]Número inválido[/red]")
 
 
-def ask_int(label: str, default: str, lo: int = None) -> int:
+def ask_int(label: str, default: str, lo: int = None):
     while True:
         raw = questionary.text(f"{label}:", default=default).unsafe_ask()
         if raw is None:
-            raise KeyboardInterrupt
+            return None
         try:
             val = int(raw)
             if lo is not None and val < lo:
@@ -352,15 +352,25 @@ def wizard() -> Optional[Dict]:
                 return None
 
         initial_capital = ask_float("Capital inicial (USD)", "10000", lo=0)
+        if initial_capital is None:
+            return None
         entry_pct = ask_float("% de capital por entrada (0-1]", "0.05", hi=1)
+        if entry_pct is None:
+            return None
         timeframe = questionary.select(
             "Timeframe:", choices=["1m", "5m", "15m", "1h", "4h", "1d"],
             default="1h").unsafe_ask()
         if timeframe is None:
             return None
         take_profit_pct = ask_float("Take-profit % (ej. 0.02 = 2%)", "0.02")
+        if take_profit_pct is None:
+            return None
         lookback_days = ask_int("Lookback days (backtest)", "30", lo=1)
+        if lookback_days is None:
+            return None
         hypotheses_per_cycle = ask_int("Hipótesis nuevas por ciclo", "3", lo=1)
+        if hypotheses_per_cycle is None:
+            return None
 
         state_dir = os.path.join(PROJECT_ROOT, "runtime", "state")
         os.makedirs(state_dir, exist_ok=True)
@@ -439,7 +449,11 @@ def burst_wizard() -> Optional[Dict]:
                 return None
 
         margin = ask_float("Margen por entrada (USD, min 5)", "10", lo=5)
+        if margin is None:
+            return None
         leverage = ask_int("Leverage (1-20)", "10", lo=1)
+        if leverage is None:
+            return None
         leverage = max(1, min(20, leverage))
 
         timeframe = questionary.select(
@@ -449,10 +463,16 @@ def burst_wizard() -> Optional[Dict]:
             return None
 
         tp_pct = ask_float("Take-profit % (0.4-0.8 recommended)", "0.006")
+        if tp_pct is None:
+            return None
         tp_pct = max(0.004, min(0.008, tp_pct))
 
         lookback_days = ask_int("Lookback days (backtest)", "14", lo=1)
+        if lookback_days is None:
+            return None
         hyp_per_cycle = ask_int("Hipótesis nuevas por ciclo", "5", lo=1)
+        if hyp_per_cycle is None:
+            return None
 
         state_dir = os.path.join(PROJECT_ROOT, "runtime", "state_burst")
         os.makedirs(state_dir, exist_ok=True)
@@ -1195,14 +1215,34 @@ def render_burst_monitor(runtime: RuntimeState):
 
 
 def burst_monitor_loop(runtime: RuntimeState):
-    with Live(render_burst_monitor(runtime), console=console,
-              refresh_per_second=1) as live:
-        try:
+    """Live burst monitor; ESC returns to menu without stopping anything."""
+    console.print("[dim]Burst monitor — presiona ESC para volver al menú[/dim]")
+    try:
+        with Live(render_burst_monitor(runtime), console=console,
+                  refresh_per_second=1, screen=False,
+                  redirect_stdout=False, redirect_stderr=False) as live:
             while True:
                 live.update(render_burst_monitor(runtime))
-                time.sleep(2)
-        except KeyboardInterrupt:
-            pass
+                import select
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                old_attrs = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    r, _, _ = select.select([sys.stdin], [], [], 1.0)
+                    if r:
+                        ch = sys.stdin.read(1)
+                        if ch == "\x1b":
+                            return
+                        if ch == "\x03":
+                            raise KeyboardInterrupt
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        console.print(f"[red]Error en burst monitor: {exc}[/red]")
 
 
 # ---------------------------------------------------------------------------
