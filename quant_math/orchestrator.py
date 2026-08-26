@@ -207,6 +207,8 @@ class Orchestrator:
 
     def _generate_and_backtest(self) -> List[Dict]:
         """Generate N hypotheses across configured symbols and backtest them."""
+        cycle_generated = 0
+        cycle_fresh = 0
         new_records = []
         symbols = self.config.symbols
         n = self.config.hypotheses_per_cycle
@@ -257,6 +259,8 @@ class Orchestrator:
                 seen[sig] = self.cycle_count
                 fresh.append(hid)
             skipped = len(hyp_ids) - len(fresh)
+            cycle_generated += len(hyp_ids)
+            cycle_fresh += len(fresh)
             if skipped:
                 print(f"  [dedupe] {skipped} duplicadas omitidas "
                       f"(ya existen en el KB)")
@@ -278,6 +282,11 @@ class Orchestrator:
                 if record is not None:
                     new_records.append(record)
                     made += 1
+        self.last_novelty = self._novelty_rate(cycle_generated, cycle_fresh)
+        self._last_novelty_fresh = cycle_fresh
+        if cycle_generated:
+            print(f"  [novedad] {cycle_fresh}/{cycle_generated} frescas "
+                  f"({self.last_novelty * 100:.0f}%)")
 
         return new_records
 
@@ -370,7 +379,8 @@ class Orchestrator:
         """Fill a paper trade at the signal price with configured sizing/TP."""
         price = float(signal["price"])
         side = signal["side"]
-        notional = self.config.initial_capital * self.config.entry_pct
+        # O6: nocional escalado por vol-target (clampeado en el engine)
+        notional = self.config.initial_capital * self.config.entry_pct             * float(signal.get("sizing_mult", 1.0))
         quantity = notional / price
         tp_price = price * (1 + self.config.take_profit_pct) if side == "buy" \
             else price * (1 - self.config.take_profit_pct)
@@ -402,6 +412,11 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # One full cycle
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _novelty_rate(generated: int, fresh: int) -> float:
+        """O4: fraccion de hipotesis generadas que sobreviven el dedupe."""
+        return round(fresh / generated, 4) if generated else 0.0
 
     def run_cycle(self) -> Dict:
         """generate -> persist -> decide -> paper execute -> feedback."""
@@ -456,8 +471,21 @@ class Orchestrator:
               f"señales={summary['signals']} no_entry={summary['no_entry']} "
               f"skip_pos={summary['skipped_position']}")
 
+        # O4: metrica de novedad generativa del ciclo
+        novelty = getattr(self, "last_novelty", 0.0)
+        summary["novelty_rate"] = novelty
+
         self.stats["cycles_completed"] = self.cycle_count
         self.stats["hypotheses_generated"] += summary["generated"]
+        self.stats["hyp_fresh_last_cycle"] = getattr(
+            self, "_last_novelty_fresh", 0)
+        self.stats["novelty_rate_last_cycle"] = novelty
+        self.stats["novelty_cum_avg"] = round(
+            (self.stats.get("novelty_cum_avg", 0.0)
+             * self.stats.get("novelty_cycles", 0) + novelty)
+            / max(1, self.stats.get("novelty_cycles", 0) + 1), 4)
+        self.stats["novelty_cycles"] = self.stats.get(
+            "novelty_cycles", 0) + 1
         self.stats["hypotheses_evaluated"] += len(records)
         self.stats["signals"] += summary["signals"]
         self.stats["no_entry"] += summary["no_entry"]

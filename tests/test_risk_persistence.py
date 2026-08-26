@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from quant_math.decision_engine import DecisionEngine
 
+
 TP = 0.02
 
 
@@ -94,7 +95,9 @@ def test_recovery_position_survives_restart_and_monitors():
     print("PASS recovery: posicion recuperada del JSONL y monitoreada")
 
 
-def test_sl_close_writes_permanent_ledger():
+def test_sl_close_writes_permanent_ledger(monkeypatch):
+    # O2: estos tests verifican fills EXACTOS al umbral -> sin slippage
+    monkeypatch.setenv("QUANTMATH_SLIPPAGE_PCT", "0")
     """Precio cae al nivel del SL -> cierre con motivo='sl' en el libro."""
     with tempfile.TemporaryDirectory() as tmp:
         key = seed_entry(tmp, entry_price=100.0)
@@ -130,7 +133,9 @@ def test_sl_close_writes_permanent_ledger():
           f"posiciones.jsonl limpio")
 
 
-def test_tp_close_and_ledger_append_only_across_sessions():
+def test_tp_close_and_ledger_append_only_across_sessions(monkeypatch):
+    # O2: fill exacto al umbral requerido aqui
+    monkeypatch.setenv("QUANTMATH_SLIPPAGE_PCT", "0")
     """TP tambien cierra; el libro es append-only y nunca se resetea."""
     with tempfile.TemporaryDirectory() as tmp:
         key = seed_entry(tmp, entry_price=100.0)

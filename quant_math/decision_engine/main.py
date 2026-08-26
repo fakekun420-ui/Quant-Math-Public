@@ -89,6 +89,26 @@ class DecisionEngine:
         # PB (auto-graduacion): cuando los ultimos N cierres tienen media
         # positiva, LEARN_MODE se desactiva solo y el gate expectancy>0
         # vuelve; la decision queda registrada y sobrevive reinicios.
+        # O2: slippage adverso en fills paper (entrada Y salida)
+        try:
+            self.slippage_pct = abs(float(os.environ.get(
+                "QUANTMATH_SLIPPAGE_PCT", "0.0005")))
+        except ValueError:
+            self.slippage_pct = 0.0005
+        if self.slippage_pct:
+            logger.info("[slippage] modelo activo: %.3f%% por lado "
+                        "(QUANTMATH_SLIPPAGE_PCT)", self.slippage_pct * 100)
+
+        # O6: sizing vol-targetado solo con gate activo (post-graduacion)
+        self.vol_target_enabled = (
+            self.learn_mode is False
+            and os.environ.get("QUANTMATH_VOL_TARGET", "1") != "0")
+        try:
+            self.vol_target_pct = float(os.environ.get(
+                "QUANTMATH_VOL_TARGET_PCT", "2.0"))
+        except ValueError:
+            self.vol_target_pct = 2.0
+
         self.graduated = False
         self.graduation_path = os.path.join(state_dir, "graduation.json")
         _ag = (os.environ.get("QUANTMATH_AUTO_GRADUATE", "1") != "0"
@@ -313,6 +333,8 @@ class DecisionEngine:
         direction = 1 if side == "buy" else -1
         qty, notional = self._last_entry_sizing(key)
         exit_px = float(exit_price) if exit_price is not None else entry_price
+        # O2: slippage adverso tambien al cerrar
+        exit_px = self._slip(exit_px, side, entering=False)
         pnl = qty * (exit_px - entry_price) * direction
         pnl_pct = (pnl / notional * 100.0) if notional else 0.0
         closure = {
@@ -536,6 +558,31 @@ class DecisionEngine:
                 return fam
         return st or "unknown"
 
+    def _slip(self, price: float, side: str, entering: bool) -> float:
+        """O2: precio adverso por slippage. Comprar entra caro y sale barato
+        (al cerrar vendo); vender es el espejo. Siempre en contra del que
+        ejecuta -> estimacion conservadora."""
+        s = self.slippage_pct
+        if not s or price <= 0:
+            return price
+        adverse_up = (side == "buy") == entering
+        return price * (1 + s) if adverse_up else price * (1 - s)
+
+    def _sizing_vol_multiplier(self, candles) -> float:
+        """O6: multiplicador de nocional por volatilidad realizada
+        (objetivo QUANTMATH_VOL_TARGET_PCT % por ciclo), clampeado x0.5-x2."""
+        import statistics as _st
+        closes = [float(c["close"]) for c in candles[-21:]]
+        if len(closes) < 6 or min(closes) <= 0:
+            return 1.0
+        rets = [(closes[i] / closes[i - 1] - 1.0)
+                for i in range(1, len(closes))]
+        vol = _st.pstdev(rets)
+        if vol <= 1e-9:
+            return 1.0
+        target = self.vol_target_pct / 100.0
+        return max(0.5, min(2.0, target / vol))
+
     def _own_ops(self, hypothesis_id: str, symbol: str):
         """Cierres de UNA hipotesis+simbolo segun el libro permanente."""
         ops = []
@@ -616,13 +663,18 @@ class DecisionEngine:
                     f"{fam_mean:.4f}" if fam_mean is not None else "-")
 
     def _maybe_graduate(self):
-        """PB: desactiva LEARN_MODE cuando los ultimos N cierres del libro
-        tienen media positiva. Se ejecuta una unica vez; la decision queda
-        en runtime/state/graduation.json y sobrevive reinicios."""
+        """O1/PB: desactiva LEARN_MODE cuando la ventana movil de cierres es
+        estadisticamente positiva: media > 0 CON limite inferior del IC90
+        (normal approx) > 0 Y diversidad minima de familias. Unica vez;
+        persistida en runtime/state/graduation.json."""
         if (self.graduated or not self.learn_mode or not self.auto_graduate
                 or not os.path.exists(self.ledger_path)):
             return
-        tail = deque(maxlen=self.graduate_window)
+        try:
+            min_fams = int(os.environ.get("QUANTMATH_GRAD_MIN_FAMILIES", "2"))
+        except ValueError:
+            min_fams = 2
+        rows = deque(maxlen=self.graduate_window)   # (pnl_pct, familia)
         with open(self.ledger_path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -633,11 +685,28 @@ class DecisionEngine:
                 except json.JSONDecodeError:
                     continue
                 if "motivo_cierre" in rec:
-                    tail.append(float(rec.get("pnl_pct") or 0.0))
-        if len(tail) < self.graduate_window:
+                    hid = rec.get("hypothesis_id", "")
+                    rows.append((float(rec.get("pnl_pct") or 0.0),
+                                 self._family_of(hid)))
+        n = len(rows)
+        if n < self.graduate_window:
             return
-        mean = sum(tail) / len(tail)
+        vals = [v for v, _ in rows]
+        mean = sum(vals) / n
         if mean <= 0:
+            return
+        # IC90 (alpha=10%) limite inferior: mean - z*sd/sqrt(n)
+        import statistics as _st
+        sd = _st.pstdev(vals)
+        ic90_lb = mean - 1.2816 * sd / (n ** 0.5)
+        fams = {f for _, f in rows}
+        if ic90_lb <= 0:
+            logger.info("[graduacion] media %+.3f%% positiva pero IC90_lb "
+                        "%.3f%% <= 0 — sigo aprendiendo", mean, ic90_lb)
+            return
+        if len(fams) < max(1, min_fams):
+            logger.info("[graduacion] IC90_lb %.3f%% OK pero familias %d < "
+                        "%d — sigo aprendiendo", ic90_lb, len(fams), min_fams)
             return
         self.learn_mode = False
         self.graduated = True
@@ -646,6 +715,9 @@ class DecisionEngine:
             "at": time.time(),
             "window": self.graduate_window,
             "mean_pnl_pct": round(mean, 6),
+            "ic90_lower_bound": round(ic90_lb, 6),
+            "families": sorted(fams),
+            "criterion": "O1: mean>0 AND ic90_lb>0 AND families>=min",
         }
         try:
             with open(self.graduation_path, "w", encoding="utf-8") as fh:
@@ -654,9 +726,9 @@ class DecisionEngine:
             logger.warning("[graduacion] no se pudo persistir: %s",
                            exc.__class__.__name__)
         logger.warning(
-            "[graduacion] LEARN_MODE DESACTIVADO automaticamente — media "
-            "de ultimos %d cierres = %+.3f%% > 0; gate expectancy>0 "
-            "restaurado", self.graduate_window, mean)
+            "[graduacion O1] LEARN_MODE DESACTIVADO automaticamente — "
+            "media %+.3f%% (IC90_lb %+.3f%%) en %d cierres de %d familias; "
+            "gate expectancy>0 restaurado", mean, ic90_lb, n, len(fams))
 
     def _family_ops_all(self, symbol: str):
         """Cierres del simbolo en el libro (todas las familias)."""
@@ -815,6 +887,12 @@ class DecisionEngine:
         candles = self.fetch_real_data(symbol)
         side = self._evaluate_direction(best, candles)
 
+        # O2: fill adverso en la entrada
+        fill_price = self._slip(float(candles[-1]["close"]), side, True)
+        # O6: multiplicador vol-target solo con gate activo
+        sizing_mult = (self._sizing_vol_multiplier(candles)
+                       if self.vol_target_enabled else 1.0)
+
         signal = {
             "action": "entry",
             "symbol": symbol,
@@ -823,8 +901,9 @@ class DecisionEngine:
             "expectancy": exp,
             "learn_entry": bool(self.learn_mode and exp <= 0),
             "scientific_score": float(best.get("scientific_score", 0.0)),
+            "sizing_mult": round(sizing_mult, 4),
             "timestamp": time.time(),
-            "price": candles[-1]["close"],
+            "price": fill_price,
         }
 
         key = self._position_key(hypothesis_id, symbol)

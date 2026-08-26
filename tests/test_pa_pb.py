@@ -93,23 +93,30 @@ def test_pa_ranking_flips_when_live_results_bad():
 
 
 def test_pb_graduates_on_positive_window():
+    """O1: requiere media>0, IC90_lb>0 y >=2 familias en la ventana."""
     with tempfile.TemporaryDirectory() as tmp:
         st = os.path.join(tmp, "state")
-        eng = make(tmp, [{"hypothesis_id": "h1", "symbol": "XRP/USDT",
-                          "status": "backtested",
-                          "strategy_type": "momentum",
-                          "expectancy": 0.01}], st,
-                   learn_mode=True, auto_graduate=True, graduate_window=3)
+        eng = make(tmp, [
+            {"hypothesis_id": "h1", "symbol": "XRP/USDT",
+             "status": "backtested", "strategy_type": "momentum",
+             "expectancy": 0.01},
+            {"hypothesis_id": "h2", "symbol": "XRP/USDT",
+             "status": "backtested", "strategy_type": "breakout",
+             "expectancy": 0.01}], st,
+            learn_mode=True, auto_graduate=True, graduate_window=4)
         assert eng.learn_mode is True
-        seed_ledger(st, [closure("h1", 0.5), closure("h1", 0.2),
-                         closure("h1", -0.1)])   # media +0.2
+        # media +0.25 con sd baja -> IC90_lb>0; 2 familias
+        seed_ledger(st, [closure("h1", 0.5), closure("h2", 0.3),
+                         closure("h1", 0.2), closure("h2", 0.0)])
         eng._maybe_graduate()
         assert eng.learn_mode is False and eng.graduated is True
         assert os.path.exists(eng.graduation_path)
         payload = json.load(open(eng.graduation_path))
-        assert payload["graduated"] is True and abs(
-            payload["mean_pnl_pct"] - 0.2) < 1e-9
-    print("PASS PB: graduacion con ventana positiva")
+        assert payload["graduated"] is True
+        assert abs(payload["mean_pnl_pct"] - 0.25) < 1e-9
+        assert payload["ic90_lower_bound"] > 0
+        assert len(payload["families"]) == 2
+    print("PASS PB/O1: graduacion con ventana positiva diversificada")
 
 
 def test_pb_no_graduation_on_negative_window():

@@ -154,4 +154,30 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
                            "short_window": fast, "long_window": slow,
                            "symbol": symbol}),
         })
+
+    # O7: familias adicionales derivadas solo de closes
+    # 1) energy_burst: pico de |retorno| z-score -> momentum en su direccion
+    if len(out) < max_hypotheses:
+        z = info.get("k_noise")
+        burst_z = 2.0 if (z is None or z < 1) else 1.5
+        out.append({
+            "name": f"MEnergy_Burst_{burst_z}_{sym}",
+            "description": (f"Pico |ret| z>{burst_z} -> momentum de energia "
+                            f"para {symbol}"),
+            "strategy_type": StrategyType.CUSTOM,
+            "parameters": _attach({"strategy_type": "energy_burst",
+                           "burst_window": 20, "burst_z": burst_z,
+                           "symbol": symbol}),
+        })
+    # 2) range_pressure: posicion del close en su rango rodante como presion
+    if len(out) < max_hypotheses:
+        out.append({
+            "name": f"MRange_Pressure_20_{sym}",
+            "description": (f"Presion (c-min)/(max-min) w20 umbral "
+                            f"0.85/0.15 para {symbol}"),
+            "strategy_type": StrategyType.CUSTOM,
+            "parameters": _attach({"strategy_type": "range_pressure",
+                           "range_window": 20, "pressure_hi": 0.85,
+                           "pressure_lo": 0.15, "symbol": symbol}),
+        })
     return out[:max_hypotheses]

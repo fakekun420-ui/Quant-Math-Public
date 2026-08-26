@@ -857,6 +857,47 @@ class AQDERunner:
                             orders.append({'symbol': symbol, 'side': 'sell', 'quantity': 1})
                         else:
                             orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
+            elif strategy_type == 'energy_burst':
+                # O7: pico de |retorno| z-score -> momentum en su direccion
+                w = int(all_params.get('burst_window', 20))
+                zthr = float(all_params.get('burst_z', 2.0))
+                orders = []
+                rets = np.diff(np.asarray(prices, dtype=float))
+                for i in range(len(prices)):
+                    if i < w or i - 1 >= len(rets):
+                        orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
+                        continue
+                    win = rets[i - w:i]
+                    mu, sd = np.mean(win), np.std(win)
+                    r = rets[i - 1]
+                    z = (r - mu) / sd if sd > 1e-12 else 0.0
+                    if abs(z) >= zthr:
+                        orders.append({'symbol': symbol,
+                                       'side': 'buy' if r > 0 else 'sell',
+                                       'quantity': 1})
+                    else:
+                        orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
+
+            elif strategy_type == 'range_pressure':
+                # O7: presion del close en su rango rodante
+                w = int(all_params.get('range_window', 20))
+                hi = float(all_params.get('pressure_hi', 0.85))
+                lo = float(all_params.get('pressure_lo', 0.15))
+                orders = []
+                p = np.asarray(prices, dtype=float)
+                for i in range(len(p)):
+                    if i < w:
+                        orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
+                        continue
+                    win = p[i - w + 1:i + 1]
+                    rng = win.max() - win.min()
+                    press = (p[i] - win.min()) / rng if rng > 1e-12 else 0.5
+                    if press >= hi:
+                        orders.append({'symbol': symbol, 'side': 'buy', 'quantity': 1})
+                    elif press <= lo:
+                        orders.append({'symbol': symbol, 'side': 'sell', 'quantity': 1})
+                    else:
+                        orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
             else:
                 # Default: hold
                 orders = [{'symbol': symbol, 'side': 'hold', 'quantity': 0} for _ in prices]
@@ -906,6 +947,17 @@ class AQDERunner:
                 'short_window': [8, 12, 15],
                 'long_window': [21, 26, 30],
                 'signal_window': [7, 9, 12]
+            }
+        elif strategy_type == 'energy_burst':
+            return {
+                'burst_window': [15, 20, 25],
+                'burst_z': [1.5, 2.0, 2.5]
+            }
+        elif strategy_type == 'range_pressure':
+            return {
+                'range_window': [15, 20, 30],
+                'pressure_hi': [0.8, 0.85, 0.9],
+                'pressure_lo': [0.1, 0.15, 0.2]
             }
         elif strategy_type == 'ati_trend':
             return {

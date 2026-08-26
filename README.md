@@ -106,6 +106,9 @@ graphify update .
 | Adaptive Mutations | Evolutionary | Backtest results (best/worst strategies) | Parameter mutations toward winners, counter-strategies vs losers |
 | Live Expectancy (PA) | Bayesian shrinkage blend | Realized paper PnL per closed trade (`[exp-refresh]`) | Re-scores hypothesis records after every closure; ranking self-improves toward what actually works |
 | Auto-Graduation (PB) | Rolling-window rule | Mean of last N closures | Automatically disables LEARN_MODE when learning succeeds; decision persisted in `graduation.json` |
+| Graduation Hardening (O1) | Statistical gate on PB | Window mean must clear IC90 lower bound > 0 with ≥2 distinct families | Prevents lucky-streak graduations; audit fields stored in `graduation.json` |
+| Slippage Model (O2) | Adverse-fill simulation | Every paper execution | Entries and exits filled at ±QUANTMATH_SLIPPAGE_PCT against the trader — realistic net PnL |
+| Vol-Target Sizing (O6) | Inverse-volatility scaler | Realized per-cycle returns | Post-graduation notional scales x0.5–x2 toward a 2% vol target instead of fixed sizing |
 
 All generation-side learning is **advisory**: it biases *what gets generated*,
 never whether a trade happens. PA changes *which ranked candidate is best*
@@ -126,6 +129,10 @@ safe: below minimum sample thresholds every learner stays in "collecting" mode.
 | `QUANTMATH_ML_MIN_RECORDS` | `100` | Records required before the prior activates |
 | `QUANTMATH_AUTO_GRADUATE` | `1` | Enable PB auto-graduation of LEARN_MODE (`0` to disable) |
 | `QUANTMATH_GRAD_WINDOW` | `30` | Closures in the rolling window that must average positive to graduate |
+| `QUANTMATH_GRAD_MIN_FAMILIES` | `2` | O1: distinct families required in the graduation window |
+| `QUANTMATH_SLIPPAGE_PCT` | `0.0005` | O2: adverse fill slippage per side applied to paper executions (`0` disables) |
+| `QUANTMATH_VOL_TARGET` | `1` (post-graduation) | O6: volatility-targeted position sizing once the gate is active (`0` disables) |
+| `QUANTMATH_VOL_TARGET_PCT` | `2.0` | O6: target per-cycle return volatility (%) the sizer aims for; multiplier clamped x0.5–x2 |
 
 ## Data Policy
 
@@ -160,9 +167,12 @@ visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
 
 ## Testing
 
-69 tests, zero warnings: integration workflow, decision-engine gate
+76+ tests, zero warnings: integration workflow, decision-engine gate
 behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
-auto-graduation persistence (PB), SIS clustering/recommendations, family
+hardened auto-graduation IC90+families (O1/PB), adverse-slippage fills
+(O2), generative-novelty metric (O4), vol-targeted sizing (O6),
+energy-burst & range-pressure families (O7), multi-symbol isolation
+(O3), SIS clustering/recommendations, family
 feedback buckets, SL 2:1 exactness, position recovery, KB round-trip +
 fallback, prior activation thresholds, model-based generator contracts.
 

@@ -393,6 +393,66 @@ def _count_open_positions(state_dir: str) -> int:
     return sum(1 for line in open(path, encoding="utf-8") if line.strip())
 
 
+
+# --- O5: analitica de aprendizaje para el Monitor -------------------------
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values) -> str:
+    if not values:
+        return "-"
+    lo, hi = min(values), max(values)
+    rng = (hi - lo) or 1.0
+    return "".join(SPARK[min(7, int((v - lo) / rng * 7))] for v in values)
+
+
+def _learning_panel_data(state_dir: str, trades, stats: Dict) -> Dict:
+    """Curva PnL de ultimos cierres, estado/progreso de graduacion y
+    trayectoria del libro (O5)."""
+    closures = [float(t.get("pnl", 0.0)) for t in trades
+                if "motivo_cierre" in t][-30:]
+    cum = []
+    acc = 0.0
+    for p in closures:
+        acc += p
+        cum.append(acc)
+    grad_path = os.path.join(state_dir, "graduation.json")
+    grad = None
+    if os.path.exists(grad_path):
+        try:
+            with open(grad_path) as fh:
+                grad = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            grad = None
+    win = 30
+    tail = closures[-win:]
+    mean_w = sum(tail) / len(tail) if tail else 0.0
+    ic90_lb = 0.0
+    if len(tail) >= 8:
+        import statistics as _st
+        ic90_lb = mean_w - 1.2816 * (_st.pstdev(tail) / len(tail) ** 0.5)
+    last10 = [float(t.get("pnl_pct") or 0.0)
+              for t in trades if "motivo_cierre" in t]
+    recent = sum(last10[-10:]) / max(1, len(last10[-10:]))
+    prior = sum(last10[-20:-10]) / max(1, len(last10[-20:-10]) - (
+        0 if len(last10) >= 20 else max(0, 10 - len(last10))))         if len(last10) > 10 else 0.0
+    return {
+        "curve": _sparkline(cum),
+        "graduated": bool(grad and grad.get("graduated")),
+        "grad_at": time.strftime(
+            "%d %b %H:%M", time.localtime(grad["at"])) if grad else "-",
+        "grad_mean": grad.get("mean_pnl_pct", 0.0) if grad else 0.0,
+        "window_n": len(tail),
+        "window_size": win,
+        "window_mean": mean_w,
+        "ic90_lb": ic90_lb,
+        "recent10": recent,
+        "prior10": prior,
+        "novelty_last": stats.get("novelty_rate_last_cycle"),
+        "novelty_avg": stats.get("novelty_cum_avg"),
+    }
+
+
 def render_monitor(runtime: RuntimeState):
     stats = runtime.stats
     cfg = stats.get("config", {})
@@ -471,6 +531,33 @@ def render_monitor(runtime: RuntimeState):
     body.add_row("Último ciclo",
                  time.strftime("%H:%M:%S", time.localtime(stats.get("last_cycle_at", 0)))
                  if stats.get("last_cycle_at") else "-")
+
+    # O5: panel de aprendizaje
+    L = _learning_panel_data(state_dir, trades, stats)
+    trend = ("→" if abs(L["recent10"] - L["prior10"]) < 0.05
+             else ("▲" if L["recent10"] > L["prior10"] else "▼"))
+    tstyle = "green" if L["recent10"] >= L["prior10"] else "red"
+    if L["graduated"]:
+        grad_txt = Text(f"GRADUADO {L['grad_at']} "
+                        f"(media ventana {L['grad_mean']:+.3f}%)",
+                        style="bold green")
+    else:
+        grad_txt = (f"aprendiendo {L['window_n']}/{L['window_size']} · "
+                    f"media {L['window_mean']:+.3f}% · IC90_lb "
+                    f"{L['ic90_lb']:+.3f}%")
+    nov = ("-"
+           if L["novelty_last"] is None
+           else f"{L['novelty_last'] * 100:.0f}% "
+                f"(prom {L['novelty_avg'] * 100:.0f}%)")
+    pnl_style2 = "green" if L["recent10"] >= 0 else "red"
+    body.add_row("Graduación (PB/O1)", grad_txt)
+    body.add_row("Curva PnL (últimos 30)", Text(L["curve"]))
+    body.add_row("Trayectoria libro (últ10 vs prev10)",
+                 Text(f"{L['recent10']:+.3f}% vs {L['prior10']:+.3f}% {trend}",
+                      style=tstyle))
+    body.add_row("PnL medio últimos 10",
+                 Text(f"{L['recent10']:+.3f}%", style=pnl_style2))
+    body.add_row("Novedad generativa (O4)", nov)
 
     config_panel = Table.grid(padding=(0, 1))
     for key in ("symbols", "timeframe", "initial_capital", "entry_pct",

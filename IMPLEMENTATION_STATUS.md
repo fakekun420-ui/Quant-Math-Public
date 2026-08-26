@@ -1,6 +1,6 @@
-# QUANT-MATH Implementation Status — v1.0.1
+# QUANT-MATH Implementation Status — v1.1.0
 
-Estado real verificado con la suite completa (69 tests, 0 warnings).
+Estado real verificado con la suite completa (76+ tests, 0 warnings).
 
 ## ✅ Núcleo en producción
 
@@ -48,6 +48,23 @@ scipy>=1.12 (cwt/ricker eliminadas upstream).
 | PA: expectancy viva | `decision_engine.main._refresh_live_expectancy` | tras cada cierre re-blendea la expectancy del registro hacia resultados reales (`est = (n·propia+3·familia)/(n+3)`; `exp = w·gen+(1-w)·est`, w=n/(n+5)); persiste en PG+JSONL; log `[exp-refresh]` |
 | PB: auto-graduación | `decision_engine.main._maybe_graduate` | con los últimos N cierres de media positiva desactiva LEARN_MODE y restaura el gate; persiste en `runtime/state/graduation.json`; flags `QUANTMATH_AUTO_GRADUATE` / `QUANTMATH_GRAD_WINDOW` |
 
+## ✅ Implementados en v1.1.0 — plan de optimización O1–O7 de la evaluación
+
+| Ítem | Implementación | Verificación |
+|---|---|---|
+| **O1** Graduación endurecida | `_maybe_graduate`: media>0 **y** IC90_lb>0 (normal approx, z=1.2816) **y** ≥ `QUANTMATH_GRAD_MIN_FAMILIES` (default 2) familias distintas; payload auditable en graduation.json | 3 tests (marginal bloqueada / diversidad / criterio completo) |
+| **O2** Slippage paper | ±`QUANTMATH_SLIPPAGE_PCT` (0.05% default) adverso en entrada y salida (`_slip`), conservador para ambos lados del libro | test aritmética exacta |
+| **O4** Novedad generativa | `novelty_rate_last_cycle`, `novelty_cum_avg` en runtime_stats + línea `[novedad]` por ciclo; helper testeable `_novelty_rate` | incluido en suite orchestrator |
+| **O6** Sizing vol-targetado | Post-graduación: `signal["sizing_mult"] = clamp(target/vol_realizada, 0.5, 2)`; orchestrator escala notional; flags VOL_TARGET/VOL_TARGET_PCT | test clamp+gate |
+| **O7** Familias nuevas | `energy_burst` (pico \|ret\| z-score) y `range_pressure` (posición en rango rodante) en model_based_generator + ramas de señal y grids WFV en aqde_runner; StrategyType.CUSTOM → familia "custom" compartida para feedback | test generación+señal |
+| **O3** Multi-símbolo | Verificado e2e: keys por hipótesis×símbolo aisladas, P1 fallback por símbolo; ids deben ser únicos por símbolo (documentado) | test integración 2 símbolos |
+| **O5** Panel CLI aprendizaje | Monitor: curva PnL sparkline (últimos 30), estado/progreso graduación con IC90_lb en vivo, trayectoria libro (últ10 vs prev10), novedad generativa | manual via CLI |
+
+**Diferidos con criterio explícito**: familia seasonality (requiere plombr
+de timestamps hasta el interface de señales — closes-only hoy);
+order-flow real (sin fuente L2/taker-volume en el stack actual).
+Estos dos puntos quedan como follow-up documentado, no descartados.
+
 ## ❌ Descartados (no implementar)
 
 - VectorBT / Backtrader / pykalman — backtester propio ya corregido.
@@ -62,5 +79,5 @@ python -m pytest test_integration.py tests/ \
     ml_quant/test_standalone.py order_management/test_standalone.py \
     portfolio_construction/test_standalone.py regime_detection/test_standalone.py \
     risk_management/test_standalone.py
-# 69 passed · 0 warnings
+# 76+ passed · 0 warnings
 ```
