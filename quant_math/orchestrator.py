@@ -54,6 +54,11 @@ class OrchestratorConfig:
     exchange_id: str = "bybit"              # REAL data source, always
     dry_run: bool = True                    # True=paper trading ONLY (no live path yet)
     use_postgres: bool = True               # KB storage: PG if reachable, JSONL fallback
+    mode: str = "classic"                   # "classic" or "burst"
+
+    # Burst-mode specifics (only used when mode == "burst")
+    burst_margin: float = 10.0              # USD margin per burst entry
+    burst_leverage: int = 10                # leverage multiplier (1-20)
 
     def __post_init__(self):
         if not self.symbols:
@@ -66,11 +71,111 @@ class OrchestratorConfig:
             raise ValueError(f"min_paper_trades inválido: {self.min_paper_trades}")
         if self.hypotheses_per_cycle < 1:
             raise ValueError(f"hypotheses_per_cycle inválido: {self.hypotheses_per_cycle}")
+        if self.mode not in ("classic", "burst"):
+            raise ValueError(f"mode debe ser 'classic' o 'burst', recibido '{self.mode}'")
         if self.dry_run is False:
             raise NotImplementedError(
                 "trading real no implementado aún: dry_run=False no disponible "
                 "(los datos son SIEMPRE reales; dry_run solo controla ejecución)"
             )
+        # Burst-mode constraints
+        if self.mode == "burst":
+            self.interval_seconds = min(self.interval_seconds, 15)
+            self.burst_margin = max(5.0, self.burst_margin)
+            self.burst_leverage = max(1, min(20, self.burst_leverage))
+            self.take_profit_pct = max(0.004, min(0.008, self.take_profit_pct))
+
+
+# ---------------------------------------------------------------------------
+# Burst state tracker (V2 B3)
+# ---------------------------------------------------------------------------
+
+import dataclasses as _dc
+
+
+@_dc.dataclass
+class _BurstState:
+    """Estado persistente de la ráfaga burst."""
+    entries_this_cycle: int = 0
+    last_entry_cycle: int = 0
+    consecutive_losses: int = 0
+    total_entries: int = 0
+    total_closures: int = 0
+    wins: int = 0
+    losses: int = 0
+
+
+class BurstStateTracker:
+    """Maneja cooldown, max entries, y streak de burst."""
+
+    MAX_ENTRIES_PER_CYCLE = 5
+    COOLDOWN_CYCLES = 10
+    MAX_EXPOSURE_USD = 50.0  # 5 x $10 margin
+
+    def __init__(self, state_dir: str):
+        self.path = os.path.join(state_dir, "burst_state.json")
+        self.state = self._load()
+
+    def _load(self) -> _BurstState:
+        if os.path.exists(self.path):
+            try:
+                with open(self.path) as fh:
+                    d = json.load(fh)
+                return _BurstState(**{k: d.get(k, 0)
+                                      for k in _BurstState.__dataclass_fields__})
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+        return _BurstState()
+
+    def _save(self):
+        with open(self.path, "w") as fh:
+            json.dump(_dc.asdict(self.state), fh)
+
+    def can_enter(self, current_cycle: int) -> bool:
+        if self.state.entries_this_cycle >= self.MAX_ENTRIES_PER_CYCLE:
+            return False
+        if current_cycle - self.state.last_entry_cycle < self.COOLDOWN_CYCLES:
+            return False
+        return True
+
+    def register_entry(self, current_cycle: int):
+        self.state.entries_this_cycle += 1
+        self.state.last_entry_cycle = current_cycle
+        self.state.total_entries += 1
+        self._save()
+
+    def register_closure(self, pnl: float):
+        self.state.total_closures += 1
+        if pnl > 0:
+            self.state.wins += 1
+            self.state.consecutive_losses = 0
+        else:
+            self.state.losses += 1
+            self.state.consecutive_losses += 1
+        self._save()
+
+    def reset_cycle(self):
+        self.state.entries_this_cycle = 0
+        self._save()
+
+    def cooldown_remaining(self, current_cycle: int) -> int:
+        elapsed = current_cycle - self.state.last_entry_cycle
+        return max(0, self.COOLDOWN_CYCLES - elapsed)
+
+    def stats_dict(self, current_cycle: int) -> Dict:
+        s = self.state
+        win_rate = (s.wins / s.total_closures * 100
+                    if s.total_closures > 0 else 0.0)
+        return {
+            "entries_this_cycle": s.entries_this_cycle,
+            "total_entries": s.total_entries,
+            "total_closures": s.total_closures,
+            "wins": s.wins,
+            "losses": s.losses,
+            "win_rate": win_rate,
+            "consecutive_losses": s.consecutive_losses,
+            "cooldown_remaining": self.cooldown_remaining(current_cycle),
+        }
 
 
 class Orchestrator:
@@ -81,9 +186,13 @@ class Orchestrator:
         self._build_runner()
         self.engine = self._build_engine()
         self.cycle_count = 0
+        # V2 B3: burst state tracker (only for burst mode)
+        self.burst_tracker = (BurstStateTracker(config.state_dir)
+                              if config.mode == "burst" else None)
         # Runtime stats consumed by external monitors (CLI)
         self.stats = {
             "state": "RUNNING",
+            "mode": config.mode,
             "cycles_completed": 0,
             "hypotheses_generated": 0,
             "hypotheses_evaluated": 0,
@@ -199,6 +308,9 @@ class Orchestrator:
             min_paper_trades=self.config.min_paper_trades,
             use_postgres=self.config.use_postgres,
             take_profit_pct=self.config.take_profit_pct,
+            mode=self.config.mode,
+            burst_margin=self.config.burst_margin,
+            burst_leverage=self.config.burst_leverage,
         )
 
     # ------------------------------------------------------------------
@@ -266,6 +378,16 @@ class Orchestrator:
                       f"(ya existen en el KB)")
             if not fresh:
                 continue
+
+            # V2 B2: burst mode — prioritize scalp_burst family
+            if self.config.mode == "burst":
+                scalp_hyps = [hid for hid in fresh
+                              if self.runner.all_hypotheses.get(hid)
+                              and self.runner.all_hypotheses[hid].parameters.get(
+                                  "strategy_type") == "scalp_burst"]
+                other_hyps = [hid for hid in fresh if hid not in scalp_hyps]
+                # Take all scalp_burst + at most 1 other for exploration
+                fresh = scalp_hyps + other_hyps[:1] if other_hyps else scalp_hyps
 
             # Backtest on REAL Bybit data (force_real_data=True upstream);
             # resultados alimentan el feedback adaptativo del runner.
@@ -371,6 +493,33 @@ class Orchestrator:
     # Stage 3: persistence + decisions + paper execution
     # ------------------------------------------------------------------
 
+    def _open_burst_entries(self) -> list:
+        """V2 B4: list of open burst entries from the permanent ledger."""
+        ledger_path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
+        if not os.path.exists(ledger_path):
+            return []
+        open_keys = set()
+        entries = []
+        try:
+            with open(ledger_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    key = rec.get("key", "")
+                    if "motivo_cierre" in rec:
+                        open_keys.discard(key)
+                    elif rec.get("margin_usd"):
+                        entries.append(rec)
+                        open_keys.add(key)
+        except OSError:
+            pass
+        return [e for e in entries if e.get("key") in open_keys]
+
     def _publish_to_kb(self, records: List[Dict]):
         for record in records:
             self.engine.register_hypothesis(record)
@@ -379,8 +528,24 @@ class Orchestrator:
         """Fill a paper trade at the signal price with configured sizing/TP."""
         price = float(signal["price"])
         side = signal["side"]
-        # O6: nocional escalado por vol-target (clampeado en el engine)
-        notional = self.config.initial_capital * self.config.entry_pct             * float(signal.get("sizing_mult", 1.0))
+        # Burst mode: margin × leverage; Classic: capital × entry_pct × vol-mult
+        if self.config.mode == "burst":
+            margin = float(signal.get("margin", self.config.burst_margin))
+            leverage = int(signal.get("leverage", self.config.burst_leverage))
+            # V2 B4: exposure cap — check total open margin
+            open_margin = sum(
+                float(rec.get("margin_usd", 0))
+                for rec in self._open_burst_entries()
+            )
+            if open_margin + margin > BurstStateTracker.MAX_EXPOSURE_USD:
+                print(f"  [burst] EXPOSURE CAP: open={open_margin:.0f} "
+                      f"+ new={margin:.0f} > {BurstStateTracker.MAX_EXPOSURE_USD:.0f}")
+                return {"action": "exposure_capped"}
+            notional = margin * leverage
+        else:
+            # O6: nocional escalado por vol-target (clampeado en el engine)
+            notional = (self.config.initial_capital * self.config.entry_pct
+                        * float(signal.get("sizing_mult", 1.0)))
         quantity = notional / price
         tp_price = price * (1 + self.config.take_profit_pct) if side == "buy" \
             else price * (1 - self.config.take_profit_pct)
@@ -399,6 +564,9 @@ class Orchestrator:
             "timestamp": signal["timestamp"],
             "cycle": self.cycle_count,
         }
+        if self.config.mode == "burst":
+            trade["margin_usd"] = margin
+            trade["leverage"] = leverage
         trades_path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
         os.makedirs(self.config.state_dir, exist_ok=True)
         with open(trades_path, "a", encoding="utf-8") as fh:
@@ -425,8 +593,12 @@ class Orchestrator:
         cfg = self.config
         print(f"\n{'=' * 60}")
         print(f"ORCHESTRATOR CYCLE {self.cycle_count} "
-              f"(modo={'paper' if cfg.dry_run else 'LIVE'}, datos=REALES/{cfg.exchange_id})")
+              f"(modo={cfg.mode}, datos=REALES/{cfg.exchange_id})")
         print(f"{'=' * 60}")
+
+        # V2 B3: reset burst cycle counter
+        if self.burst_tracker:
+            self.burst_tracker.reset_cycle()
 
         summary = {"cycle": self.cycle_count, "generated": 0, "signals": 0,
                    "no_entry": 0, "skipped_position": 0, "trades": []}
@@ -453,12 +625,25 @@ class Orchestrator:
 
         # 4-5. Decide per symbol; execute paper trades; engine handles feedback
         for symbol in cfg.symbols:
+            # V2 B3: burst cooldown gate
+            if (self.burst_tracker
+                    and not self.burst_tracker.can_enter(self.cycle_count)):
+                print(f"  [burst] {symbol}: COOLDOWN "
+                      f"({self.burst_tracker.cooldown_remaining(self.cycle_count)} "
+                      f"ciclos restantes)")
+                summary["no_entry"] += 1
+                continue
             outcome = self.engine.decide(symbol)
             action = outcome["action"] if outcome else "none"
             if action == "entry":
                 summary["signals"] += 1
                 trade = self._execute_paper_trade(outcome)
-                summary["trades"].append(trade)
+                if trade.get("action") == "exposure_capped":
+                    summary["no_entry"] += 1
+                else:
+                    summary["trades"].append(trade)
+                    if self.burst_tracker:
+                        self.burst_tracker.register_entry(self.cycle_count)
             elif action == "no_entry":
                 summary["no_entry"] += 1
                 print(f"  [decision] {symbol}: NO_ENTRY ({outcome['reason']})")
@@ -466,6 +651,12 @@ class Orchestrator:
                 summary["skipped_position"] += 1
                 print(f"  [decision] {symbol}: SKIP posición abierta "
                       f"({outcome.get('hypothesis_id')})")
+
+        # V2 B3: register closures for burst stats
+        if self.burst_tracker:
+            for closure in exits:
+                self.burst_tracker.register_closure(
+                    float(closure.get("pnl", 0.0)))
 
         print(f"[cycle {self.cycle_count}] generadas={summary['generated']} "
               f"señales={summary['signals']} no_entry={summary['no_entry']} "
@@ -492,6 +683,10 @@ class Orchestrator:
         self.stats["skipped_position"] += summary["skipped_position"]
         self.stats["paper_trades_taken"] += len(summary["trades"])
         self.stats["last_cycle_at"] = time.time()
+        # V2 B3: burst stats for monitor
+        if self.burst_tracker:
+            self.stats["burst_stats"] = self.burst_tracker.stats_dict(
+                self.cycle_count)
         self._write_stats()
         return summary
 

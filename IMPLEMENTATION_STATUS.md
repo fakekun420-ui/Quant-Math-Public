@@ -1,6 +1,6 @@
-# QUANT-MATH Implementation Status — v1.1.0
+# QUANT-MATH Implementation Status — v1.2.0
 
-Estado real verificado con la suite completa (76+ tests, 0 warnings).
+Estado real verificado con la suite completa (115+ tests, 0 warnings).
 
 ## ✅ Núcleo en producción
 
@@ -65,6 +65,26 @@ de timestamps hasta el interface de señales — closes-only hoy);
 order-flow real (sin fuente L2/taker-volume en el stack actual).
 Estos dos puntos quedan como follow-up documentado, no descartados.
 
+
+## ✅ Implementados en v1.2.0 — Plan V2: Burst Scalping
+
+| Fase | Implementación | Verificación |
+|---|---|---|
+| **C1** Infraestructura de modo | `OrchestratorConfig.mode` ("classic"/"burst"), `burst_margin`, `burst_leverage`; burst constraints en `__post_init__` (interval≤15s, margin≥$5, leverage 1-20×, TP∈[0.4%,0.8%]) | 7 tests (constraints, clamps, notional) |
+| **C1** Selector Top-20 | `fetch_top_volume_assets()` via ccxt `fetch_tickers`, exclude stables, fallback list; `burst_wizard()` con `questionary.checkbox` | manual CLI + test |
+| **C1** Menú burst | Opción 7 "Iniciar Burst Scalping" en menú principal; `burst_wizard()` con paths aislados (`runtime/state_burst/`, `hypotheses_burst.jsonl`) | test config generation |
+| **B1** Sizing margin×leverage | `_execute_paper_trade`: burst mode usa `margin × leverage` (default $10×10=$100 notional); ledger records `margin_usd`, `leverage` backward-compatible | 5 tests |
+| **B1** Plantilla scalp_burst | `model_based_generator.py`: EMA trend + momentum spike + pullback entry; params: ema_fast=8, ema_slow=21, momentum_window=5, threshold=0.2%, pullback=0.3% | 2 tests |
+| **B2** Estrategia scalp_burst | `aqde_runner._create_strategy_from_hypothesis`: branch completo con EMA, momentum, pullback; `quant_math_adapter.make_strategy`: branches para energy_burst, range_pressure, scalp_burst (fix bug old fallthrough) | 3 tests |
+| **B2** Grid WFV | scalp_burst: ema_fast[5,8,12]×ema_slow[18,21,26]×momentum_window[3,5,8]×threshold[0.1%,0.2%,0.3]×pullback[0.2%,0.3%,0.5%] | test grid keys |
+| **B2** Priorización burst | `_generate_and_backtest`: burst mode prioriza scalp_burst en la generación (+1 other for exploration) | test config |
+| **B3** BurstStateTracker | `BurstStateTracker` con cooldown (10 ciclos), max 5 entries/cycle, max $50 exposure; persiste en `burst_state.json`; `reset_cycle()`, `register_entry()`, `register_closure()` | 8 tests |
+| **B3** Trend filter EMA | `decide()` burst mode: side must align with EMA(8)>EMA(21); `_ema_simple()` helper | test trend blocks |
+| **B4** Slippage burst | `QUANTMATH_BURST_SLIPPAGE_PCT` (default 0.03%/side vs classic 0.05%); `_slip()` usa burst-specific rate | 2 tests |
+| **B4** Exposure cap | `_execute_paper_trade`: verifica Σmargin abierto ≤ $50 antes de nueva entrada burst | test cap |
+| **B5** Monitor burst | Panel dedicado en `render_monitor`: entries/ciclo, cierres, win rate, cooldown, pérdidas consecutivas | 5 tests |
+
+**Suite completa: 115 passed, 0 warnings.**
 ## ❌ Descartados (no implementar)
 
 - VectorBT / Backtrader / pykalman — backtester propio ya corregido.

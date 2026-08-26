@@ -503,6 +503,60 @@ class QuantMathAdapter:
                         lower_band = ema_s[i] - atr_band
                         buy_sig = close_prices[i] > upper_band and ema_s[i] > ema_l[i]
                         sell_sig = close_prices[i] < lower_band and ema_s[i] < ema_l[i]
+                    elif stype == 'energy_burst':
+                        w = 20
+                        zthr = 1.5
+                        if i >= w and i >= 1:
+                            rets = np.diff(np.array(close_prices[:i+1], dtype=float))
+                            win = rets[i - w:i]
+                            mu, sd = np.mean(win), np.std(win)
+                            r = rets[i - 1] if i - 1 < len(rets) else 0
+                            z = (r - mu) / sd if sd > 1e-12 else 0.0
+                            buy_sig = abs(z) >= zthr and r > 0
+                            sell_sig = abs(z) >= zthr and r < 0
+                        else:
+                            buy_sig = sell_sig = False
+                    elif stype == 'range_pressure':
+                        w = 20
+                        hi, lo = 0.85, 0.15
+                        if i >= w:
+                            win = np.array(close_prices[i - w + 1:i + 1], dtype=float)
+                            rng = win.max() - win.min()
+                            press = (close_prices[i] - win.min()) / rng if rng > 1e-12 else 0.5
+                            buy_sig = press >= hi
+                            sell_sig = press <= lo
+                        else:
+                            buy_sig = sell_sig = False
+                    elif stype == 'scalp_burst':
+                        ema_f_w, ema_s_w = 8, 21
+                        mom_w, mom_thr, pb = 5, 0.002, 0.003
+                        if i >= ema_s_w + mom_w and i >= 2:
+                            arr = np.array(close_prices[:i+1], dtype=float)
+                            af = 2.0 / (ema_f_w + 1)
+                            as_ = 2.0 / (ema_s_w + 1)
+                            ef = np.zeros(len(arr))
+                            es = np.zeros(len(arr))
+                            ef[0] = es[0] = arr[0]
+                            for j in range(1, len(arr)):
+                                ef[j] = arr[j] * af + ef[j-1] * (1 - af)
+                                es[j] = arr[j] * as_ + es[j-1] * (1 - as_)
+                            trend_up = ef[-1] > es[-1]
+                            ret = (arr[-1] - arr[-mom_w]) / arr[-mom_w] if arr[-mom_w] > 0 else 0
+                            mom_ok = abs(ret) >= mom_thr
+                            if trend_up and mom_ok and ret > 0:
+                                rh = float(np.max(arr[-mom_w:]))
+                                pb_ok = ((rh - arr[-1]) / rh >= pb if rh > 0 else False)
+                                buy_sig = pb_ok or arr[-1] > arr[-2]
+                                sell_sig = False
+                            elif not trend_up and mom_ok and ret < 0:
+                                rl = float(np.min(arr[-mom_w:]))
+                                bk = ((arr[-1] - rl) / rl >= pb if rl > 0 else False)
+                                sell_sig = bk or arr[-1] < arr[-2]
+                                buy_sig = False
+                            else:
+                                buy_sig = sell_sig = False
+                        else:
+                            buy_sig = sell_sig = False
                     else:
                         buy_sig = ema_s[i] > ema_l[i]
                         sell_sig = ema_s[i] < ema_l[i]

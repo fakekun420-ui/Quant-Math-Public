@@ -180,4 +180,18 @@ def generate_model_hypotheses(symbol: str, closes, max_hypotheses: int = 2):
                            "range_window": 20, "pressure_hi": 0.85,
                            "pressure_lo": 0.15, "symbol": symbol}),
         })
+    # 3) scalp_burst:rafaga tendencial con EMA trend + momentum + pullback
+    if len(out) < max_hypotheses:
+        out.append({
+            "name": f"MScalp_Burst_{sym}",
+            "description": (f"Rafaga tendencial: EMA trend + momentum spike "
+                            f"+ pullback entry para {symbol}"),
+            "strategy_type": StrategyType.CUSTOM,
+            "parameters": _attach({"strategy_type": "scalp_burst",
+                           "ema_fast": 8, "ema_slow": 21,
+                           "momentum_window": 5,
+                           "momentum_threshold": 0.002,
+                           "pullback_pct": 0.003,
+                           "symbol": symbol}),
+        })
     return out[:max_hypotheses]

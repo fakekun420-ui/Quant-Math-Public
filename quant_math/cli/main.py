@@ -2,11 +2,13 @@
 Quant-Math interactive CLI.
 
 Menu:
-  1. Iniciar Quant-Math   -> config wizard, then Orchestrator in a background PROCESS
-  2. Detener investigación -> graceful stop of the background process
-  3. Monitor               -> live rich dashboard (if running)
-  4. Ver log               -> paginated quant_math.log viewer
-  5. Salir
+  1. Iniciar Quant-Math       -> config wizard, then Orchestrator in a background PROCESS
+  2. Detener investigación    -> graceful stop of the background process
+  3. Monitor                  -> live rich dashboard (if running)
+  4. Ver log                  -> paginated quant_math.log viewer
+  5. Historial de operaciones -> trade history viewer
+  6. Iniciar Burst Scalping   -> burst mode wizard (scalp bursts, $10 margin × leverage)
+  7. Salir
 
 Logs from the orchestrator process go to quant_math.log ONLY — they never
 mix with the Live monitor render.
@@ -99,7 +101,7 @@ def _orchestrator_process_main(cfg_dict: Dict):
         pass
     finally:
         orch.mark_stopped()
-        log_fh.close()
+        cap.fh.close()
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +349,88 @@ def wizard() -> Optional[Dict]:
         return None
 
 
+def burst_wizard() -> Optional[Dict]:
+    """Interactive burst-scalping configuration wizard."""
+    console.print(Panel(
+        "[bold cyan]Wizard Burst Scalping[/bold cyan]\n"
+        "Ráfagas tendenciales: $10 margen × leverage, TP 0.4-0.8%.\n"
+        "Modo paper trading. Los datos son SIEMPRE reales (Bybit).",
+        expand=False))
+    try:
+        # Symbol selection: interactive Top-20 or manual
+        use_top = questionary.select(
+            "Selección de símbolos:",
+            choices=[
+                questionary.Choice("Top-20 por volumen (recomendado)",
+                                   value="top20"),
+                questionary.Choice("Ingresar manualmente", value="manual"),
+            ]).unsafe_ask()
+        if use_top is None:
+            return None
+
+        if use_top == "top20":
+            console.print("[cyan]Obteniendo Top-20 por volumen...[/cyan]")
+            top_assets = fetch_top_volume_assets("bybit", 20)
+            selected = questionary.checkbox(
+                "Selecciona símbolos (espacio marcar, Enter confirmar):",
+                choices=[questionary.Choice(s, value=s) for s in top_assets]
+            ).unsafe_ask()
+            if not selected:
+                console.print("[red]Debes seleccionar al menos un símbolo[/red]")
+                return None
+            symbols = list(selected)
+        else:
+            raw = questionary.text(
+                "Símbolos (separados por coma):",
+                default="BTC/USDT").unsafe_ask()
+            if raw is None:
+                return None
+            symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+            if not symbols:
+                console.print("[red]Se requiere al menos un símbolo[/red]")
+                return None
+
+        margin = ask_float("Margen por entrada (USD, min 5)", "10", lo=5)
+        leverage = ask_int("Leverage (1-20)", "10", lo=1)
+        leverage = max(1, min(20, leverage))
+
+        timeframe = questionary.select(
+            "Timeframe:", choices=["1m", "5m", "15m", "1h"],
+            default="5m").unsafe_ask()
+        if timeframe is None:
+            return None
+
+        tp_pct = ask_float("Take-profit % (0.4-0.8 recommended)", "0.006")
+        tp_pct = max(0.004, min(0.008, tp_pct))
+
+        lookback_days = ask_int("Lookback days (backtest)", "14", lo=1)
+        hyp_per_cycle = ask_int("Hipótesis nuevas por ciclo", "5", lo=1)
+
+        state_dir = os.path.join(PROJECT_ROOT, "runtime", "state_burst")
+        os.makedirs(state_dir, exist_ok=True)
+
+        return {
+            "symbols": symbols,
+            "timeframe": timeframe,
+            "lookback_days": lookback_days,
+            "initial_capital": 1000.0,
+            "entry_pct": 0.1,               # ignored in burst mode (margin-based)
+            "take_profit_pct": tp_pct,
+            "min_paper_trades": 3,
+            "hypotheses_per_cycle": hyp_per_cycle,
+            "kb_path": os.path.join(PROJECT_ROOT, "runtime", "hypotheses_burst.jsonl"),
+            "state_dir": state_dir,
+            "interval_seconds": 15,
+            "exchange_id": "bybit",
+            "dry_run": True,
+            "mode": "burst",
+            "burst_margin": margin,
+            "burst_leverage": leverage,
+        }
+    except (AttributeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Monitor
 # ---------------------------------------------------------------------------
@@ -369,6 +453,31 @@ def _get_current_price(symbol: str, exchange_id: str) -> Optional[float]:
         return price
     except Exception:
         return cached[0] if cached else None
+
+
+def fetch_top_volume_assets(exchange_id: str = "bybit", n: int = 20) -> list:
+    """Top-N USDT pairs by quoteVolume, stablecoin bases excluded."""
+    STABLES = {"USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD",
+               "USDJ", "GBP", "EUR", "AUD", "BRL", "JPY"}
+    try:
+        import ccxt
+        ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+        tickers = ex.fetch_tickers()
+    except Exception:
+        return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+    pairs = []
+    for sym, t in tickers.items():
+        if not sym.endswith("/USDT"):
+            continue
+        base = sym.split("/")[0]
+        if base in STABLES:
+            continue
+        qv = float(t.get("quoteVolume") or 0)
+        if qv > 0:
+            pairs.append((sym, qv))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in pairs[:n]] if pairs else [
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
 
 
 def _read_paper_trades(state_dir: str):
@@ -558,6 +667,29 @@ def render_monitor(runtime: RuntimeState):
     body.add_row("PnL medio últimos 10",
                  Text(f"{L['recent10']:+.3f}%", style=pnl_style2))
     body.add_row("Novedad generativa (O4)", nov)
+
+    # V2 B5: burst-specific panel
+    if stats.get("mode") == "burst":
+        b = stats.get("burst_stats", {})
+        body.add_row("── BURST SCALPING ──", "")
+        body.add_row("Entries burst (ciclo/total)",
+                     f"{b.get('entries_this_cycle', 0)} / "
+                     f"{b.get('total_entries', 0)}")
+        body.add_row("Cierres burst",
+                     f"{b.get('total_closures', 0)} "
+                     f"(W:{b.get('wins', 0)} L:{b.get('losses', 0)})")
+        wr = b.get('win_rate', 0)
+        body.add_row("Win rate burst",
+                     Text(f"{wr:.0f}%",
+                          style="green" if wr >= 50 else "red"))
+        cd = b.get('cooldown_remaining', 0)
+        body.add_row("Cooldown restante",
+                     Text(f"{cd} ciclos",
+                          style="yellow" if cd > 0 else "dim"))
+        cl = b.get('consecutive_losses', 0)
+        if cl > 0:
+            body.add_row("Pérdidas consecutivas",
+                         Text(str(cl), style="red"))
 
     config_panel = Table.grid(padding=(0, 1))
     for key in ("symbols", "timeframe", "initial_capital", "entry_pct",
@@ -807,6 +939,9 @@ def main():
                         questionary.Choice("Ver log", value="log"),
                         questionary.Choice("Historial de operaciones",
                                            value="history"),
+                        questionary.Choice("Iniciar Burst Scalping",
+                                           value="start_burst",
+                                           disabled="ya está corriendo" if runtime.running else None),
                         questionary.Choice("Salir", value="quit"),
                     ],
                 ).unsafe_ask()
@@ -850,6 +985,19 @@ def _dispatch(runtime: RuntimeState, action: str):
             console.print("[green]Investigación detenida.[/green]")
         else:
             console.print("[yellow]No hay proceso activo.[/yellow]")
+
+    elif action == "start_burst":
+        cfg = burst_wizard()
+        if cfg is None:
+            console.print("[dim]Wizard burst cancelado.[/dim]")
+            return
+        runtime.start(cfg)
+        console.print(f"[green]Burst Scalping iniciado (pid={runtime.process.pid}). "
+                      f"Logs: {LOG_PATH}[/green]")
+        try:
+            questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").unsafe_ask()
+        except (AttributeError):
+            pass
 
     elif action == "monitor":
         monitor_loop(runtime)

@@ -898,6 +898,82 @@ class AQDERunner:
                         orders.append({'symbol': symbol, 'side': 'sell', 'quantity': 1})
                     else:
                         orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
+
+            elif strategy_type == 'scalp_burst':
+                # V2 B2: rafaga tendencial — EMA trend + momentum spike + pullback
+                ema_fast = int(all_params.get('ema_fast', 8))
+                ema_slow = int(all_params.get('ema_slow', 21))
+                mom_w = int(all_params.get('momentum_window', 5))
+                mom_thr = float(all_params.get('momentum_threshold', 0.002))
+                pullback = float(all_params.get('pullback_pct', 0.003))
+
+                p_arr = np.asarray(prices, dtype=float)
+                n = len(p_arr)
+                # EMA
+                alpha_f = 2.0 / (ema_fast + 1)
+                alpha_s = 2.0 / (ema_slow + 1)
+                ema_f = np.zeros(n)
+                ema_s = np.zeros(n)
+                ema_f[0] = ema_s[0] = p_arr[0]
+                for i in range(1, n):
+                    ema_f[i] = p_arr[i] * alpha_f + ema_f[i - 1] * (1 - alpha_f)
+                    ema_s[i] = p_arr[i] * alpha_s + ema_s[i - 1] * (1 - alpha_s)
+
+                orders = []
+                in_pos = False
+                entry_idx = 0
+                entry_side = "buy"
+                for i in range(n):
+                    if i < ema_slow + mom_w or i < 2:
+                        orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
+                        continue
+
+                    trend_up = ema_f[i] > ema_s[i]
+                    ret = ((p_arr[i] - p_arr[i - mom_w]) / p_arr[i - mom_w]
+                           if p_arr[i - mom_w] > 0 else 0)
+                    momentum_ok = abs(ret) >= mom_thr
+
+                    if not in_pos:
+                        entered = False
+                        if trend_up and momentum_ok and ret > 0:
+                            recent_high = float(np.max(p_arr[max(0, i - mom_w):i]))
+                            pullback_ok = ((recent_high - p_arr[i]) / recent_high
+                                           if recent_high > 0 else 0) >= pullback
+                            if pullback_ok or p_arr[i] > p_arr[i - 1]:
+                                orders.append({'symbol': symbol, 'side': 'buy',
+                                               'quantity': 1})
+                                in_pos = True
+                                entry_idx = i
+                                entry_side = "buy"
+                                entered = True
+                        elif not trend_up and momentum_ok and ret < 0:
+                            recent_low = float(np.min(p_arr[max(0, i - mom_w):i]))
+                            bounce_ok = ((p_arr[i] - recent_low) / recent_low
+                                         if recent_low > 0 else 0) >= pullback
+                            if bounce_ok or p_arr[i] < p_arr[i - 1]:
+                                orders.append({'symbol': symbol, 'side': 'sell',
+                                               'quantity': 1})
+                                in_pos = True
+                                entry_idx = i
+                                entry_side = "sell"
+                                entered = True
+                        if not entered:
+                            orders.append({'symbol': symbol, 'side': 'hold',
+                                           'quantity': 0})
+                    else:
+                        # Exit: max 5 bars or trend reversal
+                        bars_held = i - entry_idx
+                        trend_reversal = ((entry_side == "buy" and not trend_up)
+                                          or (entry_side == "sell" and trend_up))
+                        if bars_held >= 5 or trend_reversal:
+                            exit_side = "sell" if entry_side == "buy" else "buy"
+                            orders.append({'symbol': symbol, 'side': exit_side,
+                                           'quantity': 1})
+                            in_pos = False
+                        else:
+                            orders.append({'symbol': symbol, 'side': 'hold',
+                                           'quantity': 0})
+
             else:
                 # Default: hold
                 orders = [{'symbol': symbol, 'side': 'hold', 'quantity': 0} for _ in prices]
@@ -963,6 +1039,14 @@ class AQDERunner:
             return {
                 'atr_window': [10, 14, 20],
                 'atr_factor': [2.0, 2.5, 3.0, 3.5]
+            }
+        elif strategy_type == 'scalp_burst':
+            return {
+                'ema_fast': [5, 8, 12],
+                'ema_slow': [18, 21, 26],
+                'momentum_window': [3, 5, 8],
+                'momentum_threshold': [0.001, 0.002, 0.003],
+                'pullback_pct': [0.002, 0.003, 0.005]
             }
         else:
             return {}

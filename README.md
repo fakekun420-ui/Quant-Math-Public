@@ -133,6 +133,11 @@ safe: below minimum sample thresholds every learner stays in "collecting" mode.
 | `QUANTMATH_SLIPPAGE_PCT` | `0.0005` | O2: adverse fill slippage per side applied to paper executions (`0` disables) |
 | `QUANTMATH_VOL_TARGET` | `1` (post-graduation) | O6: volatility-targeted position sizing once the gate is active (`0` disables) |
 | `QUANTMATH_VOL_TARGET_PCT` | `2.0` | O6: target per-cycle return volatility (%) the sizer aims for; multiplier clamped x0.5–x2 |
+| `QUANTMATH_BURST_SLIPPAGE_PCT` | `0.0003` | V2: burst-mode adverse fill slippage per side (0.03%) |
+| `QUANTMATH_BURST_GRAD_WINDOW` | `100` | V2: burst graduation window (closures) |
+| `QUANTMATH_BURST_GRAD_MIN_NET` | `0.05` | V2: burst graduation min mean net % per trade |
+| `QUANTMATH_BURST_MAX_ENTRIES` | `5` | V2: max burst entries per cycle |
+| `QUANTMATH_BURST_COOLDOWN_CYCLES` | `10` | V2: cooldown cycles between burst entries |
 
 ## Data Policy
 
@@ -167,7 +172,7 @@ visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
 
 ## Testing
 
-76+ tests, zero warnings: integration workflow, decision-engine gate
+115+ tests, zero warnings: integration workflow, decision-engine gate
 behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
 hardened auto-graduation IC90+families (O1/PB), adverse-slippage fills
 (O2), generative-novelty metric (O4), vol-targeted sizing (O6),

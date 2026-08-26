@@ -68,6 +68,9 @@ class DecisionEngine:
         learn_mode: Optional[bool] = None,
         auto_graduate: Optional[bool] = None,
         graduate_window: Optional[int] = None,
+        mode: str = "classic",
+        burst_margin: float = 10.0,
+        burst_leverage: int = 10,
     ):
         self.symbols = list(symbols)
         self.kb_path = kb_path
@@ -76,6 +79,9 @@ class DecisionEngine:
         self.timeframe = timeframe
         self.candle_limit = candle_limit
         self.min_paper_trades = min_paper_trades
+        self.mode = mode
+        self.burst_margin = burst_margin
+        self.burst_leverage = burst_leverage
         self.take_profit_pct = (
             float(take_profit_pct) if take_profit_pct is not None else None)
         self.learn_mode = (_learn_mode_default() if learn_mode is None
@@ -98,6 +104,16 @@ class DecisionEngine:
         if self.slippage_pct:
             logger.info("[slippage] modelo activo: %.3f%% por lado "
                         "(QUANTMATH_SLIPPAGE_PCT)", self.slippage_pct * 100)
+
+        # V2 B4: burst-specific slippage (tighter for faster trades)
+        if self.mode == "burst":
+            try:
+                self.burst_slippage_pct = abs(float(os.environ.get(
+                    "QUANTMATH_BURST_SLIPPAGE_PCT", "0.0003")))
+            except ValueError:
+                self.burst_slippage_pct = 0.0003
+        else:
+            self.burst_slippage_pct = self.slippage_pct
 
         # O6: sizing vol-targetado solo con gate activo (post-graduacion)
         self.vol_target_enabled = (
@@ -562,11 +578,20 @@ class DecisionEngine:
         """O2: precio adverso por slippage. Comprar entra caro y sale barato
         (al cerrar vendo); vender es el espejo. Siempre en contra del que
         ejecuta -> estimacion conservadora."""
-        s = self.slippage_pct
+        s = self.burst_slippage_pct if self.mode == "burst" else self.slippage_pct
         if not s or price <= 0:
             return price
         adverse_up = (side == "buy") == entering
         return price * (1 + s) if adverse_up else price * (1 - s)
+
+    @staticmethod
+    def _ema_simple(prices, span):
+        """V2 B3: EMA simple para trend filter burst."""
+        alpha = 2.0 / (span + 1)
+        ema = prices[0]
+        for p in prices[1:]:
+            ema = p * alpha + ema * (1 - alpha)
+        return ema
 
     def _sizing_vol_multiplier(self, candles) -> float:
         """O6: multiplicador de nocional por volatilidad realizada
@@ -886,6 +911,21 @@ class DecisionEngine:
 
         candles = self.fetch_real_data(symbol)
         side = self._evaluate_direction(best, candles)
+
+        # V2 B3: burst trend filter — side must align with EMA trend
+        if self.mode == "burst":
+            closes = [float(c["close"]) for c in candles]
+            if len(closes) >= 21:
+                ef, es = self._ema_simple(closes, 8), self._ema_simple(closes, 21)
+                trend_up = ef > es
+                if (side == "buy" and not trend_up) or (side == "sell" and trend_up):
+                    return {
+                        "action": "no_entry",
+                        "symbol": symbol,
+                        "hypothesis_id": hypothesis_id,
+                        "reason": "burst_trend_filter",
+                        "signal": None,
+                    }
 
         # O2: fill adverso en la entrada
         fill_price = self._slip(float(candles[-1]["close"]), side, True)
