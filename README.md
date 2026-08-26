@@ -1,13 +1,13 @@
-# QUANT-MATH v1.0.1 — Autonomous Quantitative Research System
+# QUANT-MATH v1.2.0 — Autonomous Quantitative Research System
 
 Self-improving quantitative trading research system: an AQDE engine generates
 market-driven hypotheses, a mathematical gate validates them against **real
 Bybit data**, and an unsupervised learning loop (SIS) learns from every closed
 operation to continuously improve what gets generated next.
 
-> **v1.0.1** — SIS unsupervised learning over operations, family-level AQDE
-> feedback, persistent PostgreSQL knowledge base (qcow2 microVM), SL 2:1 risk
-> rule, intra-cycle market-data cache, CLI operations history.
+> **v1.2.0** — Burst Scalping mode (margin×leverage, $0.20–$0.60 net target),
+> separate burst/classic records, interactive Top-20 asset selector,
+> dedicated burst monitor + history, hardened graduation (IC90 + diversity).
 
 ## How It Works
 
@@ -56,12 +56,8 @@ loss-collection experiments, paper-only).
 # Interactive CLI (menu → wizard → orchestrator in background process)
 python -m quant_math.cli.main
 
-# Run the full test suite (69 tests across all modules)
-python -m pytest test_integration.py tests/ \
-    algo_trading/test_standalone.py backtesting/test_standalone.py \
-    ml_quant/test_standalone.py order_management/test_standalone.py \
-    portfolio_construction/test_standalone.py regime_detection/test_standalone.py \
-    risk_management/test_standalone.py
+# Run the full test suite (95 tests across all modules)
+python -m pytest tests/ -q
 
 # Refresh the code-graph index after refactors
 graphify update .
@@ -71,11 +67,14 @@ graphify update .
 
 | Menu option | What it does |
 |---|---|
-| Iniciar Quant-Math | Config wizard → orchestrator in background process |
+| Iniciar Quant-Math | Config wizard with Top-20 asset selector → orchestrator in background |
 | Detener investigación | Graceful stop (positions are preserved) |
-| Monitor | Live dashboard: cycles, hypotheses, open/closed ops, wins/losses, MtM + realized PnL split, legacy PnL separated |
-| Ver log | Paginated log viewer |
-| Historial de operaciones | Permanent trade book: paginated closures with entry/exit prices, PnL USD/%, motivo (tp/sl/manual) + summary |
+| Monitor | Live dashboard (classic or burst): cycles, hypotheses, open/closed ops, wins/losses, MtM + realized PnL split |
+| Ver log | Paginated log viewer (quant_math.log or quant_math_burst.log) |
+| Historial de operaciones | Permanent trade book with entry/exit prices, PnL USD/%, motivo + summary |
+| Iniciar Burst Scalping | Burst wizard: Top-20 selector, margin/leverage config → burst orchestrator |
+| Historial Burst | Burst-only trade book with margin/leverage columns (enabled when burst active) |
+| Ver log Burst | Burst-only log viewer (enabled when burst active) |
 
 `ESC` navigates back everywhere without stopping background work;
 `Ctrl+C` performs full clean shutdown.
@@ -109,6 +108,7 @@ graphify update .
 | Graduation Hardening (O1) | Statistical gate on PB | Window mean must clear IC90 lower bound > 0 with ≥2 distinct families | Prevents lucky-streak graduations; audit fields stored in `graduation.json` |
 | Slippage Model (O2) | Adverse-fill simulation | Every paper execution | Entries and exits filled at ±QUANTMATH_SLIPPAGE_PCT against the trader — realistic net PnL |
 | Vol-Target Sizing (O6) | Inverse-volatility scaler | Realized per-cycle returns | Post-graduation notional scales x0.5–x2 toward a 2% vol target instead of fixed sizing |
+| Burst Scalping (V2) | Margin×leverage sizing | EMA trend + momentum spike + pullback entry | $10 margin × 10× leverage = $100 notional; TP 0.4–0.8% = $0.20–$0.60 net; cooldown 10 cycles, max $50 exposure |
 
 All generation-side learning is **advisory**: it biases *what gets generated*,
 never whether a trade happens. PA changes *which ranked candidate is best*
@@ -151,17 +151,21 @@ resamples already-real trade PnLs (statistical bootstrap).
 
 ```
 ├── aqde_runner.py              # AQDE engine: generation + backtesting
-├── model_based_generator.py    # ARIMA/GARCH hypothesis candidates
+├── model_based_generator.py    # ARIMA/GARCH hypothesis candidates + burst template
 ├── quant_math/
-│   ├── cli/main.py             # Interactive CLI (menu/wizard/monitor/history)
-│   ├── orchestrator.py         # Cycle orchestration + dedupe + SIS hook
-│   ├── decision_engine/        # Expectancy gate, TP/SL, positions, feedback
+│   ├── cli/main.py             # Interactive CLI (menu/wizard/monitor/history/burst)
+│   ├── orchestrator.py         # Cycle orchestration + dedupe + SIS hook + BurstStateTracker
+│   ├── decision_engine/        # Expectancy gate, TP/SL, positions, feedback, burst sizing
 │   ├── ml/                     # Prior, feature store, SIS loop, KB reset
 │   └── autonomous_research/    # Research manager, adapters, KB backends
-├── runtime/state/              # Positions, ledger, counters, stats
-├── runtime/hypotheses.jsonl    # KB mirror (fallback seed)
+├── runtime/state/              # Classic: positions, ledger, counters, stats
+├── runtime/state_burst/        # Burst: isolated state (positions, ledger, burst_state)
+├── runtime/hypotheses.jsonl    # Classic KB mirror (fallback seed)
+├── runtime/hypotheses_burst.jsonl  # Burst KB mirror
+├── quant_math.log              # Classic orchestrator log
+├── quant_math_burst.log        # Burst orchestrator log
 ├── tools/                      # Migration & maintenance utilities
-├── tests/                      # Behavior suites (gate, SIS, risk, KB…)
+├── tests/                      # Behavior suites (gate, SIS, risk, KB, burst…)
 ├── */test_standalone.py        # Per-module test scripts
 └── graphify-out/               # Code knowledge graph (Graphify index)
 ```
@@ -172,14 +176,16 @@ visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
 
 ## Testing
 
-115+ tests, zero warnings: integration workflow, decision-engine gate
+95 tests, zero warnings: integration workflow, decision-engine gate
 behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
 hardened auto-graduation IC90+families (O1/PB), adverse-slippage fills
 (O2), generative-novelty metric (O4), vol-targeted sizing (O6),
 energy-burst & range-pressure families (O7), multi-symbol isolation
 (O3), SIS clustering/recommendations, family
 feedback buckets, SL 2:1 exactness, position recovery, KB round-trip +
-fallback, prior activation thresholds, model-based generator contracts.
+fallback, prior activation thresholds, model-based generator contracts,
+burst infrastructure (cooldown, trend filter, exposure, sizing),
+burst history/log separation, burst monitor.
 
 ## License
 

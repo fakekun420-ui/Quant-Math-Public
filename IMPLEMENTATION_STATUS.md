@@ -1,6 +1,6 @@
 # QUANT-MATH Implementation Status — v1.2.0
 
-Estado real verificado con la suite completa (115+ tests, 0 warnings).
+Estado real verificado con la suite completa (95 tests, 0 warnings).
 
 ## ✅ Núcleo en producción
 
@@ -83,8 +83,12 @@ Estos dos puntos quedan como follow-up documentado, no descartados.
 | **B4** Slippage burst | `QUANTMATH_BURST_SLIPPAGE_PCT` (default 0.03%/side vs classic 0.05%); `_slip()` usa burst-specific rate | 2 tests |
 | **B4** Exposure cap | `_execute_paper_trade`: verifica Σmargin abierto ≤ $50 antes de nueva entrada burst | test cap |
 | **B5** Monitor burst | Panel dedicado en `render_monitor`: entries/ciclo, cierres, win rate, cooldown, pérdidas consecutivas | 5 tests |
+| **B6** Records separados | `BURST_LOG_PATH` (quant_math_burst.log) vs `LOG_PATH`; `BURST_STATE_DIR` (runtime/state_burst/) aislado; `log_path` inyectado vía config_dict al proceso hijo | 9 tests |
+| **B7** Historial burst | `view_burst_history()`: libro permanente burst con columnas margin/leverage; solo habilitado cuando burst está activo | test integración |
+| **B8** Monitor burst dedicado | `burst_monitor_loop()` + `render_burst_monitor()`: panel propio con exposición margin/notional, entries por ciclo, cooldown, win rate, Pérdidas consecutivas, KB trajectory, config burst | test render |
+| **B9** Selector interactivo monitor | Al seleccionar "Monitor" en modo clásico, pregunta Quant-Math o Burst; en modo burst entra directo | manual CLI |
 
-**Suite completa: 115 passed, 0 warnings.**
+**Suite completa: 95 passed, 0 warnings.**
 ## ❌ Descartados (no implementar)
 
 - VectorBT / Backtrader / pykalman — backtester propio ya corregido.
