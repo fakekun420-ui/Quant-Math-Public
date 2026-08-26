@@ -96,6 +96,7 @@ def _orchestrator_process_main(cfg_dict: Dict):
 
     from quant_math.orchestrator import Orchestrator, OrchestratorConfig
 
+    log_path = cfg_dict.pop("log_path", LOG_PATH)
     config = OrchestratorConfig(**cfg_dict)
     orch = Orchestrator(config)
     try:
