@@ -318,10 +318,13 @@ def wizard() -> Optional[Dict]:
         if use_top == "top20":
             console.print("[cyan]Obteniendo Top-20 por volumen...[/cyan]")
             top_assets = fetch_top_volume_assets("bybit", 20)
-            selected = questionary.checkbox(
-                "Selecciona símbolos (espacio marcar, Enter confirmar):",
-                choices=[questionary.Choice(s, value=s) for s in top_assets]
-            ).unsafe_ask()
+            try:
+                selected = questionary.checkbox(
+                    "Selecciona símbolos (espacio marcar, Enter confirmar):",
+                    choices=[questionary.Choice(s, value=s) for s in top_assets]
+                ).unsafe_ask()
+            except (AttributeError, TypeError):
+                return None
             if not selected:
                 console.print("[red]Debes seleccionar al menos un símbolo[/red]")
                 return None
@@ -394,10 +397,13 @@ def burst_wizard() -> Optional[Dict]:
         if use_top == "top20":
             console.print("[cyan]Obteniendo Top-20 por volumen...[/cyan]")
             top_assets = fetch_top_volume_assets("bybit", 20)
-            selected = questionary.checkbox(
-                "Selecciona símbolos (espacio marcar, Enter confirmar):",
-                choices=[questionary.Choice(s, value=s) for s in top_assets]
-            ).unsafe_ask()
+            try:
+                selected = questionary.checkbox(
+                    "Selecciona símbolos (espacio marcar, Enter confirmar):",
+                    choices=[questionary.Choice(s, value=s) for s in top_assets]
+                ).unsafe_ask()
+            except (AttributeError, TypeError):
+                return None
             if not selected:
                 console.print("[red]Debes seleccionar al menos un símbolo[/red]")
                 return None
@@ -490,16 +496,26 @@ def fetch_top_volume_assets(exchange_id: str = "bybit", n: int = 20) -> list:
         return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
     pairs = []
     for sym, t in tickers.items():
-        if not sym.endswith("/USDT"):
+        # Bybit returns "BTC/USDT:USDT" — normalize to "BTC/USDT"
+        clean = sym.split(":")[0] if ":" in sym else sym
+        if not clean.endswith("/USDT"):
             continue
-        base = sym.split("/")[0]
+        base = clean.split("/")[0]
         if base in STABLES:
             continue
         qv = float(t.get("quoteVolume") or 0)
         if qv > 0:
-            pairs.append((sym, qv))
+            pairs.append((clean, qv))
     pairs.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in pairs[:n]] if pairs else [
+    seen = set()
+    result = []
+    for s, _ in pairs:
+        if s not in seen:
+            seen.add(s)
+            result.append(s)
+        if len(result) >= n:
+            break
+    return result if result else [
         "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
 
 
