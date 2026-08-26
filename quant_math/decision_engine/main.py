@@ -199,7 +199,9 @@ class DecisionEngine:
         self.hypotheses[hid] = record
         if self.storage is not None:
             self.storage.save(record)
-            return
+        # dual-write SIEMPRE: el espejo JSONL es la fuente de arranque del
+        # engine; si solo escribiera PG, un reinicio perderia los updates
+        # (bug post-graduacion: gate activo con universo cargado vacio)
         with open(self.kb_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False,
                                 default=str) + "\n")
