@@ -1075,7 +1075,7 @@ def render_burst_monitor(runtime: RuntimeState):
     closed_keys = set()
     total_closed = wins = losses = 0
     total_pnl = 0.0
-    mtm_pnl = 0.0
+    open_entries = []
     for t in trades:
         key = t.get("key")
         if "motivo_cierre" in t:
@@ -1089,8 +1089,17 @@ def render_burst_monitor(runtime: RuntimeState):
             elif pnl < 0:
                 losses += 1
         elif key and key not in closed_keys:
-            mtm_pnl += float(t.get("pnl", 0.0))
+            open_entries.append(t)
     win_rate = (wins / total_closed * 100) if total_closed else 0.0
+
+    # MtM: fetch current prices for open entries
+    unrealized = 0.0
+    for t in open_entries:
+        cur = _get_current_price(t["symbol"], cfg.get("exchange_id", "bybit"))
+        ref = cur if cur is not None else t["entry_price"]
+        direction = 1 if t["side"] == "buy" else -1
+        qty = float(t.get("quantity", 0))
+        unrealized += qty * (ref - float(t["entry_price"])) * direction
 
     # Burst-specific stats
     b = stats.get("burst_stats", {})
@@ -1130,8 +1139,8 @@ def render_burst_monitor(runtime: RuntimeState):
     body.add_row("PnL total (cerradas)",
                  Text(f"${total_pnl:+,.2f}", style=pnl_style))
     body.add_row("PnL MtM (abiertas)",
-                 Text(f"${mtm_pnl:+,.2f}",
-                      style="green" if mtm_pnl >= 0 else "red"))
+                 Text(f"${unrealized:+,.2f}",
+                      style="green" if unrealized >= 0 else "red"))
     body.add_row("Operaciones cerradas", str(total_closed))
     body.add_row("Win/Loss (global)",
                  f"[green]{wins}[/green] / [red]{losses}[/red]")
