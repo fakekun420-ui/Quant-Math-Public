@@ -319,16 +319,23 @@ def wizard() -> Optional[Dict]:
             console.print("[cyan]Obteniendo Top-20 por volumen...[/cyan]")
             top_assets = fetch_top_volume_assets("bybit", 20)
             try:
-                selected = questionary.checkbox(
+                _cb_result = questionary.checkbox(
                     "Selecciona símbolos (espacio marcar, Enter confirmar):",
                     choices=[questionary.Choice(s, value=s) for s in top_assets]
                 ).unsafe_ask()
             except (AttributeError, TypeError):
                 return None
+            # questionary may return list or tuple depending on version
+            if isinstance(_cb_result, tuple):
+                selected = list(_cb_result[0]) if _cb_result and _cb_result[0] else []
+            elif isinstance(_cb_result, list):
+                selected = _cb_result
+            else:
+                selected = list(_cb_result) if _cb_result else []
             if not selected:
                 console.print("[red]Debes seleccionar al menos un símbolo[/red]")
                 return None
-            symbols = list(selected)
+            symbols = selected
         else:
             symbols_raw = questionary.text(
                 "Símbolos (separados por coma):",
@@ -398,16 +405,23 @@ def burst_wizard() -> Optional[Dict]:
             console.print("[cyan]Obteniendo Top-20 por volumen...[/cyan]")
             top_assets = fetch_top_volume_assets("bybit", 20)
             try:
-                selected = questionary.checkbox(
+                _cb_result = questionary.checkbox(
                     "Selecciona símbolos (espacio marcar, Enter confirmar):",
                     choices=[questionary.Choice(s, value=s) for s in top_assets]
                 ).unsafe_ask()
             except (AttributeError, TypeError):
                 return None
+            # questionary may return list or tuple depending on version
+            if isinstance(_cb_result, tuple):
+                selected = list(_cb_result[0]) if _cb_result and _cb_result[0] else []
+            elif isinstance(_cb_result, list):
+                selected = _cb_result
+            else:
+                selected = list(_cb_result) if _cb_result else []
             if not selected:
                 console.print("[red]Debes seleccionar al menos un símbolo[/red]")
                 return None
-            symbols = list(selected)
+            symbols = selected
         else:
             raw = questionary.text(
                 "Símbolos (separados por coma):",
