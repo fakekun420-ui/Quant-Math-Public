@@ -163,6 +163,7 @@ class RuntimeState:
     def __init__(self):
         self.processes: Dict[str, mp.Process] = {}
         self.configs: Dict[str, Dict] = {}
+        self._minimized = False  # True after minimize — exit won't kill processes
 
     @staticmethod
     def _pg_alive(timeout=1.5) -> bool:
@@ -1410,10 +1411,12 @@ def burst_monitor_loop(runtime: RuntimeState, mode: str = "burst"):
 # ---------------------------------------------------------------------------
 
 def shutdown(runtime: RuntimeState):
-    if runtime.running:
+    if runtime.running and not runtime._minimized:
         console.print("[yellow]Deteniendo orchestrators...[/yellow]")
         runtime.stop_all()
         console.print("[green]Orchestrators detenidos.[/green]")
+    elif runtime._minimized and runtime.running:
+        console.print("[dim]Procesos siguen en background (minimizados).[/dim]")
 
     stop_vm_env = os.environ.get("QUANTMATH_VM_STOP_ON_EXIT")
     if runtime._pg_alive():
@@ -1628,6 +1631,7 @@ def _dispatch(runtime: RuntimeState, action: str):
         if not running:
             console.print("[yellow]No hay procesos corriendo para minimizar.[/yellow]")
             return
+        runtime._minimized = True
         console.print()
         console.print("[bold cyan]Minimizando — procesos en background:[/bold cyan]")
         for mode in running:
