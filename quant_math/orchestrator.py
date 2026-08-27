@@ -192,6 +192,11 @@ class Orchestrator:
         # V2 B3: burst state tracker (only for burst mode)
         self.burst_tracker = (BurstStateTracker(config.state_dir)
                               if config.mode == "burst" else None)
+        # Reset cooldown from previous sessions — cycle_count starts at 0
+        # so last_entry_cycle from a prior session creates negative elapsed
+        if self.burst_tracker and self.burst_tracker.state.last_entry_cycle > 0:
+            self.burst_tracker.state.last_entry_cycle = 0
+            self.burst_tracker._save()
         # Runtime stats consumed by external monitors (CLI)
         self.stats = {
             "state": "RUNNING",
