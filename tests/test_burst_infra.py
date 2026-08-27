@@ -31,17 +31,17 @@ def test_mode_burst_forces_interval():
 def test_mode_burst_clamps_margin():
     cfg = OrchestratorConfig(
         symbols=["BTC/USDT"], timeframe="5m", lookback_days=14,
-        initial_capital=1000, entry_pct=0.1, take_profit_pct=0.006,
+        initial_capital=50, entry_pct=0.1, take_profit_pct=0.20,
         min_paper_trades=3, hypotheses_per_cycle=5,
         kb_path="/tmp/kb.jsonl", state_dir="/tmp/state",
-        mode="burst", burst_margin=1.0)
-    assert cfg.burst_margin == 5.0
+        mode="burst", burst_margin=0.5)
+    assert cfg.burst_margin == 1.0
 
 
 def test_mode_burst_clamps_leverage():
     cfg = OrchestratorConfig(
         symbols=["BTC/USDT"], timeframe="5m", lookback_days=14,
-        initial_capital=1000, entry_pct=0.1, take_profit_pct=0.006,
+        initial_capital=50, entry_pct=0.1, take_profit_pct=0.20,
         min_paper_trades=3, hypotheses_per_cycle=5,
         kb_path="/tmp/kb.jsonl", state_dir="/tmp/state",
         mode="burst", burst_leverage=50)
@@ -51,11 +51,11 @@ def test_mode_burst_clamps_leverage():
 def test_mode_burst_clamps_tp():
     cfg = OrchestratorConfig(
         symbols=["BTC/USDT"], timeframe="5m", lookback_days=14,
-        initial_capital=1000, entry_pct=0.1, take_profit_pct=0.05,
+        initial_capital=50, entry_pct=0.1, take_profit_pct=0.80,
         min_paper_trades=3, hypotheses_per_cycle=5,
         kb_path="/tmp/kb.jsonl", state_dir="/tmp/state",
         mode="burst")
-    assert cfg.take_profit_pct == 0.008
+    assert cfg.take_profit_pct == 0.50
 
 
 def test_mode_invalid_raises():

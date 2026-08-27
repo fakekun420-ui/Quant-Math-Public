@@ -83,9 +83,9 @@ class OrchestratorConfig:
         # Burst-mode constraints
         if self.mode == "burst":
             self.interval_seconds = min(self.interval_seconds, 15)
-            self.burst_margin = max(5.0, self.burst_margin)
+            self.burst_margin = max(1.0, self.burst_margin)
             self.burst_leverage = max(1, min(20, self.burst_leverage))
-            self.take_profit_pct = max(0.004, min(0.008, self.take_profit_pct))
+            self.take_profit_pct = max(0.02, min(0.50, self.take_profit_pct))
 
 
 # ---------------------------------------------------------------------------

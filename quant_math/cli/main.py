@@ -498,10 +498,10 @@ def wizard() -> Optional[Dict]:
                 console.print("[red]Se requiere al menos un símbolo[/red]")
                 return None
 
-        initial_capital = ask_float("Capital inicial (USD)", "10000", lo=0)
+        initial_capital = ask_float("Capital inicial (USD)", "50", lo=0)
         if initial_capital is None:
             return None
-        entry_pct = ask_float("% de capital por entrada (0-1]", "0.05", hi=1)
+        entry_pct = ask_float("% de capital por entrada (0-1]", "0.02", hi=1)
         if entry_pct is None:
             return None
         timeframe = questionary.select(
@@ -509,7 +509,7 @@ def wizard() -> Optional[Dict]:
             default="1h").unsafe_ask()
         if timeframe is None:
             return None
-        take_profit_pct = ask_float("Take-profit % (ej. 0.02 = 2%)", "0.02")
+        take_profit_pct = ask_float("Take-profit % (ej. 0.25 = 25%)", "0.25")
         if take_profit_pct is None:
             return None
         lookback_days = ask_int("Lookback days (backtest)", "30", lo=1)
@@ -595,10 +595,10 @@ def burst_wizard() -> Optional[Dict]:
                 console.print("[red]Se requiere al menos un símbolo[/red]")
                 return None
 
-        margin = ask_float("Margen por entrada (USD, min 5)", "10", lo=5)
+        margin = ask_float("Margen por entrada (USD, min 1)", "1", lo=1)
         if margin is None:
             return None
-        leverage = ask_int("Leverage (1-20)", "10", lo=1)
+        leverage = ask_int("Leverage (1-20)", "5", lo=1)
         if leverage is None:
             return None
         leverage = max(1, min(20, leverage))
@@ -609,10 +609,9 @@ def burst_wizard() -> Optional[Dict]:
         if timeframe is None:
             return None
 
-        tp_pct = ask_float("Take-profit % (0.4-0.8 recommended)", "0.006")
+        tp_pct = ask_float("Take-profit % (ej. 0.20 = 20%)", "0.20")
         if tp_pct is None:
             return None
-        tp_pct = max(0.004, min(0.008, tp_pct))
 
         lookback_days = ask_int("Lookback days (backtest)", "14", lo=1)
         if lookback_days is None:
@@ -628,7 +627,7 @@ def burst_wizard() -> Optional[Dict]:
             "symbols": symbols,
             "timeframe": timeframe,
             "lookback_days": lookback_days,
-            "initial_capital": 1000.0,
+            "initial_capital": 50.0,
             "entry_pct": 0.1,               # ignored in burst mode (margin-based)
             "take_profit_pct": tp_pct,
             "min_paper_trades": 3,

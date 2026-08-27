@@ -60,12 +60,12 @@ def test_burst_tp_range():
     from quant_math.orchestrator import OrchestratorConfig
     cfg = OrchestratorConfig(
         symbols=["BTC/USDT"], timeframe="5m", lookback_days=14,
-        initial_capital=1000, entry_pct=0.1, take_profit_pct=0.006,
+        initial_capital=50, entry_pct=0.1, take_profit_pct=0.20,
         min_paper_trades=3, hypotheses_per_cycle=5,
         kb_path="/tmp/kb.jsonl", state_dir="/tmp/state",
-        mode="burst", burst_margin=10, burst_leverage=10)
-    # TP should be clamped to [0.004, 0.008]
-    assert 0.004 <= cfg.take_profit_pct <= 0.008
+        mode="burst", burst_margin=1, burst_leverage=5)
+    # TP should be clamped to [0.02, 0.50]
+    assert 0.02 <= cfg.take_profit_pct <= 0.50
     # SL = TP/2
     sl = cfg.take_profit_pct / 2
     assert sl > 0
