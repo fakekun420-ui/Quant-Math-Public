@@ -651,22 +651,37 @@ def burst_wizard() -> Optional[Dict]:
 # ---------------------------------------------------------------------------
 
 _price_cache: Dict[str, tuple] = {}
+_exchange_instances: Dict[str, object] = {}
+
+
+def _get_exchange(exchange_id: str):
+    """Get or create a shared CCXT exchange instance."""
+    if exchange_id not in _exchange_instances:
+        import ccxt
+        _exchange_instances[exchange_id] = getattr(ccxt, exchange_id)({
+            "enableRateLimit": True,
+            "timeout": 5000,
+        })
+    return _exchange_instances[exchange_id]
 
 
 def _get_current_price(symbol: str, exchange_id: str) -> Optional[float]:
-    """Throttled real price lookup (20s cache per symbol)."""
+    """Real price lookup with 5s cache per symbol."""
     cached = _price_cache.get(symbol)
     now = time.time()
-    if cached and now - cached[1] < 20:
+    if cached and now - cached[1] < 5:
         return cached[0]
     try:
-        import ccxt
-        ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+        ex = _get_exchange(exchange_id)
         ticker = ex.fetch_ticker(symbol)
         price = ticker.get("last") or ticker.get("close")
-        _price_cache[symbol] = (price, now)
-        return price
-    except Exception:
+        if price:
+            _price_cache[symbol] = (float(price), now)
+            return float(price)
+        return cached[0] if cached else None
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug(f"Price fetch failed for {symbol}: {e}")
         return cached[0] if cached else None
 
 
