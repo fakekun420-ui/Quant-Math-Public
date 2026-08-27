@@ -1,6 +1,6 @@
-# QUANT-MATH Implementation Status — v1.2.0
+# QUANT-MATH Implementation Status — v1.3.0
 
-Estado real verificado con la suite completa (95 tests, 0 warnings).
+Estado real verificado con la suite completa (104 tests, 0 warnings).
 
 ## ✅ Núcleo en producción
 
@@ -89,6 +89,22 @@ Estos dos puntos quedan como follow-up documentado, no descartados.
 | **B9** Selector interactivo monitor | Al seleccionar "Monitor" en modo clásico, pregunta Quant-Math o Burst; en modo burst entra directo | manual CLI |
 
 **Suite completa: 95 passed, 0 warnings.**
+
+## ✅ Implementados en v1.3.0 — Multi-Proceso, Paralelismo, Optimización
+
+| Feature | Implementación | Verificación |
+|---|---|---|
+| **Fix Monitor MtM** | Two-pass scan: primero closure keys, luego entries sin closure. Arregla conteo de 7→2 posiciones abiertas y MtM de -$5.25→+$0.24 | 2 tests (entries cerradas no cuentan, mixed open/closed) |
+| **Multi-Proceso simultáneo** | `RuntimeState.processes: Dict[str, Process]` soporta classic+burst al mismo tiempo; `running_mode()`, `stop_mode()`, `stop_all()`; menu 10 items con start/stop per-mode | 5 tests (running_mode, any_running, stats_for, config_dict legacy, clear_pid) |
+| **Minimizar + Background** | PID files en `runtime/state_{mode}/orchestrator.pid`; detección de huérfanos al re-entrar al CLI; `termux-wake-lock` durante ejecución, `termux-wake-unlock` durante sleep | manual (Termux) |
+| **Paralelismo generación** | `ThreadPoolExecutor` para generar+backtestear símbolos en paralelo (max 3 workers); `threading.Lock` protege `runner.all_hypotheses` compartido | manual (performance) |
+| **Paralelismo exits+publish** | `check_exits_all()` corre en paralelo con `_publish_to_kb()` via ThreadPool (datos independientes) | manual (performance) |
+| **Sleep adaptativo** | Burst mode duerme 60s cuando idle (sin pos abiertas ni cooldown) vs 15s activo | test (config) |
+| **Memory pruning** | `performance_history` cap 500 registros; `all_hypotheses` cap 200 activas (retired/failed removidas) | 2 tests (prune_history, prune_hypotheses) |
+| **Buffered logs** | `_CappedStream` usa `buffering=8192` en vez de `1` (~90% menos syscalls) | code review |
+| **os.nice(10)** | Prioridad baja en child process para no competir con apps foreground en Android | code review |
+
+**Suite completa: 104 passed, 0 warnings.**
 ## ❌ Descartados (no implementar)
 
 - VectorBT / Backtrader / pykalman — backtester propio ya corregido.

@@ -1,13 +1,12 @@
-# QUANT-MATH v1.2.0 — Autonomous Quantitative Research System
+# QUANT-MATH v1.3.0 — Autonomous Quantitative Research System
 
 Self-improving quantitative trading research system: an AQDE engine generates
 market-driven hypotheses, a mathematical gate validates them against **real
 Bybit data**, and an unsupervised learning loop (SIS) learns from every closed
 operation to continuously improve what gets generated next.
 
-> **v1.2.0** — Burst Scalping mode (margin×leverage, $0.20–$0.60 net target),
-> separate burst/classic records, interactive Top-20 asset selector,
-> dedicated burst monitor + history, hardened graduation (IC90 + diversity).
+> **v1.3.0** — Simultaneous classic+burst, parallel generation, resource
+> optimization for Android/Termux, minimize with background persistence.
 
 ## How It Works
 
@@ -17,10 +16,10 @@ Bybit (real OHLCV)
    ▼
 AQDE Runner ── templates + ARIMA/GARCH candidates + adaptive mutations
    │            (feedback from previous backtests; rotation per cycle;
-   │             dedupe vs KB with refresh window)
+   │             dedupe vs KB with refresh window; parallel per-symbol)
    ▼
 Orchestrator ── publish to Knowledge Base (PostgreSQL ⇄ JSONL fallback)
-   │
+   │             check_exits runs in parallel with publish (ThreadPool)
    ▼
 Decision Engine ── ranked candidates (expectancy DESC, score DESC);
    │                 falls back to next-best candidate when the top one
@@ -53,10 +52,10 @@ loss-collection experiments, paper-only).
 ## Quick Start
 
 ```bash
-# Interactive CLI (menu → wizard → orchestrator in background process)
+# Interactive CLI (menu → wizard → orchestrator in background)
 python -m quant_math.cli.main
 
-# Run the full test suite (95 tests across all modules)
+# Run the full test suite (104 tests across all modules)
 python -m pytest tests/ -q
 
 # Refresh the code-graph index after refactors
@@ -67,17 +66,51 @@ graphify update .
 
 | Menu option | What it does |
 |---|---|
-| Iniciar Quant-Math | Config wizard with Top-20 asset selector → orchestrator in background |
-| Detener investigación | Graceful stop (positions are preserved) |
-| Monitor | Live dashboard (classic or burst): cycles, hypotheses, open/closed ops, wins/losses, MtM + realized PnL split |
-| Ver log | Paginated log viewer (quant_math.log or quant_math_burst.log) |
+| Iniciar Quant-Math | Config wizard → classic orchestrator in background |
+| Iniciar Burst Scalping | Burst wizard: Top-20 selector, margin/leverage → burst orchestrator |
+| Detener Quant-Math | Stop classic mode only |
+| Detener Burst | Stop burst mode only |
+| Detener ambos | Stop both classic and burst |
+| Monitor | Live dashboard: cycles, hypotheses, open/closed ops, wins/losses, MtM + realized PnL split |
+| Ver log | Paginated log viewer (classic or burst, auto-selects if only one running) |
 | Historial de operaciones | Permanent trade book with entry/exit prices, PnL USD/%, motivo + summary |
-| Iniciar Burst Scalping | Burst wizard: Top-20 selector, margin/leverage config → burst orchestrator |
-| Historial Burst | Burst-only trade book with margin/leverage columns (enabled when burst active) |
-| Ver log Burst | Burst-only log viewer (enabled when burst active) |
+| Minimizar (seguir en background) | Shows running PIDs, keeps processes alive after CLI closes |
+| Salir | Graceful shutdown of all processes |
 
-`ESC` navigates back everywhere without stopping background work;
-`Ctrl+C` performs full clean shutdown.
+- `ESC` navigates back everywhere without stopping background work
+- `Ctrl+C` performs full clean shutdown
+- Re-entering the CLI detects orphan processes and offers to stop them
+
+## Simultaneous Mode
+
+Both classic and burst modes can run simultaneously from a single CLI session.
+Each mode has its own:
+- Process and PID file (`runtime/state_{mode}/orchestrator.pid`)
+- State directory (`runtime/state/` vs `runtime/state_burst/`)
+- Log file (`quant_math.log` vs `quant_math_burst.log`)
+- Knowledge base entries (isolated by mode)
+
+When both are running, monitor/log/history ask which mode to display.
+
+## Background Persistence
+
+The orchestrator processes are spawned with `daemon=False` and write PID
+files to `runtime/state_{mode}/orchestrator.pid`. This means:
+- Closing the CLI does **not** kill background processes
+- Re-entering the CLI detects live processes via PID files
+- On Android/Termux, `termux-wake-lock` is acquired during cycle execution
+  and released during sleep to prevent OS from killing the process
+
+## Resource Optimization
+
+| Optimization | Effect |
+|---|---|
+| `os.nice(10)` | Lower process priority — doesn't compete with foreground apps |
+| Adaptive sleep | Burst mode sleeps 60s when idle (no entries possible) vs 15s active |
+| Memory pruning | `performance_history` capped at 500, `all_hypotheses` capped at 200 active |
+| Buffered log I/O | 8KB buffers reduce syscalls by ~90% |
+| Parallel generation | ThreadPoolExecutor generates + backtests symbols in parallel (up to 3 workers) |
+| Parallel exits+publish | `check_exits_all()` runs concurrently with `_publish_to_kb()` |
 
 ## Persistence
 
@@ -109,6 +142,8 @@ graphify update .
 | Slippage Model (O2) | Adverse-fill simulation | Every paper execution | Entries and exits filled at ±QUANTMATH_SLIPPAGE_PCT against the trader — realistic net PnL |
 | Vol-Target Sizing (O6) | Inverse-volatility scaler | Realized per-cycle returns | Post-graduation notional scales x0.5–x2 toward a 2% vol target instead of fixed sizing |
 | Burst Scalping (V2) | Margin×leverage sizing | EMA trend + momentum spike + pullback entry | $10 margin × 10× leverage = $100 notional; TP 0.4–0.8% = $0.20–$0.60 net; cooldown 10 cycles, max $50 exposure |
+| Parallel Generation (V3) | ThreadPool per-symbol | Cross-symbol parallelism | Up to 3 symbols generate + backtest simultaneously; check_exits overlaps with KB publish |
+| Resource Optimization (V3) | Adaptive sleep + pruning | Idle detection, memory caps | Burst sleeps 60s when idle; performance_history capped at 500; os.nice(10) for battery savings |
 
 All generation-side learning is **advisory**: it biases *what gets generated*,
 never whether a trade happens. PA changes *which ranked candidate is best*
@@ -176,7 +211,7 @@ visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
 
 ## Testing
 
-95 tests, zero warnings: integration workflow, decision-engine gate
+104 tests, zero warnings: integration workflow, decision-engine gate
 behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
 hardened auto-graduation IC90+families (O1/PB), adverse-slippage fills
 (O2), generative-novelty metric (O4), vol-targeted sizing (O6),
@@ -185,7 +220,8 @@ energy-burst & range-pressure families (O7), multi-symbol isolation
 feedback buckets, SL 2:1 exactness, position recovery, KB round-trip +
 fallback, prior activation thresholds, model-based generator contracts,
 burst infrastructure (cooldown, trend filter, exposure, sizing),
-burst history/log separation, burst monitor.
+burst history/log separation, burst monitor,
+two-pass MtM fix, multi-process RuntimeState, memory pruning.
 
 ## License
 
