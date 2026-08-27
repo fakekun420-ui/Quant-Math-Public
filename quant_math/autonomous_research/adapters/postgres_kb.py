@@ -1,14 +1,14 @@
 """
-PostgreSQL-backed Knowledge Base with automatic JSONL fallback.
+JSONL-backed Knowledge Base with atomic upsert and indexed search.
 
 Drop-in replacement for HypothesisKnowledgeBase (same public interface) plus
 record-level helpers used by DecisionEngine (register_hypothesis/load_records).
 
-Hard guarantees:
-- psycopg2 import is optional: missing driver == JSONL mode, never a crash.
-- Every operation wraps PostgreSQL access in try/except; any failure flips
-  the instance to JSONL fallback mode with an explicit log line.
-- No synthetic/demo records are ever injected on empty results.
+Features:
+- Atomic upsert: read-all → merge → write-all (no partial writes)
+- Search by status, symbol, strategy_type (in-memory index)
+- Thread-safe via threading.Lock
+- No external dependencies (no PostgreSQL, no psycopg2)
 """
 
 from __future__ import annotations
@@ -19,273 +19,190 @@ import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DSN = (
-    "host=127.0.0.1 port=15432 dbname=quantmath_kb "
-    "user=quantmath password=quantmath connect_timeout=2"
-)
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS {{table}} (
-    hypothesis_id     TEXT PRIMARY KEY,
-    name              TEXT,
-    description       TEXT,
-    strategy_type     TEXT,
-    symbol            TEXT,
-    status            TEXT,
-    expectancy        DOUBLE PRECISION,
-    scientific_score  DOUBLE PRECISION,
-    win_rate          DOUBLE PRECISION,
-    total_return      DOUBLE PRECISION,
-    total_return_pct  DOUBLE PRECISION,
-    n_trades          INTEGER,
-    sharpe_ratio      DOUBLE PRECISION,
-    max_drawdown      DOUBLE PRECISION,
-    parameters        JSONB,
-    data_source       TEXT,
-    orchestrator_cycle INTEGER,
-    created_at        DOUBLE PRECISION,
-    updated_at        DOUBLE PRECISION NOT NULL DEFAULT EXTRACT(EPOCH FROM now()),
-    raw               JSONB NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_{{table}}_status ON {{table}}(status);
-CREATE INDEX IF NOT EXISTS idx_{{table}}_symbol ON {{table}}(symbol);
-CREATE INDEX IF NOT EXISTS idx_{{table}}_type_symbol ON {{table}}(strategy_type, symbol);
-"""
+class JSONLKnowledgeBase:
+    """HypothesisKnowledgeBase-compatible KB backed by JSONL files.
 
-COLUMNS = (
-    "hypothesis_id", "name", "description", "strategy_type", "symbol",
-    "status", "expectancy", "scientific_score", "win_rate",
-    "total_return", "total_return_pct", "n_trades", "sharpe_ratio",
-    "max_drawdown", "parameters", "data_source", "orchestrator_cycle",
-    "created_at",
-)
-
-
-def resolve_dsn() -> str:
-    return os.environ.get("QUANTMATH_PG_DSN", DEFAULT_DSN)
-
-
-def _psycopg2():
-    """Import psycopg2 lazily; returns module or None (never raises)."""
-    try:
-        import psycopg2
-        import psycopg2.extras
-        return psycopg2
-    except Exception:
-        return None
-
-
-class PostgreSQLKnowledgeBase:
-    """HypothesisKnowledgeBase-compatible KB backed by PostgreSQL.
-
-    If PostgreSQL is unreachable at any point, every method transparently
-    executes against a JSONL mirror file instead and logs the fallback.
+    All operations are atomic: reads load the full file, writes rewrite
+    the entire file. Thread-safe via a global lock per file path.
     """
 
-    _fail_until: Dict[str, float] = {}
-    FAIL_TTL_SECONDS = 30.0
+    _locks: Dict[str, threading.Lock] = {}
+    _global_lock = threading.Lock()
 
-    def __init__(self, storage_path: str = "runtime/state",
-                 dsn: Optional[str] = None, jsonl_fallback: Optional[str] = None):
-        self.storage_path = storage_path
-        self.dsn = dsn or resolve_dsn()
-        if jsonl_fallback:
-            self.jsonl_path = jsonl_fallback
-        elif storage_path.endswith(".jsonl"):
-            self.jsonl_path = storage_path
-        else:
-            self.jsonl_path = os.path.join(storage_path, "hypotheses.jsonl")
-
-        import hashlib
-        self.table = "hyp_" + hashlib.md5(
-            os.path.abspath(self.jsonl_path).encode()).hexdigest()[:10]
-
-        self._pg2 = _psycopg2()
-        self._conn = None
-        self._pg_ok = False
-        self._lock = threading.Lock()
-        if self._pg2 is None:
-            logger.warning(
-                "[kb-storage] psycopg2 no disponible — usando JSONL (%s)",
-                self.jsonl_path)
-        else:
-            self._connect()
-
-    # ------------------------------------------------------------------
-    # Connection plumbing
-    # ------------------------------------------------------------------
-
-    def _connect(self) -> bool:
-        now = time.time()
-        until = PostgreSQLKnowledgeBase._fail_until.get(self.dsn, 0.0)
-        if now < until and self._conn is None:
-            self._pg_ok = False
-            return False
-        try:
-            if self._conn is not None:
-                try:
-                    with self._conn.cursor() as cur:
-                        cur.execute("SELECT 1")
-                    self._pg_ok = True
-                    PostgreSQLKnowledgeBase._fail_until.pop(self.dsn, None)
-                    return True
-                except Exception:
-                    try:
-                        self._conn.close()
-                    except Exception:
-                        pass
-                    self._conn = None
-            self._conn = self._pg2.connect(self.dsn)
-            self._conn.autocommit = True
-            self._ensure_schema()
-            self._maybe_seed_from_jsonl()
-            self._pg_ok = True
-            PostgreSQLKnowledgeBase._fail_until.pop(self.dsn, None)
-            return True
-        except Exception as exc:
-            self._pg_ok = False
-            PostgreSQLKnowledgeBase._fail_until[self.dsn] = \
-                time.time() + PostgreSQLKnowledgeBase.FAIL_TTL_SECONDS
-            logger.warning(
-                "[kb-storage] PostgreSQL no disponible (%s) — fallback a JSONL: %s",
-                exc.__class__.__name__, self.jsonl_path)
-            return False
-
-    def _ensure_schema(self):
-        with self._conn.cursor() as cur:
-            cur.execute(SCHEMA_SQL.replace("{{table}}", self.table))
-
-    def _maybe_seed_from_jsonl(self):
-        """Bootstrap: if the PG table is empty but the JSONL mirror has
-        records, import them so the KB survives server restarts. The seed
-        only fires on an empty table, keeping PG authoritative afterwards."""
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(f"SELECT count(*) FROM {self.table}")
-                if cur.fetchone()[0] > 0:
-                    return
-            records = self._jsonl_load_all()
-            if not records:
-                return
-            for rec in records.values():
-                self._pg_upsert(rec)
-            logger.info(
-                "[kb-storage] sembrados %d registros del JSONL (%s) a "
-                "PostgreSQL tabla=%s", len(records), self.jsonl_path,
-                self.table)
-        except Exception as exc:
-            logger.warning("[kb-storage] seeding omitido: %s", exc)
-
-    def is_available(self) -> bool:
-        with self._lock:
-            return self._connect()
+    def __init__(self, jsonl_path: str):
+        self.jsonl_path = jsonl_path
+        os.makedirs(os.path.dirname(jsonl_path) or ".", exist_ok=True)
+        # Per-file lock for concurrent access
+        with JSONLKnowledgeBase._global_lock:
+            if jsonl_path not in JSONLKnowledgeBase._locks:
+                JSONLKnowledgeBase._locks[jsonl_path] = threading.Lock()
+        self._lock = JSONLKnowledgeBase._locks[jsonl_path]
+        # In-memory index for fast searches
+        self._index: Dict[str, Dict[str, Any]] = {}
+        self._index_built = False
 
     @property
     def backend_name(self) -> str:
-        return "postgresql" if self._pg_ok else "jsonl"
+        return "jsonl"
 
-    def _try_pg(self) -> bool:
-        """Return True if a healthy PG connection is present."""
-        if self._pg2 is None:
-            return False
-        with self._lock:
-            if self._pg_ok:
-                return True
-            return self._connect()
-
-    def _downgrade(self, exc: Exception):
-        self._pg_ok = False
-        logger.warning(
-            "[kb-storage] fallo PostgreSQL en operación (%s: %s) — fallback a JSONL: %s",
-            exc.__class__.__name__, exc, self.jsonl_path)
+    def is_available(self) -> bool:
+        return True
 
     # ------------------------------------------------------------------
-    # Record-level API (DecisionEngine semantics: upsert, last-wins load)
+    # Atomic read/write
     # ------------------------------------------------------------------
 
-    def register_hypothesis(self, record: Dict[str, Any]) -> str:
-        hid = record.get("hypothesis_id") or f"hyp_{int(time.time() * 1000)}"
-        record = dict(record, hypothesis_id=hid)
-        if self._try_pg():
-            try:
-                self._pg_upsert(record)
-                return hid
-            except Exception as exc:
-                self._downgrade(exc)
-        self._jsonl_append(record)
-        return hid
-
-    def load_records(self) -> Dict[str, Dict[str, Any]]:
-        if self._try_pg():
-            try:
-                return self._pg_load_all()
-            except Exception as exc:
-                self._downgrade(exc)
-        return self._jsonl_load_all()
-
-    def _pg_upsert(self, record: Dict[str, Any]):
-        params = json.dumps(record.get("parameters", {}), ensure_ascii=False)
-        raw = json.dumps(record, ensure_ascii=False, default=str)
-        values = []
-        for col in COLUMNS:
-            v = record.get(col)
-            if col == "parameters":
-                v = params
-            values.append(v)
-        values.append(raw)
-        placeholders = ", ".join(["%s"] * (len(COLUMNS) + 1))
-        cols_sql = ", ".join(COLUMNS + ("raw",))
-        updates = ", ".join(
-            f"{c} = EXCLUDED.{c}" for c in COLUMNS[1:] + ("raw",))
-        sql = (f"INSERT INTO {self.table} ({cols_sql}) VALUES ({placeholders}) "
-               f"ON CONFLICT (hypothesis_id) DO UPDATE SET {updates}, "
-               "updated_at = EXTRACT(EPOCH FROM now())")
-        with self._conn.cursor() as cur:
-            cur.execute(sql, values)
-
-    def _pg_load_all(self) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        with self._conn.cursor() as cur:
-            cur.execute(f"SELECT raw FROM {self.table} ORDER BY created_at ASC NULLS FIRST")
-            for (raw,) in cur.fetchall():
-                rec = raw if isinstance(raw, dict) else json.loads(raw)
-                out[rec["hypothesis_id"]] = rec
-        return out
-
-    # ------------------------------------------------------------------
-    # JSONL mirror (identical semantics to DecisionEngine file format)
-    # ------------------------------------------------------------------
-
-    def _jsonl_append(self, record: Dict[str, Any]):
-        os.makedirs(os.path.dirname(self.jsonl_path) or ".", exist_ok=True)
-        with open(self.jsonl_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-
-    def _jsonl_load_all(self) -> Dict[str, Dict[str, Any]]:
+    def _load_all(self) -> Dict[str, Dict[str, Any]]:
+        """Load all records from JSONL, merging by hypothesis_id (last wins)."""
         records: Dict[str, Dict[str, Any]] = {}
         if not os.path.exists(self.jsonl_path):
             return records
-        with open(self.jsonl_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                hid = rec.get("hypothesis_id")
-                if not hid:
-                    continue
-                if hid in records:
-                    records[hid].update(rec)
-                else:
+        try:
+            with open(self.jsonl_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    hid = rec.get("hypothesis_id")
+                    if not hid:
+                        continue
                     records[hid] = rec
+        except OSError as exc:
+            logger.warning("[jsonl-kb] load failed: %s", exc)
         return records
+
+    def _save_all(self, records: Dict[str, Dict[str, Any]]):
+        """Atomically write all records to JSONL (atomic via tmp+rename)."""
+        tmp = self.jsonl_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for rec in records.values():
+                    fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+            os.replace(tmp, self.jsonl_path)
+        except OSError as exc:
+            logger.warning("[jsonl-kb] save failed: %s", exc)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _rebuild_index(self):
+        """Rebuild in-memory index from JSONL file."""
+        self._index = self._load_all()
+        self._index_built = True
+
+    # ------------------------------------------------------------------
+    # Record-level API (DecisionEngine semantics)
+    # ------------------------------------------------------------------
+
+    def register_hypothesis(self, record: Dict[str, Any]) -> str:
+        """Atomic upsert: load → merge → save."""
+        hid = record.get("hypothesis_id") or f"hyp_{int(time.time() * 1000)}"
+        record = dict(record, hypothesis_id=hid)
+        record["updated_at"] = time.time()
+        if "created_at" not in record:
+            record["created_at"] = time.time()
+        with self._lock:
+            records = self._load_all()
+            existing = records.get(hid)
+            if existing:
+                # Merge: existing fields preserved unless explicitly updated
+                merged = dict(existing)
+                for k, v in record.items():
+                    if v is not None:
+                        merged[k] = v
+                records[hid] = merged
+            else:
+                records[hid] = record
+            self._save_all(records)
+            self._index = records
+            self._index_built = True
+        return hid
+
+    def load_records(self) -> Dict[str, Dict[str, Any]]:
+        """Load all records (uses cache if available)."""
+        with self._lock:
+            if self._index_built:
+                return dict(self._index)
+            records = self._load_all()
+            self._index = records
+            self._index_built = True
+            return dict(records)
+
+    def update_hypothesis(self, hypothesis_id: str, updates: Dict[str, Any]) -> bool:
+        """Atomic update: load → merge → save."""
+        with self._lock:
+            records = self._load_all()
+            if hypothesis_id not in records:
+                return False
+            merged = dict(records[hypothesis_id])
+            merged.update(updates or {})
+            merged["hypothesis_id"] = hypothesis_id
+            merged["updated_at"] = time.time()
+            records[hypothesis_id] = merged
+            self._save_all(records)
+            self._index = records
+            self._index_built = True
+        return True
+
+    def delete_hypothesis(self, hypothesis_id: str) -> bool:
+        """Atomic delete: load → remove → save."""
+        with self._lock:
+            records = self._load_all()
+            if hypothesis_id not in records:
+                return False
+            del records[hypothesis_id]
+            self._save_all(records)
+            self._index = records
+            self._index_built = True
+        return True
+
+    # ------------------------------------------------------------------
+    # Search (in-memory index for speed)
+    # ------------------------------------------------------------------
+
+    def search_hypotheses(self, criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Search by exact field match (status, symbol, strategy_type, etc.)."""
+        crit = {k: v for k, v in (criteria or {}).items() if v is not None}
+        if not crit:
+            return list(self.load_records().values())
+        results = []
+        for rec in self.load_records().values():
+            if all(rec.get(k) == v for k, v in crit.items()):
+                results.append(rec)
+        return results
+
+    def search_by_status(self, status: str) -> List[Dict[str, Any]]:
+        """Fast search by status using index."""
+        return self.search_hypotheses({"status": status})
+
+    def search_by_symbol(self, symbol: str) -> List[Dict[str, Any]]:
+        """Fast search by symbol using index."""
+        return self.search_hypotheses({"symbol": symbol})
+
+    def search_by_status_and_symbol(self, status: str, symbol: str) -> List[Dict[str, Any]]:
+        """Fast search by status + symbol."""
+        return self.search_hypotheses({"status": status, "symbol": symbol})
+
+    def search_hypotheses_by_text(self, query: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Full-text search across all fields."""
+        q = (query or "").lower()
+        hits = [
+            r for r in self.load_records().values()
+            if q in json.dumps(r, ensure_ascii=False).lower()
+        ]
+        return hits[:limit]
+
+    def search_similar_hypotheses(self, description: str, threshold: float = 0.7) -> List[Dict[str, Any]]:
+        return self.search_hypotheses_by_text(description, limit=100)
 
     # ------------------------------------------------------------------
     # Public interface mirroring HypothesisKnowledgeBase
@@ -297,70 +214,6 @@ class PostgreSQLKnowledgeBase:
 
     def retrieve_hypothesis(self, hypothesis_id: str) -> Optional[Dict[str, Any]]:
         return self.load_records().get(hypothesis_id)
-
-    def search_hypotheses(self, criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
-        crit = dict(criteria)
-        if hasattr(crit, "__dict__") and not isinstance(crit, dict):
-            crit = vars(crit)
-        crit = {k: v for k, v in (crit or {}).items() if v is not None}
-        results = []
-        for rec in self.load_records().values():
-            if all(rec.get(k) == v for k, v in crit.items()):
-                results.append(rec)
-        return results
-
-    def search_hypotheses_by_text(self, query: str, limit: int = 100) -> List[Dict[str, Any]]:
-        q = (query or "").lower()
-        hits = [
-            r for r in self.load_records().values()
-            if q in json.dumps(r, ensure_ascii=False).lower()
-        ]
-        return hits[:limit]
-
-    def search_similar_hypotheses(self, description: str, threshold: float = 0.7) -> List[Dict[str, Any]]:
-        return self.search_hypotheses_by_text(description, limit=100)
-
-    def update_hypothesis(self, hypothesis_id: str, updates: Dict[str, Any]) -> bool:
-        records = self.load_records()
-        if hypothesis_id not in records:
-            return False
-        merged = dict(records[hypothesis_id])
-        merged.update(updates or {})
-        merged["hypothesis_id"] = hypothesis_id
-        if self._try_pg():
-            try:
-                self._pg_upsert(merged)
-                return True
-            except Exception as exc:
-                self._downgrade(exc)
-        self._jsonl_append(merged)
-        return True
-
-    def delete_hypothesis(self, hypothesis_id: str) -> bool:
-        existed = False
-        if self._try_pg():
-            try:
-                with self._conn.cursor() as cur:
-                    cur.execute(
-                        f"DELETE FROM {self.table} WHERE hypothesis_id = %s",
-                        (hypothesis_id,))
-                    existed = cur.rowcount > 0
-            except Exception as exc:
-                self._downgrade(exc)
-        records = self.load_records()
-        if hypothesis_id in records:
-            remaining = [r for k, r in records.items() if k != hypothesis_id]
-            self._rewrite_jsonl(remaining)
-            existed = True
-        return existed
-
-    def _rewrite_jsonl(self, records: List[Dict[str, Any]]):
-        os.makedirs(os.path.dirname(self.jsonl_path) or ".", exist_ok=True)
-        tmp = self.jsonl_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            for r in records:
-                fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
-        os.replace(tmp, self.jsonl_path)
 
     def get_statistics(self) -> Dict[str, Any]:
         records = list(self.load_records().values())
@@ -423,7 +276,12 @@ class PostgreSQLKnowledgeBase:
         if isinstance(hypothesis, dict):
             return dict(hypothesis)
         data = {}
-        for attr in COLUMNS:
+        columns = ("hypothesis_id", "name", "description", "strategy_type",
+                    "symbol", "status", "expectancy", "scientific_score",
+                    "win_rate", "total_return", "total_return_pct", "n_trades",
+                    "sharpe_ratio", "max_drawdown", "parameters", "data_source",
+                    "orchestrator_cycle", "created_at")
+        for attr in columns:
             val = getattr(hypothesis, attr, None)
             if val is not None:
                 data[attr] = getattr(val, "value", val)
@@ -435,60 +293,26 @@ class PostgreSQLKnowledgeBase:
 
 
 class KBPersistence:
-    """Storage facade used by DecisionEngine: PostgreSQL first, JSONL fallback."""
-
-    _availability_cache: Dict[str, bool] = {}
+    """Storage facade used by DecisionEngine: pure JSONL, no PostgreSQL."""
 
     def __init__(self, kb_path: str):
         self.kb_path = kb_path
-        if os.environ.get("QUANTMATH_PG_DISABLE") == "1":
-            self.kb = None
-            logger.info("[kb-storage] backend=jsonl (QUANTMATH_PG_DISABLE=1)")
-            return
-        self.kb = PostgreSQLKnowledgeBase(
-            storage_path=os.path.dirname(kb_path) or ".",
-            jsonl_fallback=kb_path)
-        logger.info("[kb-storage] backend=%s kb=%s",
-                    self.kb.backend_name, kb_path)
-        KBPersistence._availability_cache[self.kb.dsn] = \
-            self.kb.backend_name == "postgresql"
+        self.kb = JSONLKnowledgeBase(jsonl_path=kb_path)
+        logger.info("[kb-storage] backend=jsonl kb=%s", kb_path)
 
     @property
     def mode(self) -> str:
-        if self.kb is None:
-            return "jsonl"
-        return self.kb.backend_name
+        return "jsonl"
 
     def load_all(self) -> Dict[str, Dict[str, Any]]:
-        if self.kb is not None:
-            return self.kb.load_records()
-        records: Dict[str, Dict[str, Any]] = {}
-        if not os.path.exists(self.kb_path):
-            return records
-        with open(self.kb_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                hid = rec.get("hypothesis_id")
-                if not hid:
-                    continue
-                if hid in records:
-                    records[hid].update(rec)
-                else:
-                    records[hid] = rec
-        return records
+        return self.kb.load_records()
 
     def save(self, record: Dict[str, Any]) -> str:
-        if self.kb is not None:
-            return self.kb.register_hypothesis(record)
-        hid = record.get("hypothesis_id") or f"hyp_{int(time.time() * 1000)}"
-        os.makedirs(os.path.dirname(self.kb_path) or ".", exist_ok=True)
-        with open(self.kb_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(dict(record, hypothesis_id=hid),
-                                ensure_ascii=False, default=str) + "\n")
-        return hid
+        return self.kb.register_hypothesis(record)
+
+
+# ---------------------------------------------------------------------------
+# Legacy aliases for backward compatibility
+# ---------------------------------------------------------------------------
+
+PostgreSQLKnowledgeBase = JSONLKnowledgeBase

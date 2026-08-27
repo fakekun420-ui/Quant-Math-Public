@@ -103,9 +103,10 @@ def main():
     )
 
     def _handle_sigint(signum, frame):
-        raise KeyboardInterrupt
+        orch.request_stop()
 
     signal.signal(signal.SIGINT, _handle_sigint)
+    signal.signal(signal.SIGTERM, _handle_sigint)
 
     # Set learn mode
     os.environ.setdefault("QUANTMATH_LEARN_MODE", "1")
@@ -118,8 +119,6 @@ def main():
     _acquire_wakelock()
     try:
         orch.run_forever()
-    except KeyboardInterrupt:
-        pass
     finally:
         orch.mark_stopped()
         _release_wakelock()

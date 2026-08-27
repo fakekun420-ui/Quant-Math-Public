@@ -167,78 +167,16 @@ class RuntimeState:
 
     @staticmethod
     def _pg_alive(timeout=1.5) -> bool:
-        try:
-            with socket.create_connection(("127.0.0.1", 15432), timeout=timeout):
-                return True
-        except OSError:
-            return False
+        """PostgreSQL eliminado — siempre retorna False."""
+        return False
 
     def _ensure_pg_vm(self):
-        """Arranca la microVM de PostgreSQL si no responde; si falla, sigue
-        con fallback a JSONL dejando el motivo claro en consola."""
-        if os.environ.get("QUANTMATH_PG_DISABLE") == "1":
-            console.print("[dim]PG deshabilitado (QUANTMATH_PG_DISABLE=1) — "
-                          "KB en modo JSONL[/dim]")
-            return
-        if self._pg_alive():
-            return
-        boot = os.environ.get(
-            "QUANTMATH_PG_BOOT", "/var/lib/quantmath-pgvm/boot_pg_vm.py")
-        if not os.path.exists(boot):
-            console.print("[yellow]PostgreSQL no disponible y no hay script "
-                          f"de arranque ({boot}) — fallback a JSONL[/yellow]")
-            return
-        console.print("[cyan]PostgreSQL VM no responde — iniciando microVM "
-                      "(puede tardar unos minutos)...[/cyan]")
-        try:
-            logf = open("/var/lib/quantmath-pgvm/autostart.log", "ab")
-            subprocess.Popen(
-                [sys.executable, "-u", boot, "normal"],
-                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-                start_new_session=True)
-        except Exception as exc:
-            console.print(f"[yellow]No se pudo lanzar la VM ({exc}) — "
-                          "fallback a JSONL[/yellow]")
-            return
-        timeout_s = int(os.environ.get("QUANTMATH_PG_BOOT_TIMEOUT", "480"))
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if self._pg_alive():
-                console.print("[green]PostgreSQL VM lista.[/green]")
-                return
-            time.sleep(5)
-        console.print(f"[yellow]VM no respondio en {timeout_s}s — "
-                      "fallback a JSONL[/yellow]")
+        """PostgreSQL VM eliminado — KB opera en modo JSONL puro."""
+        console.print("[dim]KB: modo JSONL (PostgreSQL eliminado)[/dim]")
 
     def _stop_pg_vm(self, timeout: float = 25.0) -> bool:
-        """Apaga la microVM de PostgreSQL: 'quit' por el FIFO de control del
-        driver; si el FIFO no tiene lector (driver muerto), fallback a pkill
-        acotado a NUESTROS procesos. Devuelve True solo si el puerto quedo
-        caido."""
-        fifo = "/var/lib/quantmath-pgvm/cmd.fifo"
-        sent = False
-        try:
-            fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-            try:
-                os.write(fd, b"quit\n")
-                sent = True
-            finally:
-                os.close(fd)
-        except OSError:
-            sent = False
-        if not sent:
-            subprocess.run(["pkill", "-9", "-f",
-                            "/var/lib/quantmath-pgvm/boot_pg_vm.py"],
-                           check=False)
-            subprocess.run(["pkill", "-9", "-f",
-                            "qemu-system-aarch64.*pgdata.qcow2"],
-                           check=False)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if not self._pg_alive(timeout=1.0):
-                return True
-            time.sleep(1.5)
-        return False
+        """PostgreSQL VM eliminado — no hay nada que detener."""
+        return True
 
     # --- Process management (multi-mode) ---
 

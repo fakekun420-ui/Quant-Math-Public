@@ -55,7 +55,7 @@ class OrchestratorConfig:
     interval_seconds: int = 3600            # period between continuous cycles
     exchange_id: str = "bybit"              # REAL data source, always
     dry_run: bool = True                    # True=paper trading ONLY (no live path yet)
-    use_postgres: bool = True               # KB storage: PG if reachable, JSONL fallback
+    use_postgres: bool = False               # KB storage: always JSONL (PG removed)
     mode: str = "classic"                   # "classic" or "burst"
 
     # Burst-mode specifics (only used when mode == "burst")
@@ -185,6 +185,7 @@ class Orchestrator:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
+        self._stop_requested = False
         self._build_runner()
         self.engine = self._build_engine()
         self.cycle_count = 0
@@ -796,19 +797,28 @@ class Orchestrator:
         """Continuous loop (Ctrl+C to stop)."""
         cycles = 0
         while max_cycles is None or cycles < max_cycles:
+            if self._stop_requested:
+                break
             try:
                 self.run_cycle()
             except Exception as exc:
                 logger.exception("Cycle failed: %s", exc)
             cycles += 1
             if max_cycles is None or cycles < max_cycles:
-                # Adaptive sleep: longer when idle to save battery
+                # Adaptive sleep: shorter intervals to allow signal processing
                 sleep_time = self.config.interval_seconds
                 if self.config.mode == "burst":
-                    # If no entries possible and no open positions, sleep longer
                     can_enter = (self.burst_tracker is None
                                  or self.burst_tracker.can_enter(self.cycle_count))
                     has_open = len(self.engine.open_positions) > 0
                     if not can_enter and not has_open:
-                        sleep_time = max(sleep_time, 60)  # idle: at least 60s
-                time.sleep(sleep_time)
+                        sleep_time = max(sleep_time, 60)
+                # Sleep in 1s increments to allow SIGINT processing
+                elapsed = 0
+                while elapsed < sleep_time and not self._stop_requested:
+                    time.sleep(min(1.0, sleep_time - elapsed))
+                    elapsed += 1
+
+    def request_stop(self):
+        """Request the orchestrator to stop after the current cycle."""
+        self._stop_requested = True
