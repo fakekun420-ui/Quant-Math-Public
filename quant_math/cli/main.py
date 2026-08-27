@@ -135,6 +135,28 @@ def _orchestrator_process_main(cfg_dict: Dict):
 # State helpers
 # ---------------------------------------------------------------------------
 
+
+class _DetachedProcess:
+    """Wrapper for a subprocess.Popen that provides mp.Process-like interface."""
+
+    def __init__(self, pid: int, mode: str):
+        self.pid = pid
+        self.mode = mode
+        self._proc: Optional[subprocess.Popen] = None
+
+    def is_alive(self) -> bool:
+        """Check if the process is still running via PID file + os.kill."""
+        try:
+            os.kill(self.pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    @property
+    def exitcode(self) -> Optional[int]:
+        return None  # detached processes — exitcode not tracked
+
+
 class RuntimeState:
     """Tracks background orchestrator processes (supports simultaneous classic+burst)."""
 
@@ -313,36 +335,49 @@ class RuntimeState:
             self.stop_mode(mode)
 
         self.configs[mode] = config_dict
-        ctx = mp.get_context("spawn")
-        proc = ctx.Process(
-            target=_orchestrator_process_main,
-            args=(config_dict,),
-            daemon=False,
-            name=f"quant-math-{mode}",
+
+        # Launch as fully detached subprocess (survives Termux close)
+        launcher = os.path.join(PROJECT_ROOT, "quant_math_bg.py")
+        config_json = json.dumps(config_dict)
+
+        proc = subprocess.Popen(
+            [sys.executable, "-u", launcher, config_json, mode],
+            start_new_session=True,    # new process group — survives parent exit
+            stdin=subprocess.DEVNULL,   # no terminal input
+            stdout=subprocess.DEVNULL,  # output goes to log file
+            stderr=subprocess.DEVNULL,
         )
-        proc.start()
-        self.processes[mode] = proc
+        # Store as a simple object with .pid and .is_alive()
+        self.processes[mode] = _DetachedProcess(proc.pid, mode)
         self._write_pid(mode)
 
     def stop_mode(self, mode: str, timeout: float = 15.0) -> bool:
         """Stop a specific mode's orchestrator."""
         proc = self.processes.get(mode)
         if proc is None:
-            return False
-        if not proc.is_alive() and proc.exitcode is not None:
             self._clear_pid(mode)
             return False
+        if not proc.is_alive():
+            self._clear_pid(mode)
+            return False
+        # Escalating stop: SIGINT → SIGTERM → SIGKILL
         try:
             os.kill(proc.pid, signal.SIGINT)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             pass
-        proc.join(timeout=2)
+        time.sleep(2)
         if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=2)
+            try:
+                os.kill(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            time.sleep(2)
         if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=3)
+            try:
+                os.kill(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            time.sleep(1)
         self._force_stats_stopped(mode)
         self._clear_pid(mode)
         return True
@@ -1413,8 +1448,10 @@ def _detect_active_modes(runtime: RuntimeState) -> Dict[str, int]:
     orphans = runtime.detect_orphans()
     for mode, pid in orphans.items():
         if not runtime.running_mode(mode):
-            console.print(f"[yellow]Proceso {mode} detectado (PID {pid}) "
-                          "pero no está registrado. Puede ser un huérfano.[/yellow]")
+            # Register orphan so it can be stopped from the menu
+            runtime.processes[mode] = _DetachedProcess(pid, mode)
+            console.print(f"[green]Proceso {mode} detectado (PID {pid}) — "
+                          "registrado para control desde el menú.[/green]")
     return orphans
 
 
