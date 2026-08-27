@@ -423,8 +423,8 @@ def ask_float(label: str, default: str, lo: float = None, hi: float = None):
             return None
         try:
             val = float(raw)
-            if lo is not None and val <= lo:
-                console.print(f"[red]Debe ser > {lo}[/red]")
+            if lo is not None and val < lo:
+                console.print(f"[red]Debe ser >= {lo}[/red]")
                 continue
             if hi is not None and not (0 < val <= hi):
                 console.print(f"[red]Debe estar en (0, {hi}][/red]")
