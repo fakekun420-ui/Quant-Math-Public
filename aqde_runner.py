@@ -103,6 +103,18 @@ class AQDERunner:
         # nunca persiste entre ciclos.
         self._mkt_cache: Dict[Any, Any] = {}
 
+    def _prune_memory(self):
+        """Prune unbounded data structures to prevent memory growth."""
+        # Keep only last 500 performance records
+        if len(self.performance_history) > 500:
+            self.performance_history = self.performance_history[-500:]
+        # Keep only active hypotheses (not retired/failed)
+        if len(self.all_hypotheses) > 200:
+            active = {k: v for k, v in self.all_hypotheses.items()
+                      if getattr(v, "status", None) not in ("retired", "failed")}
+            if len(active) > 100:
+                self.all_hypotheses = active
+
     def invalidate_market_cache(self):
         """Fuerza re-descarga en el siguiente acceso (inicio de ciclo nuevo)."""
         self._mkt_cache.clear()

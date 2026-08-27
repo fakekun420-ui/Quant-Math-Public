@@ -49,6 +49,27 @@ console = Console()
 
 def _orchestrator_process_main(cfg_dict: Dict):
     """Child process: run the orchestrator loop with all output to quant_math.log."""
+    # Lower process priority for battery savings on Android
+    try:
+        os.nice(10)
+    except (OSError, AttributeError):
+        pass
+
+    # Termux wakelock: acquire to keep CPU alive during cycles
+    _is_termux = os.path.exists("/data/data/com.termux")
+    def _acquire_wakelock():
+        if _is_termux:
+            try:
+                subprocess.run(["termux-wake-lock"], timeout=2, capture_output=True)
+            except Exception:
+                pass
+    def _release_wakelock():
+        if _is_termux:
+            try:
+                subprocess.run(["termux-wake-unlock"], timeout=2, capture_output=True)
+            except Exception:
+                pass
+
     log_path = cfg_dict.get("log_path", LOG_PATH)
     # Route ALL stdout/stderr to the log file before importing heavy modules
     class _CappedStream:
@@ -57,7 +78,7 @@ def _orchestrator_process_main(cfg_dict: Dict):
         def __init__(self, path, max_mb=150):
             self.path = path
             self.max_bytes = int(max_mb * 1024 * 1024)
-            self.fh = open(path, "a", buffering=1)
+            self.fh = open(path, "a", buffering=8192)
 
         def write(self, data):
             try:
@@ -67,7 +88,7 @@ def _orchestrator_process_main(cfg_dict: Dict):
                     if os.path.exists(bak):
                         os.remove(bak)
                     os.replace(self.path, bak)
-                    self.fh = open(self.path, "a", buffering=1)
+                    self.fh = open(self.path, "a", buffering=8192)
             except OSError:
                 pass
             return self.fh.write(data)
@@ -99,12 +120,14 @@ def _orchestrator_process_main(cfg_dict: Dict):
     log_path = cfg_dict.pop("log_path", LOG_PATH)
     config = OrchestratorConfig(**cfg_dict)
     orch = Orchestrator(config)
+    _acquire_wakelock()
     try:
         orch.run_forever()
     except KeyboardInterrupt:
         pass
     finally:
         orch.mark_stopped()
+        _release_wakelock()
         cap.fh.close()
 
 
@@ -113,11 +136,11 @@ def _orchestrator_process_main(cfg_dict: Dict):
 # ---------------------------------------------------------------------------
 
 class RuntimeState:
-    """Tracks the background orchestrator process."""
+    """Tracks background orchestrator processes (supports simultaneous classic+burst)."""
 
     def __init__(self):
-        self.process: Optional[mp.Process] = None
-        self.config_dict: Optional[Dict] = None
+        self.processes: Dict[str, mp.Process] = {}
+        self.configs: Dict[str, Dict] = {}
 
     @staticmethod
     def _pg_alive(timeout=1.5) -> bool:
@@ -193,66 +216,154 @@ class RuntimeState:
                 return True
             time.sleep(1.5)
         return False
-    @property
-    def running(self) -> bool:
-        return self.process is not None and self.process.is_alive()
+
+    # --- Process management (multi-mode) ---
+
+    def running_mode(self, mode: str) -> bool:
+        """Check if a specific mode's orchestrator is alive."""
+        p = self.processes.get(mode)
+        return p is not None and p.is_alive()
 
     @property
-    def stats(self) -> Dict:
-        if not self.config_dict:
-            return {}
-        stats_path = os.path.join(self.config_dict["state_dir"], "runtime_stats.json")
+    def running(self) -> bool:
+        return any(p.is_alive() for p in self.processes.values())
+
+    def any_running(self) -> List[str]:
+        """Return list of modes with live processes."""
+        return [m for m, p in self.processes.items() if p.is_alive()]
+
+    def _pid_file(self, mode: str) -> str:
+        state_dir = (self.configs.get(mode) or {}).get(
+            "state_dir", os.path.join(PROJECT_ROOT, "runtime", f"state_{mode}" if mode == "burst" else "state"))
+        return os.path.join(state_dir, "orchestrator.pid")
+
+    def _write_pid(self, mode: str):
+        pid = self.processes[mode].pid
+        pid_file = self._pid_file(mode)
+        os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+        with open(pid_file, "w") as f:
+            f.write(str(pid))
+
+    def _clear_pid(self, mode: str):
+        pid_file = self._pid_file(mode)
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
+
+    def detect_orphans(self) -> Dict[str, int]:
+        """Detect orphan orchestrator processes from PID files."""
+        active = {}
+        for mode in ("classic", "burst"):
+            pid_file = self._pid_file(mode)
+            if os.path.exists(pid_file):
+                try:
+                    pid = int(open(pid_file).read().strip())
+                    os.kill(pid, 0)  # check alive
+                    active[mode] = pid
+                except (OSError, ValueError):
+                    try:
+                        os.remove(pid_file)
+                    except OSError:
+                        pass
+        return active
+
+    def stats_for(self, mode: str) -> Dict:
+        cfg = self.configs.get(mode) or {}
+        state_dir = cfg.get("state_dir",
+                            os.path.join(PROJECT_ROOT, "runtime", f"state_{mode}" if mode == "burst" else "state"))
+        stats_path = os.path.join(state_dir, "runtime_stats.json")
         if not os.path.exists(stats_path):
-            return {"state": "RUNNING" if self.running else "STOPPED"}
+            return {"state": "RUNNING" if self.running_mode(mode) else "STOPPED"}
         try:
             with open(stats_path) as fh:
                 return json.load(fh)
         except (OSError, json.JSONDecodeError):
             return {}
 
-    def start(self, config_dict: Dict):
+    @property
+    def stats(self) -> Dict:
+        """Legacy stats for single-mode. Returns stats of first running mode, or classic."""
+        for mode in ("classic", "burst"):
+            if self.running_mode(mode):
+                return self.stats_for(mode)
+        # Fallback: last started config
+        for mode in ("classic", "burst"):
+            if self.configs.get(mode):
+                return self.stats_for(mode)
+        return {}
+
+    @property
+    def config_dict(self) -> Optional[Dict]:
+        """Legacy: return config of first running or last started mode."""
+        for mode in ("classic", "burst"):
+            if self.running_mode(mode):
+                return self.configs.get(mode)
+        for mode in ("classic", "burst"):
+            if self.configs.get(mode):
+                return self.configs.get(mode)
+        return None
+
+    def start(self, config_dict: Dict, mode: str = "classic"):
         self._ensure_pg_vm()
-        # Confirmado por el operador: el sistema opera a proposito con
-        # perdidas iniciales para alimentar el aprendizaje (solo paper).
         os.environ.setdefault("QUANTMATH_LEARN_MODE", "1")
-        self.config_dict = config_dict
+
+        # Stop existing process for this mode if any
+        if self.running_mode(mode):
+            self.stop_mode(mode)
+
+        self.configs[mode] = config_dict
         ctx = mp.get_context("spawn")
-        self.process = ctx.Process(
+        proc = ctx.Process(
             target=_orchestrator_process_main,
             args=(config_dict,),
             daemon=False,
-            name="quant-math-orchestrator",
+            name=f"quant-math-{mode}",
         )
-        self.process.start()
+        proc.start()
+        self.processes[mode] = proc
+        self._write_pid(mode)
 
-    def stop(self, timeout: float = 15.0) -> bool:
-        """Aggressive escalating stop: SIGINT -> SIGTERM -> SIGKILL, <10s worst case."""
-        if self.process is None:
+    def stop_mode(self, mode: str, timeout: float = 15.0) -> bool:
+        """Stop a specific mode's orchestrator."""
+        proc = self.processes.get(mode)
+        if proc is None:
             return False
-        was_running = self.running
-        if not was_running and self.process.exitcode is not None:
+        if not proc.is_alive() and proc.exitcode is not None:
+            self._clear_pid(mode)
             return False
-        # SpawnProcess no soporta send_signal(); usar os.kill directamente
         try:
-            os.kill(self.process.pid, signal.SIGINT)
+            os.kill(proc.pid, signal.SIGINT)
         except ProcessLookupError:
             pass
-        self.process.join(timeout=2)
-        if self.process.is_alive():
-            # Mid-network-call: SIGTERM mata inmediatamente
-            self.process.terminate()
-            self.process.join(timeout=2)
-        if self.process.is_alive():
-            self.process.kill()
-            self.process.join(timeout=3)
-        self._force_stats_stopped()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=3)
+        self._force_stats_stopped(mode)
+        self._clear_pid(mode)
         return True
 
-    def _force_stats_stopped(self):
+    def stop_all(self, timeout: float = 15.0) -> bool:
+        stopped = False
+        for mode in list(self.processes):
+            if self.stop_mode(mode, timeout):
+                stopped = True
+        return stopped
+
+    def stop(self, timeout: float = 15.0) -> bool:
+        """Legacy: stop all processes."""
+        return self.stop_all(timeout)
+
+    def _force_stats_stopped(self, mode: str):
         """Best-effort: reflect STOPPED in runtime_stats.json."""
-        if not self.config_dict:
-            return
-        stats_path = os.path.join(self.config_dict["state_dir"], "runtime_stats.json")
+        cfg = self.configs.get(mode) or {}
+        state_dir = cfg.get("state_dir",
+                            os.path.join(PROJECT_ROOT, "runtime", f"state_{mode}" if mode == "burst" else "state"))
+        stats_path = os.path.join(state_dir, "runtime_stats.json")
         try:
             if os.path.exists(stats_path):
                 with open(stats_path) as fh:
@@ -641,11 +752,11 @@ def _learning_panel_data(state_dir: str, trades, stats: Dict) -> Dict:
     }
 
 
-def render_monitor(runtime: RuntimeState):
-    stats = runtime.stats
+def render_monitor(runtime: RuntimeState, mode: str = "classic"):
+    stats = runtime.stats_for(mode)
     cfg = stats.get("config", {})
     state_dir = cfg.get("state_dir", "runtime/state")
-    state = "RUNNING" if runtime.running else "STOPPED"
+    state = "RUNNING" if runtime.running_mode(mode) else "STOPPED"
 
     header = Table.grid(padding=(0, 2))
     header.add_column(justify="left")
@@ -664,10 +775,10 @@ def render_monitor(runtime: RuntimeState):
     from quant_math.ml.feature_store import integration_cutoff
     cutoff = integration_cutoff(state_dir)
     trades = _read_paper_trades(state_dir) if runtime.config_dict else []
+    # Two-pass: first collect closure keys, then count open entries correctly.
     closed_keys = set()
     total_closed = wins = losses = 0
     realized = realized_legacy = 0.0
-    open_entries = []
     for rec in trades:
         key = rec.get("key")
         if "motivo_cierre" in rec:
@@ -684,10 +795,12 @@ def render_monitor(runtime: RuntimeState):
                 losses += 1
             if key:
                 closed_keys.add(key)
-        elif cutoff and float(rec.get("timestamp") or 0) < cutoff:
-            continue                      # fantasma pre-integracion: no expone
-        else:
-            open_entries.append(rec)
+    open_entries = [
+        rec for rec in trades
+        if "motivo_cierre" not in rec
+        and rec.get("key") not in closed_keys
+        and not (cutoff and float(rec.get("timestamp") or 0) < cutoff)
+    ]
     unrealized = 0.0
     for t in open_entries:
         cur = _get_current_price(t["symbol"], cfg.get("exchange_id", "bybit"))
@@ -790,14 +903,14 @@ def render_monitor(runtime: RuntimeState):
     )
 
 
-def monitor_loop(runtime: RuntimeState):
+def monitor_loop(runtime: RuntimeState, mode: str = "classic"):
     """Live monitor; ESC returns to menu without stopping anything."""
     console.print("[dim]Monitor en vivo — presiona ESC para volver al menú[/dim]")
     try:
-        with Live(render_monitor(runtime), console=console, refresh_per_second=2,
+        with Live(render_monitor(runtime, mode), console=console, refresh_per_second=2,
                   screen=False, redirect_stdout=False, redirect_stderr=False) as live:
             while True:
-                live.update(render_monitor(runtime))
+                live.update(render_monitor(runtime, mode))
                 import select
                 import termios
                 import tty
@@ -1057,11 +1170,11 @@ def _burst_count_open_positions():
     return _count_open_positions(BURST_STATE_DIR)
 
 
-def render_burst_monitor(runtime: RuntimeState):
-    stats = runtime.stats
+def render_burst_monitor(runtime: RuntimeState, mode: str = "burst"):
+    stats = runtime.stats_for(mode)
     cfg = stats.get("config", {})
     state_dir = cfg.get("state_dir", BURST_STATE_DIR)
-    state = "RUNNING" if runtime.running else "STOPPED"
+    state = "RUNNING" if runtime.running_mode(mode) else "STOPPED"
 
     header = Table.grid(padding=(0, 2))
     header.add_column(justify="left")
@@ -1072,10 +1185,10 @@ def render_burst_monitor(runtime: RuntimeState):
 
     open_pos = _burst_count_open_positions()
     trades = _burst_read_paper_trades()
+    # Two-pass: first collect closure keys, then count open entries correctly.
     closed_keys = set()
     total_closed = wins = losses = 0
     total_pnl = 0.0
-    open_entries = []
     for t in trades:
         key = t.get("key")
         if "motivo_cierre" in t:
@@ -1088,8 +1201,11 @@ def render_burst_monitor(runtime: RuntimeState):
                 wins += 1
             elif pnl < 0:
                 losses += 1
-        elif key and key not in closed_keys:
-            open_entries.append(t)
+    open_entries = [
+        t for t in trades
+        if "motivo_cierre" not in t
+        and t.get("key") not in closed_keys
+    ]
     win_rate = (wins / total_closed * 100) if total_closed else 0.0
 
     # MtM: fetch current prices for open entries
@@ -1223,15 +1339,15 @@ def render_burst_monitor(runtime: RuntimeState):
     )
 
 
-def burst_monitor_loop(runtime: RuntimeState):
+def burst_monitor_loop(runtime: RuntimeState, mode: str = "burst"):
     """Live burst monitor; ESC returns to menu without stopping anything."""
     console.print("[dim]Burst monitor — presiona ESC para volver al menú[/dim]")
     try:
-        with Live(render_burst_monitor(runtime), console=console,
+        with Live(render_burst_monitor(runtime, mode), console=console,
                   refresh_per_second=1, screen=False,
                   redirect_stdout=False, redirect_stderr=False) as live:
             while True:
-                live.update(render_burst_monitor(runtime))
+                live.update(render_burst_monitor(runtime, mode))
                 import select
                 import termios
                 import tty
@@ -1260,9 +1376,9 @@ def burst_monitor_loop(runtime: RuntimeState):
 
 def shutdown(runtime: RuntimeState):
     if runtime.running:
-        console.print("[yellow]Deteniendo orchestrator...[/yellow]")
-        runtime.stop()
-        console.print("[green]Orchestrator detenido.[/green]")
+        console.print("[yellow]Deteniendo orchestrators...[/yellow]")
+        runtime.stop_all()
+        console.print("[green]Orchestrators detenidos.[/green]")
 
     stop_vm_env = os.environ.get("QUANTMATH_VM_STOP_ON_EXIT")
     if runtime._pg_alive():
@@ -1292,39 +1408,73 @@ def shutdown(runtime: RuntimeState):
     console.print("[bold]Hasta luego.[/bold]")
 
 
+def _detect_active_modes(runtime: RuntimeState) -> Dict[str, int]:
+    """Detect running modes from PID files (for re-entrant CLI)."""
+    orphans = runtime.detect_orphans()
+    for mode, pid in orphans.items():
+        if not runtime.running_mode(mode):
+            console.print(f"[yellow]Proceso {mode} detectado (PID {pid}) "
+                          "pero no está registrado. Puede ser un huérfano.[/yellow]")
+    return orphans
+
+
+def _ask_mode(runtime: RuntimeState, require_running: bool = True) -> Optional[str]:
+    """Ask user to pick a mode. Returns None on ESC."""
+    running = runtime.any_running()
+    if require_running and not running:
+        return None
+    try:
+        choices = []
+        for mode in ("classic", "burst"):
+            label = "Quant-Math" if mode == "classic" else "Burst Scalping"
+            is_up = runtime.running_mode(mode)
+            status = " ●" if is_up else ""
+            choices.append(questionary.Choice(f"{label}{status}", value=mode))
+        return questionary.select("¿Qué modo?", choices=choices).unsafe_ask()
+    except (AttributeError):
+        return None
+
+
 def main():
     runtime = RuntimeState()
+    # Detect orphan processes from previous sessions
+    _detect_active_modes(runtime)
+
     try:
         while True:
             try:
-                is_burst = (runtime.config_dict or {}).get("mode") == "burst"
+                any_running = runtime.any_running()
+                classic_running = runtime.running_mode("classic")
+                burst_running = runtime.running_mode("burst")
+
                 action = questionary.select(
                     "QUANT-MATH — Menú principal  (↑/↓ + Enter)",
                     choices=[
                         questionary.Choice("Iniciar Quant-Math",
                                            value="start",
-                                           disabled="ya está corriendo" if runtime.running else None),
-                        questionary.Choice("Detener investigación",
+                                           disabled="ya está corriendo" if classic_running else None),
+                        questionary.Choice("Iniciar Burst Scalping",
+                                           value="start_burst",
+                                           disabled="ya está corriendo" if burst_running else None),
+                        questionary.Choice("Detener Quant-Math",
                                            value="stop",
-                                           disabled="no está corriendo" if not runtime.running else None),
+                                           disabled="no está corriendo" if not classic_running else None),
+                        questionary.Choice("Detener Burst",
+                                           value="stop_burst",
+                                           disabled="no está corriendo" if not burst_running else None),
+                        questionary.Choice("Detener ambos",
+                                           value="stop_all",
+                                           disabled="nada corriendo" if not any_running else None),
                         questionary.Choice("Monitor", value="monitor"),
                         questionary.Choice("Ver log", value="log"),
                         questionary.Choice("Historial de operaciones",
                                            value="history"),
-                        questionary.Choice("Iniciar Burst Scalping",
-                                           value="start_burst",
-                                           disabled="ya está corriendo" if runtime.running else None),
-                        questionary.Choice("Historial Burst",
-                                           value="burst_history",
-                                           disabled=None if is_burst else "solo disponible con Burst activo"),
-                        questionary.Choice("Ver log Burst",
-                                           value="burst_log",
-                                           disabled=None if is_burst else "solo disponible con Burst activo"),
+                        questionary.Choice("Minimizar (seguir en background)",
+                                           value="minimize"),
                         questionary.Choice("Salir", value="quit"),
                     ],
                 ).unsafe_ask()
             except KeyboardInterrupt:
-                # Ctrl+C en el menú principal -> cierre total
                 print()
                 shutdown(runtime)
                 return 0
@@ -1332,10 +1482,9 @@ def main():
             if action is None:  # ESC on main menu
                 if runtime.running:
                     console.print("[dim]ESC: sigue corriendo en fondo. "
-                                  "Usa 'Salir' o 'Detener investigación' para cerrar.[/dim]")
+                                  "Usa 'Salir' o 'Detener ambos' para cerrar.[/dim]")
                 continue
 
-            # Ctrl+C en cualquier sub-pantalla propaga -> cierre total (outer)
             _dispatch(runtime, action)
     except KeyboardInterrupt:
         print()
@@ -1350,64 +1499,112 @@ def _dispatch(runtime: RuntimeState, action: str):
         if cfg is None:
             console.print("[dim]Wizard cancelado.[/dim]")
             return
-        runtime.start(cfg)
-        console.print(f"[green]Orchestrator iniciado en proceso de fondo "
-                      f"(pid={runtime.process.pid}). Logs: {LOG_PATH}[/green]")
+        runtime.start(cfg, mode="classic")
+        pid = runtime.processes["classic"].pid
+        console.print(f"[green]Quant-Math iniciado (pid={pid}). Logs: {LOG_PATH}[/green]")
         try:
             questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").unsafe_ask()
         except (AttributeError):
             pass
-
-    elif action == "stop":
-        if runtime.stop():
-            console.print("[green]Investigación detenida.[/green]")
-        else:
-            console.print("[yellow]No hay proceso activo.[/yellow]")
 
     elif action == "start_burst":
         cfg = burst_wizard()
         if cfg is None:
             console.print("[dim]Wizard burst cancelado.[/dim]")
             return
-        runtime.start(cfg)
-        console.print(f"[green]Burst Scalping iniciado (pid={runtime.process.pid}). "
-                      f"Logs: {BURST_LOG_PATH}[/green]")
+        runtime.start(cfg, mode="burst")
+        pid = runtime.processes["burst"].pid
+        console.print(f"[green]Burst Scalping iniciado (pid={pid}). Logs: {BURST_LOG_PATH}[/green]")
         try:
             questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").unsafe_ask()
         except (AttributeError):
             pass
 
-    elif action == "monitor":
-        is_burst = (runtime.config_dict or {}).get("mode") == "burst"
-        if is_burst:
-            burst_monitor_loop(runtime)
+    elif action == "stop":
+        if runtime.stop_mode("classic"):
+            console.print("[green]Quant-Math detenido.[/green]")
         else:
-            monitor_mode = questionary.select(
-                "¿Qué monitor?",
-                choices=[
-                    questionary.Choice("Quant-Math", value="classic"),
-                    questionary.Choice("Burst Scalping", value="burst"),
-                ]).unsafe_ask()
-            if monitor_mode == "burst":
-                burst_monitor_loop(runtime)
-            else:
-                monitor_loop(runtime)
+            console.print("[yellow]Quant-Math no está corriendo.[/yellow]")
+
+    elif action == "stop_burst":
+        if runtime.stop_mode("burst"):
+            console.print("[green]Burst Scalping detenido.[/green]")
+        else:
+            console.print("[yellow]Burst Scalping no está corriendo.[/yellow]")
+
+    elif action == "stop_all":
+        if runtime.stop_all():
+            console.print("[green]Todos los procesos detenidos.[/green]")
+        else:
+            console.print("[yellow]No hay procesos activos.[/yellow]")
+
+    elif action == "monitor":
+        running = runtime.any_running()
+        if len(running) == 0:
+            console.print("[yellow]Ningún modo está corriendo. Iniciá uno primero.[/yellow]")
+            return
+        elif len(running) == 1:
+            mode = running[0]
+        else:
+            mode = _ask_mode(runtime, require_running=True)
+            if mode is None:
+                return
+        if mode == "burst":
+            burst_monitor_loop(runtime, mode)
+        else:
+            monitor_loop(runtime, mode)
 
     elif action == "log":
-        is_burst = (runtime.config_dict or {}).get("mode") == "burst"
-        if is_burst:
+        running = runtime.any_running()
+        if len(running) == 0:
+            view_log()
+            return
+        elif len(running) == 1:
+            mode = running[0]
+        else:
+            mode = _ask_mode(runtime, require_running=False)
+            if mode is None:
+                return
+        if mode == "burst":
             view_log_path(BURST_LOG_PATH)
         else:
             view_log()
 
     elif action == "history":
-        view_history(runtime)
+        running = runtime.any_running()
+        if len(running) == 0:
+            view_history(runtime)
+            return
+        elif len(running) == 1:
+            mode = running[0]
+        else:
+            mode = _ask_mode(runtime, require_running=False)
+            if mode is None:
+                return
+        if mode == "burst":
+            view_burst_history()
+        else:
+            view_history(runtime)
 
-    elif action == "burst_history":
-        view_burst_history()
-
-    elif action == "burst_log":
-        view_log_path(BURST_LOG_PATH)
+    elif action == "minimize":
+        running = runtime.any_running()
+        if not running:
+            console.print("[yellow]No hay procesos corriendo para minimizar.[/yellow]")
+            return
+        console.print()
+        console.print("[bold cyan]Minimizando — procesos en background:[/bold cyan]")
+        for mode in running:
+            pid = runtime.processes[mode].pid
+            label = "Quant-Math" if mode == "classic" else "Burst Scalping"
+            console.print(f"  ● {label}: PID {pid}")
+        console.print()
+        console.print("Para detener: abrí el wizard de nuevo y elegí")
+        console.print("'Detener Quant-Math', 'Detener Burst' o 'Detener ambos'.")
+        console.print()
+        try:
+            questionary.press_any_key_to_continue(message="(ENTER/tecla para volver)").unsafe_ask()
+        except (AttributeError):
+            pass
 
     elif action == "quit":
         shutdown(runtime)

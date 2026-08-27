@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -186,6 +188,7 @@ class Orchestrator:
         self._build_runner()
         self.engine = self._build_engine()
         self.cycle_count = 0
+        self._runner_lock = threading.Lock()  # protects runner.all_hypotheses
         # V2 B3: burst state tracker (only for burst mode)
         self.burst_tracker = (BurstStateTracker(config.state_dir)
                               if config.mode == "burst" else None)
@@ -398,6 +401,7 @@ class Orchestrator:
             batch = fresh[:cap]
             results = self.runner.run_backtest_for_symbol(symbol, batch)
             self.runner.performance_history.extend(results)
+            self.runner._prune_memory()
 
             for result in results:
                 record = self._result_to_kb_record(result, symbol)
@@ -411,6 +415,60 @@ class Orchestrator:
                   f"({self.last_novelty * 100:.0f}%)")
 
         return new_records
+
+    def _generate_and_backtest_symbol(self, symbol: str, n: int,
+                                       seen: Dict, K: int) -> List[Dict]:
+        """Generate + backtest hypotheses for a single symbol (thread-safe)."""
+        import json as _json
+        records = []
+        with self._runner_lock:
+            self.runner.iteration = self.cycle_count
+            hyp_ids = self.runner.create_hypotheses_for_symbol(symbol, self.cycle_count)
+
+        fresh = []
+        for hid in hyp_ids:
+            with self._runner_lock:
+                hyp = self.runner.all_hypotheses.get(hid)
+            if hyp is None:
+                continue
+            params = getattr(hyp, "parameters", {}) or {}
+            st = getattr(hyp.strategy_type, "value", None)
+            if not isinstance(st, str):
+                st = str(hyp.strategy_type)
+            sig = _json.dumps([st, symbol, sorted(params.items())],
+                              sort_keys=True, default=str)
+            last = seen.get(sig)
+            if last is not None and (self.cycle_count - last) < K:
+                continue
+            with self._runner_lock:
+                seen[sig] = self.cycle_count
+            fresh.append(hid)
+
+        if not fresh:
+            return records
+
+        if self.config.mode == "burst":
+            with self._runner_lock:
+                scalp_hyps = [hid for hid in fresh
+                              if self.runner.all_hypotheses.get(hid)
+                              and self.runner.all_hypotheses[hid].parameters.get(
+                                  "strategy_type") == "scalp_burst"]
+            other_hyps = [hid for hid in fresh if hid not in scalp_hyps]
+            fresh = scalp_hyps + other_hyps[:1] if other_hyps else scalp_hyps
+
+        cap = len(fresh) if getattr(self, "_explore_burst", False) \
+            else max(1, n)
+        batch = fresh[:cap]
+        with self._runner_lock:
+            results = self.runner.run_backtest_for_symbol(symbol, batch)
+            self.runner.performance_history.extend(results)
+            self.runner._prune_memory()
+
+        for result in results:
+            record = self._result_to_kb_record(result, symbol)
+            if record is not None:
+                records.append(record)
+        return records
 
     def _result_to_kb_record(self, result: Dict, symbol: str) -> Optional[Dict]:
         """Convert an AQDE backtest result into a KB JSONL record."""
@@ -603,27 +661,66 @@ class Orchestrator:
         summary = {"cycle": self.cycle_count, "generated": 0, "signals": 0,
                    "no_entry": 0, "skipped_position": 0, "trades": []}
 
-        # 1-2. Generate + backtest on real data
-        records = self._generate_and_backtest()
+        # 1-2. Generate + backtest on real data (parallel per symbol)
+        import json as _json
+        K = int(os.environ.get("QUANTMATH_SIG_REFRESH_CYCLES", "5"))
+        seen = {}
+        for h in self.engine.hypotheses.values():
+            sig = _json.dumps(
+                [h.get("strategy_type"), h.get("symbol"),
+                 sorted((h.get("parameters") or {}).items())],
+                sort_keys=True, default=str)
+            last = int(h.get("orchestrator_cycle") or 0)
+            seen[sig] = max(seen.get(sig, 0), last)
+
+        n_per_sym = max(1, cfg.hypotheses_per_cycle // max(1, len(cfg.symbols)))
+        all_records = []
+        max_workers = min(len(cfg.symbols), 3) if len(cfg.symbols) > 1 else 1
+        if max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(self._generate_and_backtest_symbol,
+                                sym, n_per_sym, seen, K): sym
+                    for sym in cfg.symbols
+                }
+                for f in as_completed(futures):
+                    sym = futures[f]
+                    try:
+                        sym_records = f.result()
+                        all_records.extend(sym_records)
+                    except Exception as exc:
+                        logger.exception("Generation failed for %s: %s", sym, exc)
+        else:
+            for sym in cfg.symbols:
+                try:
+                    sym_records = self._generate_and_backtest_symbol(
+                        sym, n_per_sym, seen, K)
+                    all_records.extend(sym_records)
+                except Exception as exc:
+                    logger.exception("Generation failed for %s: %s", sym, exc)
+
+        records = all_records
         summary["generated"] = len(records)
         for r in records:
             print(f"  [hyp] {r['hypothesis_id']} {r['name']} "
                   f"expectancy={r['expectancy']:+.5f} score={r['scientific_score']:.2f} "
                   f"status={r['status']}")
 
-        # 3. Publish to shared JSONL KB
-        self._publish_to_kb(records)
+        # 3+4. Publish to KB and check exits in parallel (independent data)
+        exits = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pub_future = pool.submit(self._publish_to_kb, records)
+            exit_future = pool.submit(self.engine.check_exits_all)
+            pub_future.result()  # MUST complete before decide()
+            exits = exit_future.result()
 
-        # SL/TP primero para TODAS las posiciones abiertas (incluye huerfas
-        # de simbolos fuera de la config actual); riesgo antes que entradas.
-        exits = self.engine.check_exits_all()
         for closure in exits:
             print(f"  [exit] {closure['motivo_cierre'].upper()} "
                   f"{closure['symbol']} exit={closure['exit_price']:.8g} "
                   f"pnl={closure['pnl']:+.4f}")
         summary["exits"] = len(exits)
 
-        # 4-5. Decide per symbol; execute paper trades; engine handles feedback
+        # 5. Decide per symbol; execute paper trades; engine handles feedback
         for symbol in cfg.symbols:
             # V2 B3: burst cooldown gate
             if (self.burst_tracker
@@ -700,4 +797,13 @@ class Orchestrator:
                 logger.exception("Cycle failed: %s", exc)
             cycles += 1
             if max_cycles is None or cycles < max_cycles:
-                time.sleep(self.config.interval_seconds)
+                # Adaptive sleep: longer when idle to save battery
+                sleep_time = self.config.interval_seconds
+                if self.config.mode == "burst":
+                    # If no entries possible and no open positions, sleep longer
+                    can_enter = (self.burst_tracker is None
+                                 or self.burst_tracker.can_enter(self.cycle_count))
+                    has_open = len(self.engine.open_positions) > 0
+                    if not can_enter and not has_open:
+                        sleep_time = max(sleep_time, 60)  # idle: at least 60s
+                time.sleep(sleep_time)

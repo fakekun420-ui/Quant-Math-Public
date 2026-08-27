@@ -105,3 +105,161 @@ class TestViewLogPath:
         import inspect
         sig = inspect.signature(view_log_path)
         assert "log_path" in sig.parameters
+
+
+class TestTwoPassMonitorFix:
+    """Test that the two-pass scan correctly identifies open entries."""
+
+    def test_entries_before_closures_are_not_counted(self, tmp_path):
+        """Entries that appear BEFORE their closure records should not be counted as open."""
+        trades_file = os.path.join(tmp_path, "paper_executions.jsonl")
+        # Entry appears first (line 1), closure appears later (line 6)
+        entry1 = {"key": "hyp_aaa:XRP/USDT", "side": "buy", "entry_price": 1.41,
+                  "symbol": "XRP/USDT", "quantity": 70.0, "margin_usd": 10.0}
+        entry2 = {"key": "hyp_bbb:XRP/USDT", "side": "sell", "entry_price": 1.40,
+                  "symbol": "XRP/USDT", "quantity": 71.0, "margin_usd": 10.0}
+        closure1 = {"key": "hyp_aaa:XRP/USDT", "motivo_cierre": "sl", "pnl": -1.3}
+        closure2 = {"key": "hyp_bbb:XRP/USDT", "motivo_cierre": "sl", "pnl": -0.8}
+
+        with open(trades_file, "w") as f:
+            f.write(json.dumps(entry1) + "\n")
+            f.write(json.dumps(entry2) + "\n")
+            f.write(json.dumps(closure1) + "\n")
+            f.write(json.dumps(closure2) + "\n")
+
+        trades = _read_paper_trades(tmp_path)
+
+        # Two-pass logic (same as render_burst_monitor)
+        closed_keys = set()
+        total_closed = 0
+        total_pnl = 0.0
+        for t in trades:
+            key = t.get("key")
+            if "motivo_cierre" in t:
+                if key:
+                    closed_keys.add(key)
+                total_closed += 1
+                total_pnl += float(t.get("pnl", 0.0))
+        open_entries = [
+            t for t in trades
+            if "motivo_cierre" not in t
+            and t.get("key") not in closed_keys
+        ]
+
+        assert total_closed == 2
+        assert total_pnl == -2.1
+        assert len(open_entries) == 0  # Both are closed
+
+    def test_mixed_open_and_closed(self, tmp_path):
+        """Some entries open, some closed — only open ones should count."""
+        trades_file = os.path.join(tmp_path, "paper_executions.jsonl")
+        entry1 = {"key": "hyp_111:XRP/USDT", "side": "buy", "entry_price": 1.41,
+                  "symbol": "XRP/USDT", "quantity": 70.0, "margin_usd": 10.0}
+        entry2 = {"key": "hyp_222:XRP/USDT", "side": "sell", "entry_price": 1.40,
+                  "symbol": "XRP/USDT", "quantity": 71.0, "margin_usd": 10.0}
+        entry3 = {"key": "hyp_333:XRP/USDT", "side": "buy", "entry_price": 1.42,
+                  "symbol": "XRP/USDT", "quantity": 70.0, "margin_usd": 10.0}
+        closure1 = {"key": "hyp_111:XRP/USDT", "motivo_cierre": "sl", "pnl": -1.3}
+
+        with open(trades_file, "w") as f:
+            f.write(json.dumps(entry1) + "\n")
+            f.write(json.dumps(entry2) + "\n")
+            f.write(json.dumps(entry3) + "\n")
+            f.write(json.dumps(closure1) + "\n")
+
+        trades = _read_paper_trades(tmp_path)
+
+        closed_keys = set()
+        total_closed = 0
+        for t in trades:
+            if "motivo_cierre" in t:
+                key = t.get("key")
+                if key:
+                    closed_keys.add(key)
+                total_closed += 1
+        open_entries = [
+            t for t in trades
+            if "motivo_cierre" not in t
+            and t.get("key") not in closed_keys
+        ]
+
+        assert total_closed == 1
+        assert len(open_entries) == 2
+        assert open_entries[0]["key"] == "hyp_222:XRP/USDT"
+        assert open_entries[1]["key"] == "hyp_333:XRP/USDT"
+
+
+class TestRuntimeStateMultiProcess:
+    """Test RuntimeState supports multiple simultaneous processes."""
+
+    def test_running_mode_returns_false_for_unknown(self):
+        from quant_math.cli.main import RuntimeState
+        rs = RuntimeState()
+        assert rs.running_mode("classic") is False
+        assert rs.running_mode("burst") is False
+
+    def test_any_running_empty(self):
+        from quant_math.cli.main import RuntimeState
+        rs = RuntimeState()
+        assert rs.any_running() == []
+
+    def test_stats_for_missing_mode(self):
+        from quant_math.cli.main import RuntimeState
+        rs = RuntimeState()
+        stats = rs.stats_for("classic")
+        assert stats.get("state") == "STOPPED"
+
+    def test_config_dict_legacy_none(self):
+        from quant_math.cli.main import RuntimeState
+        rs = RuntimeState()
+        assert rs.config_dict is None
+
+    def test_clear_pid_nonexistent(self, tmp_path, monkeypatch):
+        from quant_math.cli.main import RuntimeState
+        rs = RuntimeState()
+        # Should not raise
+        rs._clear_pid("classic")
+
+
+class TestMemoryPruning:
+    """Test that AQDERunner prunes unbounded data structures."""
+
+    def test_prune_performance_history(self):
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from aqde_runner import AQDERunner
+        runner = AQDERunner.__new__(AQDERunner)
+        runner.performance_history = [{"cycle": i} for i in range(600)]
+        runner.all_hypotheses = {}
+
+        runner._prune_memory()
+
+        assert len(runner.performance_history) == 500
+        # Should keep only the last 500
+        assert runner.performance_history[0]["cycle"] == 100
+
+    def test_prune_all_hypotheses(self):
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from aqde_runner import AQDERunner
+        from quant_math.autonomous_research.interfaces import Hypothesis
+
+        runner = AQDERunner.__new__(AQDERunner)
+        runner.performance_history = []
+        runner.all_hypotheses = {}
+
+        # Create 250 hypotheses, some retired
+        for i in range(250):
+            h = Hypothesis.__new__(Hypothesis)
+            h.hypothesis_id = f"hyp_{i}"
+            if i % 3 == 0:
+                h.status = "retired"
+            else:
+                h.status = "active"
+            runner.all_hypotheses[f"hyp_{i}"] = h
+
+        runner._prune_memory()
+
+        # Only active hypotheses should remain
+        assert all(v.status != "retired" for v in runner.all_hypotheses.values())
+        assert len(runner.all_hypotheses) > 0
