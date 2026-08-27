@@ -810,7 +810,7 @@ def render_monitor(runtime: RuntimeState, mode: str = "classic"):
     # se excluyen del MtM y del PnL nuevo: son historial, no exposicion.
     from quant_math.ml.feature_store import integration_cutoff
     cutoff = integration_cutoff(state_dir)
-    trades = _read_paper_trades(state_dir) if runtime.config_dict else []
+    trades = _read_paper_trades(state_dir)
     # Two-pass: first collect closure keys, then count open entries correctly.
     closed_keys = set()
     total_closed = wins = losses = 0
