@@ -1,12 +1,12 @@
-# QUANT-MATH v1.3.0 — Autonomous Quantitative Research System
+# QUANT-MATH v1.4.0 — Autonomous Quantitative Research System
 
 Self-improving quantitative trading research system: an AQDE engine generates
 market-driven hypotheses, a mathematical gate validates them against **real
 Bybit data**, and an unsupervised learning loop (SIS) learns from every closed
 operation to continuously improve what gets generated next.
 
-> **v1.3.0** — Simultaneous classic+burst, parallel generation, resource
-> optimization for Android/Termux, minimize with background persistence.
+> **v1.4.0** — PostgreSQL VM eliminated, JSONL-only KB with atomic upsert,
+> stop buttons fixed, realistic $50 defaults, 108 tests.
 
 ## How It Works
 
@@ -18,7 +18,7 @@ AQDE Runner ── templates + ARIMA/GARCH candidates + adaptive mutations
    │            (feedback from previous backtests; rotation per cycle;
    │             dedupe vs KB with refresh window; parallel per-symbol)
    ▼
-Orchestrator ── publish to Knowledge Base (PostgreSQL ⇄ JSONL fallback)
+Orchestrator ── publish to Knowledge Base (JSONL with atomic upsert)
    │             check_exits runs in parallel with publish (ThreadPool)
    ▼
 Decision Engine ── ranked candidates (expectancy DESC, score DESC);
@@ -55,7 +55,7 @@ loss-collection experiments, paper-only).
 # Interactive CLI (menu → wizard → orchestrator in background)
 python -m quant_math.cli.main
 
-# Run the full test suite (104 tests across all modules)
+# Run the full test suite (108 tests across all modules)
 python -m pytest tests/ -q
 
 # Refresh the code-graph index after refactors
@@ -114,14 +114,10 @@ files to `runtime/state_{mode}/orchestrator.pid`. This means:
 
 ## Persistence
 
-- **Knowledge Base**: PostgreSQL (microVM with persistent 4 GB qcow2 disk,
-  port-forwarded to `127.0.0.1:15432`) with automatic JSONL fallback.
-  - The CLI auto-boots the VM if unreachable (`QUANTMATH_PG_BOOT_TIMEOUT`,
-    default 480 s).
-  - On first connect an empty table is seeded automatically from the JSONL
-    mirror — server restarts lose nothing.
-  - Every PostgreSQL access is wrapped in try/except: if the DB is down the
-    system keeps running on JSONL and logs the fallback explicitly.
+- **Knowledge Base**: Pure JSONL with atomic upsert (no external dependencies).
+  - `JSONLKnowledgeBase` reads → merges → writes atomically per file, thread-safe via per-file locks.
+  - In-memory index for fast search by status, symbol, or combined filters.
+  - `KBPersistence` facade provides a unified API; legacy `PostgreSQLKnowledgeBase` is an alias.
 - **Operations ledger**: `runtime/state/paper_executions.jsonl` is
   append-only and never truncated — it is the permanent trade book.
 - **Open positions**: recovered automatically on restart
@@ -141,7 +137,7 @@ files to `runtime/state_{mode}/orchestrator.pid`. This means:
 | Graduation Hardening (O1) | Statistical gate on PB | Window mean must clear IC90 lower bound > 0 with ≥2 distinct families | Prevents lucky-streak graduations; audit fields stored in `graduation.json` |
 | Slippage Model (O2) | Adverse-fill simulation | Every paper execution | Entries and exits filled at ±QUANTMATH_SLIPPAGE_PCT against the trader — realistic net PnL |
 | Vol-Target Sizing (O6) | Inverse-volatility scaler | Realized per-cycle returns | Post-graduation notional scales x0.5–x2 toward a 2% vol target instead of fixed sizing |
-| Burst Scalping (V2) | Margin×leverage sizing | EMA trend + momentum spike + pullback entry | $10 margin × 10× leverage = $100 notional; TP 0.4–0.8% = $0.20–$0.60 net; cooldown 10 cycles, max $50 exposure |
+| Burst Scalping (V2) | Margin×leverage sizing | EMA trend + momentum spike + pullback entry | $1 margin × 5× leverage = $5 notional; TP 25% = $1.25 net; cooldown 10 cycles |
 | Parallel Generation (V3) | ThreadPool per-symbol | Cross-symbol parallelism | Up to 3 symbols generate + backtest simultaneously; check_exits overlaps with KB publish |
 | Resource Optimization (V3) | Adaptive sleep + pruning | Idle detection, memory caps | Burst sleeps 60s when idle; performance_history capped at 500; os.nice(10) for battery savings |
 
@@ -155,10 +151,6 @@ safe: below minimum sample thresholds every learner stays in "collecting" mode.
 | Flag | Default | Purpose |
 |---|---|---|
 | `QUANTMATH_LEARN_MODE` | `0` (CLI sets `1`) | Temporarily bypass expectancy gate to collect negative-outcome data |
-| `QUANTMATH_PG_DISABLE` | unset | Force JSONL-only knowledge base |
-| `QUANTMATH_PG_DSN` | localhost:15432 | PostgreSQL connection string |
-| `QUANTMATH_PG_BOOT_TIMEOUT` | `480` | Seconds to wait for VM auto-boot |
-| `QUANTMATH_VM_STOP_ON_EXIT` | ask | Stop PG VM when leaving the CLI (`1`/`0`) |
 | `QUANTMATH_SIG_REFRESH_CYCLES` | `5` | Cycles before a known hypothesis signature is re-backtested |
 | `QUANTMATH_SIS_MIN_ROWS` | `30` | Closed ops required before SIS activates |
 | `QUANTMATH_ML_MIN_RECORDS` | `100` | Records required before the prior activates |
@@ -189,10 +181,10 @@ resamples already-real trade PnLs (statistical bootstrap).
 ├── model_based_generator.py    # ARIMA/GARCH hypothesis candidates + burst template
 ├── quant_math/
 │   ├── cli/main.py             # Interactive CLI (menu/wizard/monitor/history/burst)
-│   ├── orchestrator.py         # Cycle orchestration + dedupe + SIS hook + BurstStateTracker
+│   ├── orchestrator.py         # Cycle orchestration + dedupe + SIS hook + BurstStateTracker + stop button
 │   ├── decision_engine/        # Expectancy gate, TP/SL, positions, feedback, burst sizing
 │   ├── ml/                     # Prior, feature store, SIS loop, KB reset
-│   └── autonomous_research/    # Research manager, adapters, KB backends
+│   └── autonomous_research/    # Research manager, adapters, JSONL KB backend
 ├── runtime/state/              # Classic: positions, ledger, counters, stats
 ├── runtime/state_burst/        # Burst: isolated state (positions, ledger, burst_state)
 ├── runtime/hypotheses.jsonl    # Classic KB mirror (fallback seed)
@@ -211,14 +203,15 @@ visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
 
 ## Testing
 
-104 tests, zero warnings: integration workflow, decision-engine gate
+108 tests, zero warnings: integration workflow, decision-engine gate
 behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
 hardened auto-graduation IC90+families (O1/PB), adverse-slippage fills
 (O2), generative-novelty metric (O4), vol-targeted sizing (O6),
 energy-burst & range-pressure families (O7), multi-symbol isolation
 (O3), SIS clustering/recommendations, family
 feedback buckets, SL 2:1 exactness, position recovery, KB round-trip +
-fallback, prior activation thresholds, model-based generator contracts,
+fallback (JSONL atomic upsert, search by status/symbol/combined),
+prior activation thresholds, model-based generator contracts,
 burst infrastructure (cooldown, trend filter, exposure, sizing),
 burst history/log separation, burst monitor,
 two-pass MtM fix, multi-process RuntimeState, memory pruning.
