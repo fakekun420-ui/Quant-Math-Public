@@ -35,6 +35,10 @@ pytest-mock>=3.12.0
 # Data Fetching
 ccxt>=4.0.0
 
+# CLI
+questionary>=1.10.0
+rich>=13.0.0
+
 # Jupyter
 jupyter>=1.0.0
 notebook>=7.0.0

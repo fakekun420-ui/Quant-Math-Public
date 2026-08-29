@@ -1,8 +1,8 @@
 # ARCHITECTURE GUIDE (v0.x — referencia histórica por módulo)
 
 > ⚠️ **DOCUMENTO HISTÓRICO (v0.x).** La arquitectura EN EJECUCIÓN de
-> Quant-Math v1.0.1 vive en `ARCHITECTURE.md` (pipeline AQDE → gate → SIS,
-> Knowledge Base PostgreSQL/JSONL, LEARN_MODE, riesgo 2:1).
+> Quant-Math v1.4.0 vive en `ARCHITECTURE.md` (pipeline AQDE → gate → SIS,
+> Knowledge Base JSONL con atomic upsert, LEARN_MODE, riesgo 2:1).
 > Las secciones siguientes permanecen válidas como detalle profundo de los
 > módulos base; los estados/checklists que contengan pueden estar desactualizados.
 

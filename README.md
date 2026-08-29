@@ -6,7 +6,8 @@ Bybit data**, and an unsupervised learning loop (SIS) learns from every closed
 operation to continuously improve what gets generated next.
 
 > **v1.4.0** — PostgreSQL VM eliminated, JSONL-only KB with atomic upsert,
-> stop buttons fixed, realistic $50 defaults, 108 tests.
+> stop buttons fixed, realistic $50 defaults, 137 tests. Lazy matplotlib
+> imports, CLI dependencies declared.
 
 ## How It Works
 
@@ -55,7 +56,7 @@ loss-collection experiments, paper-only).
 # Interactive CLI (menu → wizard → orchestrator in background)
 python -m quant_math.cli.main
 
-# Run the full test suite (108 tests across all modules)
+# Run the full test suite (137 tests across all modules)
 python -m pytest tests/ -q
 
 # Refresh the code-graph index after refactors
@@ -203,7 +204,7 @@ visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
 
 ## Testing
 
-108 tests, zero warnings: integration workflow, decision-engine gate
+137 tests, zero warnings: integration workflow, decision-engine gate
 behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
 hardened auto-graduation IC90+families (O1/PB), adverse-slippage fills
 (O2), generative-novelty metric (O4), vol-targeted sizing (O6),

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-math"
-version = "1.2.0"
+version = "1.4.0"
 description = "Quantitative Mathematics Framework for Algorithmic Trading"
 readme = "README.md"
 authors = [
@@ -37,6 +37,8 @@ dependencies = [
     "matplotlib>=3.8.0",
     "cvxpy>=1.4.0",
     "ccxt>=4.0.0",
+    "questionary>=1.10.0",
+    "rich>=13.0.0",
     "jupyter>=1.0.0",
     "notebook>=7.0.0",
     "tqdm>=4.66.0",

@@ -8,7 +8,6 @@ analysis.
 
 import numpy as np
 from typing import Tuple, Optional
-import matplotlib.pyplot as plt
 
 
 class FastFourierTransform:
@@ -209,12 +208,12 @@ class FastFourierTransform:
         
         return seasonal_strength
     
-    def plot_spectrum(self, data: np.ndarray, 
+    def plot_spectrum(self, data: np.ndarray,
                      figsize: Tuple[int, int] = (12, 5),
                      title: str = 'Frequency Spectrum'):
         """
         Plot FFT magnitude spectrum.
-        
+
         Parameters
         ----------
         data : np.ndarray
@@ -224,8 +223,9 @@ class FastFourierTransform:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         magnitude, frequencies, _ = self.compute_fft(data)
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
         
         # Magnitude spectrum
@@ -251,7 +251,7 @@ class FastFourierTransform:
                            title: str = 'Phase Spectrum'):
         """
         Plot FFT phase spectrum.
-        
+
         Parameters
         ----------
         data : np.ndarray
@@ -261,8 +261,9 @@ class FastFourierTransform:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         _, frequencies, phase = self.compute_fft(data)
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
         
         # Phase spectrum

@@ -7,7 +7,6 @@ frequency analysis of time series data.
 
 import numpy as np
 from typing import Tuple, Optional
-import matplotlib.pyplot as plt
 try:
     from scipy.signal import cwt, ricker
 except ImportError:                      # scipy >= 1.12 elimino cwt/ricker
@@ -195,11 +194,12 @@ class ContinuousWaveletTransform:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         if self.coeffs is None:
             self.compute_cwt(data)
-        
+
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
-        
+
         # Time series
         ax1.plot(data, 'b-')
         ax1.set_title('Time Series')
@@ -241,10 +241,11 @@ class ContinuousWaveletTransform:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         coeffs, freqs = self.compute_cwt(data, sampling_rate)
-        
+
         extent = [0, len(data), freqs[0], freqs[-1]]
-        
+
         fig, ax = plt.subplots(figsize=figsize)
         im = ax.imshow(coeffs, aspect='auto', extent=extent,
                       origin='lower', cmap='RdBu_r', vmin=-np.max(np.abs(coeffs)),

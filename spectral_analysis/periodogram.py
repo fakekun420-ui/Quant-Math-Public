@@ -7,7 +7,6 @@ identifying periodic patterns and seasonal components in time series.
 
 import numpy as np
 from typing import Tuple, Dict, Optional
-import matplotlib.pyplot as plt
 from scipy import signal
 from scipy.signal import periodogram
 from statsmodels.tsa.stattools import acf
@@ -293,10 +292,11 @@ class PeriodogramAnalyzer:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         freqs, power = self.compute_periodogram(data)
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
-        
+
         # Periodogram
         ax1.plot(freqs, power, 'b-')
         ax1.set_title('Periodogram')
@@ -343,8 +343,9 @@ class PeriodogramAnalyzer:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         freqs, power = self.compute_smoothed_periodogram(data, window_size)
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
         
         # Smoothed periodogram
@@ -396,10 +397,11 @@ class PeriodogramAnalyzer:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         freqs, power = self.compute_periodogram(data)
-        
+
         detected = self.detect_periodicities(data, min_period, max_period, confidence)
-        
+
         fig, ax = plt.subplots(figsize=figsize)
         
         ax.plot(freqs, power, 'b-', label='Periodogram')

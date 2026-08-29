@@ -5,7 +5,6 @@ This module demonstrates the usage of spectral analysis techniques.
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
 from spectral_analysis import (
     FastFourierTransform, compute_fft,
     ContinuousWaveletTransform,

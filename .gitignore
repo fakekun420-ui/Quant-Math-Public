@@ -1,9 +1,19 @@
-.code-graph/
-quant_math.log
+# Python
 __pycache__/
 *.pyc
-quant_math.log*
+*.pyo
+
+# Logs
+*.log
 
 # Runtime data (KB, logs, state)
 runtime/
 *.jsonl
+
+# IDE / Tools
+.code-graph/
+.opencode/
+.pytest_cache/
+
+# Knowledge graph index (generated, large)
+graphify-out/

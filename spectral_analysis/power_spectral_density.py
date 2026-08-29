@@ -7,7 +7,6 @@ Welch's method and other spectral estimation techniques.
 
 import numpy as np
 from typing import Tuple, Optional
-import matplotlib.pyplot as plt
 from scipy import signal
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
@@ -257,10 +256,11 @@ class PowerSpectralDensity:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         freqs, power = self.compute_psd(data, method)
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
-        
+
         # PSD
         ax1.plot(freqs, power, 'b-')
         ax1.set_title('Power Spectral Density')
@@ -306,9 +306,10 @@ class PowerSpectralDensity:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         if labels is None:
             labels = [f'Signal {i}' for i in range(len(data_list))]
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
         
         for data, label in zip(data_list, labels):

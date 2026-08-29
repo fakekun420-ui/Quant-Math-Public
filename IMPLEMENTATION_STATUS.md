@@ -1,23 +1,49 @@
-# QUANT-MATH Implementation Status — v1.3.0
+# QUANT-MATH Implementation Status — v1.4.0
 
-Estado real verificado con la suite completa (104 tests, 0 warnings).
+Estado real verificado con la suite completa (137 tests, 0 warnings).
 
 ## ✅ Núcleo en producción
 
 | Módulo | Estado | Notas |
 |---|---|---|
-| `data_acquisition/` | ✅ | Bybit CCXT con retry×3/backoff por página |
+| `data_acquisition/` | ✅ | Bybit CCXT con retry×3/backoff, **futures swap (USDT perpetuals)** |
 | `expectation/` | ✅ | Sharpe/Sortino/Calmar/drawdown |
-| `risk/` | ✅ | VaR, Expected Shortfall, position sizing, stop-loss |
+| `risk/` | ✅ | VaR, Expected Shortfall, position sizing, stop-loss — **integrado al orchestrator** |
 | `optimization/` | ✅ | Kelly criterion, mean-variance, adaptive sizing |
 | `backtesting/` | ✅ | Comisión proporcional 0.1% (fix wr=0%), sortino NaN-safe, WFV con cache intra-ciclo |
 | `regime_detection/` | ✅ | Clustering + features; conectable como feature SIS |
-| `quant_math/orchestrator.py` | ✅ | Ciclos, dedupe+refresh-K, publish KB, stats runtime |
+| `quant_math/orchestrator.py` | ✅ | Ciclos, dedupe+refresh-K, publish KB, stats runtime, **risk circuit breakers**, **live order placement** |
 | `quant_math/decision_engine/` | ✅ | Gate expectancy, LEARN_MODE, TP/SL 2:1 por ciclo, recuperación de posiciones, feedback key+familia, fallback al siguiente mejor candidato (P1), expectancy viva con shrinkage bayesiano (PA), auto-graduación de LEARN_MODE (PB) |
 | `quant_math/cli/main.py` | ✅ | Menú/wizard/monitor/historial, autoarranque VM PG, log rotativo |
 | `quant_math/ml/` | ✅ | Prior supervisado (active), SIS KMeans+regímenes, feature store con cutoff, reset base |
 | `model_based_generator.py` | ✅ | ARIMA/GARCH → candidatos ejecutables con contexto `_regime` |
 | PostgreSQL KB | ✅ | MicroVM qcow2 persistente (:15432), tabla por kb_path, seed JSONL↔PG, fallback total |
+
+## 🔧 v1.4.1 — Mantenimiento (2026-08-29)
+
+| Fix | Detalle |
+|---|---|
+| **FFT lazy import** | `spectral_analysis/*.py`: `matplotlib.pyplot` movido a lazy import dentro de métodos `plot_*`. `_dominant_cycle()` ahora funciona en entornos sin display. |
+| **Dependencias CLI** | `questionary` y `rich` añadidos a `requirements.txt` y `pyproject.toml`. CLI instalable desde limpio. |
+| **Versión unificada** | `pyproject.toml` sincronizado a v1.4.0 (consistente con README). |
+| **Gitignore** | Añadidos `*.pyo`, `*.log` genérico, `.pytest_cache/`, `.opencode/`, `graphify-out/`. |
+| **Limpieza tracking** | `__pycache__/*.pyc` y `graphify-out/` eliminados del índice git. |
+
+## 🟡 v1.5.0 — Futures Integration + Risk Management (en progreso)
+
+| Feature | Estado | Detalle |
+|---|---|---|
+| Bybit futures (`defaultType='swap'`) | ✅ | USDT perpetuals, symbol format `BTC/USDT:USDT` |
+| `set_leverage()` / `set_margin_mode()` | ✅ | Configurable isolated/cross, 1-100x |
+| Live order placement (`create_order`) | ✅ | Market orders via CCXT, fill confirmation |
+| Risk circuit breakers | ✅ | Daily loss limit, max drawdown, max open positions |
+| Daily PnL tracking | ✅ | Resetea a medianoche, pico de equity |
+| `RiskManager` integration | ✅ | Position sizing, drawdown check, Kelly |
+| API key infrastructure | ✅ | Fields en config, wizard prompt, env ready |
+| Config fields: `max_daily_loss_pct`, `max_drawdown_pct`, `max_open_positions` | ✅ | Defaults sensatos |
+| Config fields: `api_key`, `api_secret`, `sandbox`, `margin_mode` | ✅ | Para live trading futuro |
+| Monitor display: leverage, risk stats, daily PnL | ✅ | Clásico y Burst |
+| `_write_stats()` completo | ✅ | Incluye leverage, burst_leverage, burst_margin, dry_run, risk stats |
 
 ## 🟡 En recolección (activación automática por umbral)
 
@@ -104,7 +130,7 @@ Estos dos puntos quedan como follow-up documentado, no descartados.
 | **Buffered logs** | `_CappedStream` usa `buffering=8192` en vez de `1` (~90% menos syscalls) | code review |
 | **os.nice(10)** | Prioridad baja en child process para no competir con apps foreground en Android | code review |
 
-**Suite completa: 104 passed, 0 warnings.**
+**Suite completa: 137 passed, 0 warnings.**
 ## ❌ Descartados (no implementar)
 
 - VectorBT / Backtrader / pykalman — backtester propio ya corregido.
@@ -119,5 +145,5 @@ python -m pytest test_integration.py tests/ \
     ml_quant/test_standalone.py order_management/test_standalone.py \
     portfolio_construction/test_standalone.py regime_detection/test_standalone.py \
     risk_management/test_standalone.py
-# 76+ passed · 0 warnings
+# 137 passed · 0 warnings
 ```

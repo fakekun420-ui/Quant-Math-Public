@@ -7,7 +7,6 @@ periodic patterns and frequency components in time series data.
 
 import numpy as np
 from typing import Tuple, Dict, Optional
-import matplotlib.pyplot as plt
 from scipy.fft import fft, fftfreq
 
 
@@ -266,10 +265,11 @@ class HarmonicComponentAnalyzer:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         components = self.extract_harmonic_components(data, sampling_rate, n_harmonics)
-        
+
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
-        
+
         # Original signal
         ax1.plot(data, 'b-', label='Original Signal')
         ax1.set_title('Original Signal')
@@ -318,11 +318,12 @@ class HarmonicComponentAnalyzer:
         title : str, optional
             Plot title
         """
+        import matplotlib.pyplot as plt
         n = len(data)
         fft_result = fft(data)
         magnitude = np.abs(fft_result[:n // 2 + 1])
         frequencies = fftfreq(n, 1/sampling_rate)[:n // 2 + 1]
-        
+
         fig, ax = plt.subplots(figsize=figsize)
         
         # Plot spectrum

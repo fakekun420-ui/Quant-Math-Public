@@ -1,4 +1,4 @@
-# QUANT-MATH Architecture — v1.0.1
+# QUANT-MATH Architecture — v1.4.0
 
 > Fuente de verdad del pipeline en ejecución. El detalle histórico por
 > módulo vive en `ARCHITECTURE_GUIDE.md`; el estado de implementación en
@@ -21,8 +21,8 @@ AQDERunner ──────────┐
 Orchestrator.run_cycle()
 │  · dedupe por firma (refresh cada QUANTMATH_SIG_REFRESH_CYCLES=5)
 │  · publish → Knowledge Base
-│      PostgreSQL (microVM qcow2 persistente :15432)
-│        ⇄ fallback JSONL automático + seed inverso
+│      JSONL con atomic upsert (sin dependencias externas)
+│        ⇄ índice en memoria para búsqueda rápida
 │  · HypothesisPrior (supervisado, advisory)
 │  · SIS OperationLearningLoop (no supervisado, advisory)
 │  · ráfagas de exploración por racha de pérdidas
@@ -49,13 +49,12 @@ Feedback
 | CLI | `quant_math/cli/main.py` | Menú/wizard/monitor/historial; autoarranque VM PG; LEARN_MODE |
 | Orchestrator | `quant_math/orchestrator.py` | Ciclos, dedupe+refresh, publicación KB, stats |
 | Decision Engine | `quant_math/decision_engine/main.py` | Gate, TP/SL, posiciones, feedback key+familia |
-| Knowledge Base PG | `quant_math/ml/../adapters/postgres_kb.py` | Tabla por kb_path, seed JSONL↔PG, fallback |
+| Knowledge Base | `quant_math/autonomous_research/adapters/postgres_kb.py` | JSONL con atomic upsert, índice en memoria, search by status/symbol/combined |
 | Prior supervisado | `quant_math/ml/hypothesis_prior.py` | P(expectancy>0 \| tipo,símbolo) con shrinkage |
 | SIS no supervisado | `quant_math/ml/regime_learning.py` | KMeans + tablas régimen×familia + rachas |
 | Feature store | `quant_math/ml/feature_store.py` | Ledger↔KB→dataset con cutoff integración |
 | Model generator | `model_based_generator.py` | ARIMA/GARCH → candidatos con `_regime` |
 | Reset base | `tools/reset_learning_base.py` | Archiva KB, fija cutoff, limpia fantasmas |
-| MicroVM PG | `/var/lib/quantmath-pgvm/boot_pg_vm.py` | Alpine+PostgreSQL17 en qcow2 4G persistente |
 
 ## Garantías invariantes
 
