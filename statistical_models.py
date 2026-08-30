@@ -86,7 +86,7 @@ class ARIMAModel:
             try:
                 ar_coeff = np.linalg.solve(r[:, np.newaxis] * np.eye(self.p), acf)
                 ar_coeff = np.concatenate([[1], -ar_coeff])
-            except:
+            except Exception:
                 ar_coeff = np.ones(self.p + 1)
         else:
             ar_coeff = np.array([1.0])
@@ -348,7 +348,7 @@ class ARCHModel:
                 lr = LinearRegression()
                 lr.fit(X, y)
                 self.arch_coefficients = np.concatenate([lr.intercept_, lr.coef_])
-            except:
+            except Exception:
                 self.arch_coefficients = np.ones(self.lags + 1)
         
         return volatility
@@ -453,7 +453,7 @@ class GARCHModel(ARCHModel):
                 lr = LinearRegression()
                 lr.fit(X, y)
                 self.garch_coefficients = np.concatenate([lr.intercept_, lr.coef_[:self.lags], lr.coef_[self.lags:]])
-            except:
+            except Exception:
                 self.garch_coefficients = np.ones(2 * self.lags + 1)
         
         return volatility

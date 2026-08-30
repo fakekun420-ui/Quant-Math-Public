@@ -5,7 +5,7 @@ A modular system for autonomous hypothesis discovery and validation
 within the quant-math framework.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.5.0"
 __author__ = "AQDE Team"
 __description__ = "Autonomous hypothesis discovery engine for quantitative trading"
 

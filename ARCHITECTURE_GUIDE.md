@@ -1,7 +1,7 @@
 # ARCHITECTURE GUIDE (v0.x — referencia histórica por módulo)
 
 > ⚠️ **DOCUMENTO HISTÓRICO (v0.x).** La arquitectura EN EJECUCIÓN de
-> Quant-Math v1.4.0 vive en `ARCHITECTURE.md` (pipeline AQDE → gate → SIS,
+> Quant-Math v1.5.0 vive en `ARCHITECTURE.md` (pipeline AQDE → gate → SIS,
 > Knowledge Base JSONL con atomic upsert, LEARN_MODE, riesgo 2:1).
 > Las secciones siguientes permanecen válidas como detalle profundo de los
 > módulos base; los estados/checklists que contengan pueden estar desactualizados.
@@ -179,13 +179,9 @@ quant_math/                          # ROOT PACKAGE (single entry point)
 │   ├── __init__.py
 │   └── regime_detection.py
 │
-├── signal_processing/               # QUANT-MATH: Signal (ORPHAN — optional)
-├── spectral_analysis/               # QUANT-MATH: Spectral (ORPHAN — optional)
-├── pca_analysis/                    # QUANT-MATH: PCA (ORPHAN — fix/remove)
-├── portfolio_construction/          # QUANT-MATH: Portfolio (ORPHAN — optional)
-├── modeling/                        # QUANT-MATH: Modeling (ORPHAN — optional)
-├── volatility/                      # QUANT-MATH: Volatility (ORPHAN — optional)
-├── utils/                           # QUANT-MATH: Utils (ORPHAN — optional)
+├── signal_processing/               # QUANT-MATH: Signal (root package)
+├── spectral_analysis/               # QUANT-MATH: Spectral (root package)
+├── portfolio_construction/          # QUANT-MATH: Portfolio (root package)
 │
 ├── tests/                           # UNIFIED TEST SUITE
 │   ├── __init__.py

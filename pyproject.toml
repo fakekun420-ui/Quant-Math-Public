@@ -4,22 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-math"
-version = "1.4.0"
+version = "1.5.0"
 description = "Quantitative Mathematics Framework for Algorithmic Trading"
 readme = "README.md"
 authors = [
     {name = "Quant-Math Team", email = "team@quant-math.org"}
 ]
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Financial and Insurance Industry",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 dependencies = [
@@ -87,14 +87,14 @@ python_functions = ["test_*"]
 addopts = "-v --tb=short"
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 line-length = 100
 select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM", "T20"]
 ignore = ["E501", "B008", "C901"]
 exclude = [".git", "__pycache__", "*.pyc", "build", "dist", ".eggs"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

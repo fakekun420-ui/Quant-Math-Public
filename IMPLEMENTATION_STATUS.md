@@ -1,4 +1,4 @@
-# QUANT-MATH Implementation Status — v1.4.0
+# QUANT-MATH Implementation Status — v1.5.0
 
 Estado real verificado con la suite completa (137 tests, 0 warnings).
 
@@ -17,7 +17,6 @@ Estado real verificado con la suite completa (137 tests, 0 warnings).
 | `quant_math/cli/main.py` | ✅ | Menú/wizard/monitor/historial, autoarranque VM PG, log rotativo |
 | `quant_math/ml/` | ✅ | Prior supervisado (active), SIS KMeans+regímenes, feature store con cutoff, reset base |
 | `model_based_generator.py` | ✅ | ARIMA/GARCH → candidatos ejecutables con contexto `_regime` |
-| PostgreSQL KB | ✅ | MicroVM qcow2 persistente (:15432), tabla por kb_path, seed JSONL↔PG, fallback total |
 
 ## 🔧 v1.4.1 — Mantenimiento (2026-08-29)
 
@@ -25,11 +24,23 @@ Estado real verificado con la suite completa (137 tests, 0 warnings).
 |---|---|
 | **FFT lazy import** | `spectral_analysis/*.py`: `matplotlib.pyplot` movido a lazy import dentro de métodos `plot_*`. `_dominant_cycle()` ahora funciona en entornos sin display. |
 | **Dependencias CLI** | `questionary` y `rich` añadidos a `requirements.txt` y `pyproject.toml`. CLI instalable desde limpio. |
-| **Versión unificada** | `pyproject.toml` sincronizado a v1.4.0 (consistente con README). |
+| **Versión unificada** | `pyproject.toml` sincronizado a v1.5.0 (consistente con README). |
 | **Gitignore** | Añadidos `*.pyo`, `*.log` genérico, `.pytest_cache/`, `.opencode/`, `graphify-out/`. |
 | **Limpieza tracking** | `__pycache__/*.pyc` y `graphify-out/` eliminados del índice git. |
 
-## 🟡 v1.5.0 — Futures Integration + Risk Management (en progreso)
+## ✅ v1.5.0 — Refactor + PCA + Consolidación (2026-08-30)
+
+| Feature | Estado | Detalle |
+|---|---|---|
+| **pca_analysis** | ✅ | PCA financiero, returns decomposition, risk factors, covariance shrinkage (21 tests) |
+| **Consolidación módulos** | ✅ | `expectation/`, `risk/`, `monte_carlo/` consolidados bajo `quant_math/` |
+| **risk_management → quant_math.risk** | ✅ | `PortfolioRisk`, `RiskBudget`, `StressTesting` integrados |
+| **Limpieza stubs** | ✅ | Eliminados `modeling/`, `volatility/`, `utils/`, `Monitor`, `progreso_qwen.txt` |
+| **CI/CD** | ✅ | GitHub Actions con matrix Python 3.10/3.11/3.12 |
+| **Graphify index** | ✅ | Knowledge graph regenerado (2,713 nodos, 4,488 edges) |
+| **Versión** | ✅ | Unificada a 1.5.0 en todo el codebase |
+
+## 🟡 v1.5.0 — Futures Integration + Risk Management (previo)
 
 | Feature | Estado | Detalle |
 |---|---|---|

@@ -1,4 +1,4 @@
-# QUANT-MATH Architecture — v1.4.0
+# QUANT-MATH Architecture — v1.5.0
 
 > Fuente de verdad del pipeline en ejecución. El detalle histórico por
 > módulo vive en `ARCHITECTURE_GUIDE.md`; el estado de implementación en

@@ -1,13 +1,12 @@
-# QUANT-MATH v1.4.0 — Autonomous Quantitative Research System
+# QUANT-MATH v1.5.0 — Autonomous Quantitative Research System
 
 Self-improving quantitative trading research system: an AQDE engine generates
 market-driven hypotheses, a mathematical gate validates them against **real
 Bybit data**, and an unsupervised learning loop (SIS) learns from every closed
 operation to continuously improve what gets generated next.
 
-> **v1.4.0** — PostgreSQL VM eliminated, JSONL-only KB with atomic upsert,
-> stop buttons fixed, realistic $50 defaults, 137 tests. Lazy matplotlib
-> imports, CLI dependencies declared.
+> **v1.5.0** — Module consolidation, PCA analysis implementation, legacy
+> stubs removed, CI/CD pipeline, 27+ tests passing.
 
 ## How It Works
 

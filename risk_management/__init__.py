@@ -14,7 +14,7 @@ from .risk_management import (
     ValueAtRisk, ExpectedShortfall, PortfolioRisk, RiskBudget, StressTesting
 )
 
-__version__ = "1.0.0"
+__version__ = "1.5.0"
 __all__ = [
     'ValueAtRisk',
     'ExpectedShortfall',

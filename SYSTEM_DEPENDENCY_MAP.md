@@ -3,7 +3,7 @@
 > ⚠️ **SNAPSHOT HISTÓRICO — era Termux (2026-08-05).** Este audit fue
 > generado en el entorno anterior (`/data/data/com.termux/...`) y refleja
 > 84 archivos Python pre-reconstrucción. La arquitectura y dependencias
-> VIGENTES de Quant-Math v1.0.1 están en `ARCHITECTURE.md`.
+> VIGENTES de Quant-Math v1.5.0 están en `ARCHITECTURE.md`.
 >
 > **Δ principal desde este snapshot:** nuevo stack ML/SIS
 > (`quant_math/ml/`: prior, feature_store, regime_learning, kalman,

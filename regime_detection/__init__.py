@@ -13,7 +13,7 @@ from .regime_detection import (
     HiddenMarkovModel, RegimeDetector, RegimeClusterer
 )
 
-__version__ = "1.0.0"
+__version__ = "1.5.0"
 __all__ = [
     'HiddenMarkovModel',
     'RegimeDetector',

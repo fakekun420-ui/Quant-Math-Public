@@ -13,7 +13,7 @@ from ..adapters import QuantMathAdapter
 
 
 @click.group()
-@click.version_option(version="1.0.1")
+@click.version_option(version="1.5.0")
 def cli():
     """Autonomous Quant Discovery Engine CLI"""
     pass

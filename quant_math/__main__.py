@@ -17,7 +17,7 @@ def main():
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.0"
+        version="%(prog)s 1.5.0"
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -71,28 +71,18 @@ def show_info() -> int:
     print("=" * 60)
     print("QUANT-MATH Framework")
     print("=" * 60)
-    print("Version: 0.1.0")
+    print("Version: 1.5.0")
     print("Description: Quantitative Mathematics for Algorithmic Trading")
     print("=" * 60)
     print("\nCore Modules:")
     modules = [
         "quant_math.expectation",
         "quant_math.risk",
-        "quant_math.optimization",
         "quant_math.monte_carlo",
-        "quant_math.portfolio_construction",
         "quant_math.pca_analysis",
         "quant_math.ml",
-        "quant_math.spectral_analysis",
-        "quant_math.regime_detection",
-        "quant_math.signal_processing",
-        "quant_math.data_processing",
-        "quant_math.data_acquisition",
-        "quant_math.order_management",
-        "quant_math.execution",
-        "quant_math.algo_trading",
-        "quant_math.backtesting",
-        "autonomous_research",
+        "quant_math.decision_engine",
+        "quant_math.autonomous_research",
     ]
     for m in modules:
         print(f"  - {m}")
@@ -111,20 +101,10 @@ def list_modules() -> int:
     modules = {
         "expectation": "Statistical tests and performance metrics",
         "risk": "Risk management (VaR, ES, Position Sizing, Kelly, PortfolioRisk)",
-        "optimization": "Portfolio optimization and Kelly criterion",
         "monte_carlo": "Monte Carlo simulation engine",
-        "portfolio_construction": "Portfolio building and optimization",
         "pca_analysis": "PCA decomposition, risk factors, covariance shrinkage",
         "ml": "Machine learning for quantitative finance",
-        "spectral_analysis": "Spectral and frequency domain analysis",
-        "regime_detection": "Market regime detection",
-        "signal_processing": "Signal processing and filtering",
-        "data_processing": "Data cleaning and preprocessing",
-        "data_acquisition": "Market data fetching and storage",
-        "order_management": "Order routing and management",
-        "execution": "Trade execution algorithms",
-        "algo_trading": "Algorithmic trading system",
-        "backtesting": "Strategy backtesting framework",
+        "decision_engine": "Expectancy gate, TP/SL, burst sizing",
         "autonomous_research": "AQDE - Autonomous hypothesis discovery",
     }
     for name, desc in modules.items():

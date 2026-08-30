@@ -7,7 +7,7 @@ All modules consolidated under quant_math/ package.
 
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 __author__ = "QUANT-MATH Team"
 __all__ = [
     # Expectation
