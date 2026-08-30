@@ -70,7 +70,7 @@ from quant_math.monte_carlo import (
     calculate_var_es,
 )
 
-# Optimization
+# Optimization (root package - not yet consolidated)
 from optimization import (
     KellyCriterion as OptKellyCriterion,
     MeanVarianceOptimizer,

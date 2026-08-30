@@ -162,3 +162,12 @@ class PositionSizer:
             "atr_multiplier": atr_multiplier,
             "max_risk": max_risk
         }
+
+    @staticmethod
+    def calculate(portfolio_value: float, risk_per_trade: float,
+                  stop_loss_distance: float) -> float:
+        """Legacy static API: calculate position size in shares."""
+        if stop_loss_distance == 0:
+            return 0.0
+        max_risk = portfolio_value * risk_per_trade
+        return max_risk / stop_loss_distance

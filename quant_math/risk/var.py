@@ -29,8 +29,8 @@ class ValueAtRisk:
 
     def calculate(
         self,
-        mean_return: float,
-        std_return: float,
+        mean_return: float = 0.0,
+        std_return: float = 0.0,
         confidence: Optional[float] = None,
         method: Optional[str] = None,
         skewness: float = 0.0,
@@ -40,18 +40,20 @@ class ValueAtRisk:
         """
         Calculate Value at Risk.
 
-        Args:
-            mean_return: Mean return
-            std_return: Standard deviation of returns
-            confidence: Confidence level (uses default if None)
-            method: VaR method (uses default if None)
-            skewness: Return skewness
-            kurtosis: Return kurtosis
-            portfolio_value: Portfolio value for absolute VaR
-
-        Returns:
-            VaR as positive number (maximum expected loss)
+        Supports two call styles:
+            Instance: ValueAtRisk(0.95).calculate(mean, std) -> float
+            Class:    ValueAtRisk.calculate(portfolio_value, std, confidence) -> float
         """
+        # Class-style call: ValueAtRisk.calculate(portfolio_value, std, confidence)
+        if not isinstance(self, ValueAtRisk):
+            portfolio_value = self
+            std_return = mean_return if std_return == 0.0 else std_return
+            conf = confidence if confidence is not None else 0.95
+            alpha = 1 - conf
+            z_score = ValueAtRisk._norm_ppf(alpha)
+            var = -(0 + z_score * std_return) * portfolio_value
+            return max(0.0, var)
+
         confidence = confidence or self.default_confidence
         method = method or self.default_method
 
@@ -336,4 +338,4 @@ def calculate_var(portfolio_value: float, volatility: float, confidence_level: f
 def expected_shortfall(portfolio_value: float, volatility: float, confidence_level: float = 0.95) -> float:
     """Calculate Expected Shortfall using normal distribution (legacy API)."""
     es_calc = ExpectedShortfall()
-    return es_calculate(0.0, volatility, confidence_level, "parametric", 0.0, 3.0, portfolio_value)
+    return es_calc.calculate(0.0, volatility, confidence_level, "parametric", 0.0, 3.0, portfolio_value)

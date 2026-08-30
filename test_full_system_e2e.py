@@ -404,7 +404,7 @@ def run_full_e2e_test():
     print_stage(6, "RISK VALIDATION - ValueAtRisk, ExpectedShortfall, PortfolioRisk, StressTesting")
 
     try:
-        from risk_management import ValueAtRisk, ExpectedShortfall, PortfolioRisk, StressTesting
+        from quant_math.risk import ValueAtRisk, ExpectedShortfall, PortfolioRisk, StressTesting
 
         if results["stage_4_backtesting"]:
             portfolio_value = 100000.0

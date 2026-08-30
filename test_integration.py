@@ -21,7 +21,7 @@ import numpy as np
 from backtesting import Backtester, PerformanceMetrics, Trade, BacktestResult
 from order_management import OrderManager
 from algo_trading import AlgoTradingSystem
-from risk import PositionSizer, ValueAtRisk, ExpectedShortfall
+from quant_math.risk import PositionSizer, ValueAtRisk, ExpectedShortfall
 from optimization import KellyCriterion
 from quant_math.expectation import ReturnCalculator, DrawdownAnalyzer, SharpeMetrics
 
