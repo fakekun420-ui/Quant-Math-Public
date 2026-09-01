@@ -17,3 +17,4 @@ runtime/
 
 # Knowledge graph index (generated, large)
 graphify-out/
+.venv/

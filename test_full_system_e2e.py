@@ -413,18 +413,20 @@ def run_full_e2e_test():
             returns = np.array([t.pnl_pct for t in bt_result.trades]) if bt_result.trades else np.array([0.0])
 
             # Value at Risk
-            var_95 = ValueAtRisk.historical(returns, confidence=0.95)
-            var_99 = ValueAtRisk.historical(returns, confidence=0.99)
+            var_calc = ValueAtRisk(default_confidence=0.95)
+            var_95 = var_calc.calculate_from_returns(returns, confidence=0.95)
+            var_99 = var_calc.calculate_from_returns(returns, confidence=0.99)
             print_result("ValueAtRisk (Historical)", True,
                          f"VaR 95%: ${abs(var_95)*portfolio_value:,.2f}, VaR 99%: ${abs(var_99)*portfolio_value:,.2f}")
 
             # Parametric VaR
             portfolio_std = returns.std() if len(returns) > 1 else 0.02
-            var_param = ValueAtRisk.parametric_normal(portfolio_value, portfolio_std, 0.95)
+            var_param = var_calc.calculate(mean_return=returns.mean(), std_return=portfolio_std, confidence=0.95, portfolio_value=portfolio_value)
             print_result("ValueAtRisk (Parametric)", True, f"VaR 95%: ${var_param:,.2f}")
 
             # Expected Shortfall
-            es_95 = ExpectedShortfall.historical(returns, confidence=0.95)
+            es_calc = ExpectedShortfall(default_confidence=0.95)
+            es_95 = es_calc.calculate_from_returns(returns, confidence=0.95)
             print_result("ExpectedShortfall", True, f"ES 95%: ${abs(es_95)*portfolio_value:,.2f}")
 
             # Portfolio Risk

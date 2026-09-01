@@ -1,0 +1,3 @@
+[console_scripts]
+aqde = quant_math.autonomous_research.cli:cli
+quant-math = quant_math.__main__:main
