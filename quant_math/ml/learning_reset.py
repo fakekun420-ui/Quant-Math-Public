@@ -125,29 +125,8 @@ def reset_learning_base(kb_jsonl: str, state_dir: str,
         archived = os.path.join(archive_dir, f"hypotheses_{ts}.jsonl")
         shutil.copy2(kb_jsonl, archived)
 
-    # 2) archivar y vaciar tabla(s) PostgreSQL si alcanzables
-    pg_info = ""
-    try:
-        from quant_math.autonomous_research.adapters.postgres_kb import (
-            PostgreSQLKnowledgeBase)
-        kb = PostgreSQLKnowledgeBase(
-            storage_path=os.path.dirname(kb_jsonl) or ".",
-            dsn=dsn, jsonl_fallback=kb_jsonl)
-        if kb.is_available():
-            records = kb._pg_load_all()
-            if records:
-                dump = os.path.join(archive_dir, f"hypotheses_pg_{ts}.jsonl")
-                with open(dump, "w", encoding="utf-8") as fh:
-                    for rec in records.values():
-                        fh.write(json.dumps(rec, ensure_ascii=False,
-                                            default=str) + "\n")
-                with kb._conn.cursor() as cur:
-                    cur.execute(f"DELETE FROM {kb.table}")
-                pg_info = f"; PG: {len(records)} registros archivados+borrados"
-            else:
-                pg_info = "; PG ya estaba vacio"
-    except Exception as exc:
-        pg_info = f"; PG no tocado ({exc.__class__.__name__})"
+    # 2) PG eliminado — JSONL puro, nada que archivar en tabla
+    pg_info = "; PG eliminado (JSONL puro)"
 
     # 3) truncar JSONL del KB (queda vacio para la nueva integracion)
     with open(kb_jsonl, "w", encoding="utf-8") as fh:

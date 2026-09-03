@@ -182,11 +182,7 @@ def build_prior_from_kb(kb_path: str,
                         dsn: Optional[str] = None) -> HypothesisPrior:
     """Load every historical record (PG first, JSONL fallback) and fit."""
     from quant_math.autonomous_research.adapters.postgres_kb import (
-        PostgreSQLKnowledgeBase,
+        JSONLKnowledgeBase,
     )
-    kb = PostgreSQLKnowledgeBase(
-        storage_path=os.path.dirname(kb_path) or ".",
-        dsn=dsn,
-        jsonl_fallback=kb_path,
-    )
+    kb = JSONLKnowledgeBase(jsonl_path=kb_path)
     return HypothesisPrior.from_records(kb.load_records().values())
