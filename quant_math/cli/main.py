@@ -439,6 +439,12 @@ def wizard() -> Optional[Dict]:
         initial_capital = ask_float("Capital inicial (USD)", "50", lo=0)
         if initial_capital is None:
             return None
+
+        # Leverage selection (per first symbol, applied to all)
+        leverage = ask_leverage(symbols[0], "bybit", "classic")
+        if leverage is None:
+            return None
+
         entry_pct = ask_float("% de capital por entrada (0-1]", "0.02", hi=1)
         if entry_pct is None:
             return None
@@ -475,6 +481,7 @@ def wizard() -> Optional[Dict]:
             "interval_seconds": 60,
             "exchange_id": "bybit",
             "dry_run": True,                # paper trading only
+            "leverage": leverage,
         }
     except (AttributeError):
         # ESC / pregunta cancelada -> volver al menú.
@@ -536,10 +543,11 @@ def burst_wizard() -> Optional[Dict]:
         margin = ask_float("Margen por entrada (USD, min 1)", "1", lo=1)
         if margin is None:
             return None
-        leverage = ask_int("Leverage (1-20)", "5", lo=1)
+
+        # Leverage selection (per first symbol, applied to all)
+        leverage = ask_leverage(symbols[0], "bybit", "burst")
         if leverage is None:
             return None
-        leverage = max(1, min(20, leverage))
 
         timeframe = questionary.select(
             "Timeframe:", choices=["1m", "5m", "15m", "1h"],
@@ -656,6 +664,58 @@ def fetch_top_volume_assets(exchange_id: str = "bybit", n: int = 20) -> list:
             break
     return result if result else [
         "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+
+
+def get_max_leverage(exchange_id: str, symbol: str) -> int:
+    """Fetch max leverage from Bybit for a given symbol. Returns 20 on error."""
+    try:
+        import ccxt
+        ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+        ex.load_markets()
+        # Try both formats: BTC/USDT and BTC/USDT:USDT
+        market_sym = symbol
+        if ":" not in symbol and symbol.endswith("/USDT"):
+            market_sym = symbol + ":USDT"
+        if market_sym in ex.markets:
+            lev = ex.markets[market_sym].get("limits", {}).get("leverage", {})
+            max_lev = lev.get("max", 20)
+            return int(max_lev) if max_lev else 20
+        return 20
+    except Exception:
+        return 20
+
+
+def ask_leverage(symbol: str, exchange_id: str = "bybit", mode: str = "classic") -> Optional[int]:
+    """Ask user if they want leverage, then show interactive level selection."""
+    use_lev = questionary.select(
+        f"Operar con apalancamiento para {symbol}?",
+        choices=[
+            questionary.Choice("No (sin apalancamiento)", value=False),
+            questionary.Choice("Sí", value=True),
+        ]).unsafe_ask()
+    if use_lev is None:
+        return None
+    if not use_lev:
+        return 1
+
+    max_lev = get_max_leverage(exchange_id, symbol)
+    # Build sensible leverage levels up to max
+    standard_levels = [1, 2, 3, 5, 10, 15, 20, 25, 50, 75, 100, 125, 150]
+    levels = [l for l in standard_levels if l <= max_lev]
+    if not levels:
+        levels = [1]
+    if max_lev not in levels:
+        levels.append(max_lev)
+
+    choices = [questionary.Choice(f"{l}x", value=l) for l in levels]
+    default_lev = 10 if 10 in levels else levels[0]
+    lev = questionary.select(
+        f"Nivel de apalancamiento (máx {max_lev}x para {symbol}):",
+        choices=choices,
+        default=default_lev).unsafe_ask()
+    if lev is None:
+        return None
+    return lev
 
 
 def _read_paper_trades(state_dir: str):
@@ -875,7 +935,7 @@ def render_monitor(runtime: RuntimeState, mode: str = "classic"):
     for key in ("symbols", "timeframe", "initial_capital", "entry_pct",
                 "take_profit_pct", "stop_loss_pct", "lookback_days",
                 "min_paper_trades", "hypotheses_per_cycle", "exchange_id",
-                "mode"):
+                "mode", "leverage"):
         if key in cfg:
             config_panel.add_row(key, str(cfg[key]))
 
@@ -1311,7 +1371,7 @@ def render_burst_monitor(runtime: RuntimeState, mode: str = "burst"):
     for key in ("symbols", "timeframe", "initial_capital",
                 "take_profit_pct", "stop_loss_pct", "lookback_days",
                 "min_paper_trades", "hypotheses_per_cycle", "exchange_id",
-                "mode", "burst_margin", "burst_leverage"):
+                "mode", "burst_margin", "burst_leverage", "leverage"):
         if key in cfg:
             config_panel.add_row(key, str(cfg[key]))
 
@@ -1427,6 +1487,58 @@ def _ask_mode(runtime: RuntimeState, require_running: bool = True) -> Optional[s
         return None
 
 
+def _clean_history(runtime: RuntimeState):
+    """Archive and clean all operation history files."""
+    # Check if any mode is running
+    if runtime.any_running():
+        console.print("[red]Detené Quant-Math y Burst antes de limpiar el historial.[/red]")
+        return
+
+    confirm = questionary.select(
+        "Esto archivará y limpiará TODAS las operaciones (activas, cerradas, KB). ¿Continuar?",
+        choices=[
+            questionary.Choice("No, cancelar", value=False),
+            questionary.Choice("Sí, limpiar todo", value=True),
+        ]).unsafe_ask()
+    if not confirm:
+        console.print("[dim]Cancelado.[/dim]")
+        return
+
+    import shutil
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    archive_dir = os.path.join(PROJECT_ROOT, "runtime", "archive", f"clean_{timestamp}")
+    os.makedirs(archive_dir, exist_ok=True)
+
+    files_to_clean = [
+        # Classic state
+        os.path.join(PROJECT_ROOT, "runtime", "state", "paper_executions.jsonl"),
+        os.path.join(PROJECT_ROOT, "runtime", "state", "paper_trades.jsonl"),
+        os.path.join(PROJECT_ROOT, "runtime", "state", "positions.jsonl"),
+        os.path.join(PROJECT_ROOT, "runtime", "state", "runtime_stats.json"),
+        os.path.join(PROJECT_ROOT, "runtime", "state", "learning_meta.json"),
+        os.path.join(PROJECT_ROOT, "runtime", "state", "graduation.json"),
+        # Burst state
+        os.path.join(PROJECT_ROOT, "runtime", "state_burst", "paper_executions.jsonl"),
+        os.path.join(PROJECT_ROOT, "runtime", "state_burst", "paper_trades.jsonl"),
+        os.path.join(PROJECT_ROOT, "runtime", "state_burst", "positions.jsonl"),
+        os.path.join(PROJECT_ROOT, "runtime", "state_burst", "runtime_stats.json"),
+        os.path.join(PROJECT_ROOT, "runtime", "state_burst", "burst_state.json"),
+        # KB files
+        os.path.join(PROJECT_ROOT, "runtime", "hypotheses.jsonl"),
+        os.path.join(PROJECT_ROOT, "runtime", "hypotheses_burst.jsonl"),
+    ]
+
+    cleaned = 0
+    for f in files_to_clean:
+        if os.path.exists(f) and os.path.getsize(f) > 0:
+            shutil.copy2(f, archive_dir)
+            with open(f, "w") as fh:
+                pass
+            cleaned += 1
+
+    console.print(f"[green]Historial limpiado: {cleaned} archivos archivados en {archive_dir}[/green]")
+
+
 def main():
     runtime = RuntimeState()
     # Detect orphan processes from previous sessions
@@ -1461,6 +1573,8 @@ def main():
                         questionary.Choice("Ver log", value="log"),
                         questionary.Choice("Historial de operaciones",
                                            value="history"),
+                        questionary.Choice("Limpiar historial",
+                                           value="clean_history"),
                         questionary.Choice("Minimizar (seguir en background)",
                                            value="minimize"),
                         questionary.Choice("Salir", value="quit"),
@@ -1577,6 +1691,9 @@ def _dispatch(runtime: RuntimeState, action: str):
             view_burst_history()
         else:
             view_history(runtime)
+
+    elif action == "clean_history":
+        _clean_history(runtime)
 
     elif action == "minimize":
         running = runtime.any_running()

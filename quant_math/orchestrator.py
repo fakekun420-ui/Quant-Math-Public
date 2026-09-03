@@ -62,6 +62,9 @@ class OrchestratorConfig:
     burst_margin: float = 10.0              # USD margin per burst entry
     burst_leverage: int = 10                # leverage multiplier (1-20)
 
+    # Classic-mode leverage (1 = no leverage)
+    leverage: int = 1                       # leverage multiplier for classic mode
+
     def __post_init__(self):
         if not self.symbols:
             raise ValueError("symbols no puede estar vacío")
@@ -86,6 +89,8 @@ class OrchestratorConfig:
             self.burst_margin = max(1.0, self.burst_margin)
             self.burst_leverage = max(1, min(20, self.burst_leverage))
             self.take_profit_pct = max(0.02, min(0.50, self.take_profit_pct))
+        # Classic leverage validation
+        self.leverage = max(1, int(self.leverage))
 
 
 # ---------------------------------------------------------------------------
@@ -608,8 +613,9 @@ class Orchestrator:
             notional = margin * leverage
         else:
             # O6: nocional escalado por vol-target (clampeado en el engine)
-            notional = (self.config.initial_capital * self.config.entry_pct
-                        * float(signal.get("sizing_mult", 1.0)))
+            base_notional = (self.config.initial_capital * self.config.entry_pct
+                             * float(signal.get("sizing_mult", 1.0)))
+            notional = base_notional * self.config.leverage
         quantity = notional / price
         tp_price = price * (1 + self.config.take_profit_pct) if side == "buy" \
             else price * (1 - self.config.take_profit_pct)
@@ -631,6 +637,8 @@ class Orchestrator:
         if self.config.mode == "burst":
             trade["margin_usd"] = margin
             trade["leverage"] = leverage
+        elif self.config.leverage > 1:
+            trade["leverage"] = self.config.leverage
         trades_path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
         os.makedirs(self.config.state_dir, exist_ok=True)
         with open(trades_path, "a", encoding="utf-8") as fh:
