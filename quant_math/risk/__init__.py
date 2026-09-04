@@ -8,6 +8,7 @@ from .position_sizing import PositionSizer
 from .stop_loss import StopLoss
 from .var import ValueAtRisk, ExpectedShortfall
 from .portfolio_risk import PortfolioRisk, RiskBudget, StressTesting
+from .circuit_breaker import DailyGuard, utc_today, utc_day_start_ts
 
 __all__ = [
     "KellyCriterion",
@@ -21,4 +22,7 @@ __all__ = [
     "PortfolioRisk",
     "RiskBudget",
     "StressTesting",
+    "DailyGuard",
+    "utc_today",
+    "utc_day_start_ts",
 ]

@@ -32,6 +32,8 @@ class Trade:
     entry_time: float
     exit_time: float
     commission: float
+    liquidated: bool = False       # True if closed by liquidation (leverage)
+    funding_paid: float = 0.0      # total funding paid while holding
 
 
 @dataclass
@@ -52,6 +54,8 @@ class BacktestResult:
     profit_factor: float
     trades: List[Trade]
     equity_curve: List[Tuple[float, float]]
+    num_liquidations: int = 0
+    total_funding_paid: float = 0.0
 
 
 @dataclass
@@ -581,9 +585,18 @@ class Backtester:
     Executes strategy backtests and calculates performance metrics.
     """
 
+    # Futures realism defaults (Bybit USDT perpetuals)
+    DEFAULT_FUNDING_8H = 0.0001      # 0.01% per 8h funding interval
+    DEFAULT_SLIPPAGE_PCT = 0.0001   # 1bp adverse fill
+    MAINTENANCE_MARGIN_RATE = 0.005  # 0.5% maintenance margin
+
     def __init__(self, initial_capital: float = 100000.0,
                  commission_rate: float = 0.001,
-                 min_commission: float = 0.0):
+                 min_commission: float = 0.0,
+                 slippage_pct: float = 0.0,
+                 leverage: float = 1.0,
+                 funding_rate_8h: float = 0.0,
+                 timeframe: str = "1h"):
         """
         Initialize backtester.
 
@@ -595,10 +608,80 @@ class Backtester:
             Commission rate
         min_commission : float
             Minimum commission
+        slippage_pct : float
+            Adverse slippage per fill as fraction (e.g. 0.0001 = 1bp).
+            0.0 preserves legacy exact-fill behaviour.
+        leverage : float
+            Position leverage. 1.0 = spot (legacy behaviour). >1 scales PnL,
+            posts margin instead of full notional, and enables liquidation.
+        funding_rate_8h : float
+            Perpetual funding rate per 8h as fraction of notional
+            (e.g. 0.0001 = 0.01%). 0.0 disables.
+        timeframe : str
+            Candle timeframe ('1m','5m','15m','1h','4h','1d') used to convert
+            bars held into hours for funding accrual.
         """
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
         self.min_commission = min_commission
+        self.slippage_pct = max(0.0, float(slippage_pct))
+        self.leverage = max(1.0, float(leverage))
+        self.funding_rate_8h = float(funding_rate_8h)
+        self.timeframe = timeframe
+
+    # ------------------------------------------------------------------
+    # Futures realism helpers
+    # ------------------------------------------------------------------
+
+    def _timeframe_hours(self) -> float:
+        """Hours per candle for funding accrual."""
+        tf = (self.timeframe or "1h").strip().lower()
+        try:
+            if tf.endswith("m"):
+                return float(tf[:-1]) / 60.0
+            if tf.endswith("h"):
+                return float(tf[:-1])
+            if tf.endswith("d"):
+                return float(tf[:-1]) * 24.0
+        except ValueError:
+            pass
+        return 1.0
+
+    def _adverse_fill(self, price: float, side: str) -> float:
+        """Adverse slippage fill: buy pays more, sell receives less."""
+        if side == "buy":
+            return price * (1.0 + self.slippage_pct)
+        return price * (1.0 - self.slippage_pct)
+
+    def _fee(self, notional: float) -> float:
+        return max(self.min_commission, notional * self.commission_rate)
+
+    def _funding_cost(self, notional: float, bars_held: int) -> float:
+        """Funding paid for holding `bars_held` bars at current notional."""
+        if self.funding_rate_8h == 0.0 or bars_held <= 0:
+            return 0.0
+        hours = bars_held * self._timeframe_hours()
+        return notional * self.funding_rate_8h * (hours / 8.0)
+
+    def _liq_price_long(self, entry_price: float) -> Optional[float]:
+        """Liquidation price for a long at configured leverage (None if spot)."""
+        if self.leverage <= 1.0:
+            return None
+        drop = 1.0 / self.leverage - self.MAINTENANCE_MARGIN_RATE
+        if drop <= 0:
+            return None
+        return entry_price * (1.0 - drop)
+
+    def _touched_liq(self, series: np.ndarray, entry_idx: int,
+                     exit_idx: int, liq_price: Optional[float]) -> bool:
+        """True if any bar low (close series proxy) touched liquidation."""
+        if liq_price is None:
+            return False
+        lo = int(max(0, entry_idx))
+        hi = int(min(len(series), exit_idx + 1))
+        if hi <= lo:
+            return False
+        return bool(np.min(series[lo:hi]) <= liq_price)
 
     def run_backtest(self, strategy_func: Callable, data: Dict[str, np.ndarray],
                     initial_capital: Optional[float] = None) -> BacktestResult:
@@ -625,6 +708,9 @@ class Backtester:
         capital = initial_capital
         orders = strategy_func(data)
         trades = []
+        # Mutable counters shared with fill logic below
+        num_liquidations = [0]
+        total_funding_paid = [0.0]
 
         # Simulate execution - only process non-hold orders
         executed_orders = []
@@ -664,40 +750,66 @@ class Backtester:
             price = data[symbol][i]
 
             if side == 'buy' and quantity > 0:
-                cost = quantity * price + max(self.min_commission, quantity * price * self.commission_rate)
-                if current_capital >= cost:
-                    current_capital -= cost
+                fill = self._adverse_fill(price, 'buy')
+                margin = quantity * fill / self.leverage
+                entry_fee = self._fee(quantity * fill)
+                if current_capital >= margin + entry_fee:
+                    current_capital -= (margin + entry_fee)
                     # Track open position
                     open_positions[symbol] = {
                         'side': 'long',
                         'quantity': quantity,
-                        'entry_price': price,
-                        'entry_commission': max(self.min_commission, quantity * price * self.commission_rate),
+                        'entry_price': fill,
+                        'margin': margin,
+                        'entry_commission': entry_fee,
                         'entry_index': i
                     }
                 equity_curve.append(current_capital)
 
             elif side == 'sell' and quantity > 0:
-                proceeds = quantity * price - max(self.min_commission, quantity * price * self.commission_rate)
-                current_capital += proceeds
-                # Close position if exists
+                fill = self._adverse_fill(price, 'sell')
+                exit_fee = self._fee(quantity * fill)
+                # Close position if exists (return margin + net PnL)
                 if symbol in open_positions and open_positions[symbol]['side'] == 'long':
                     pos = open_positions[symbol]
-                    pnl = (price - pos['entry_price']) * pos['quantity'] - pos['entry_commission'] - max(self.min_commission, quantity * price * self.commission_rate)
-                    pnl_pct = (price - pos['entry_price']) / pos['entry_price'] * 100
+                    margin = pos.get('margin', pos['quantity'] * pos['entry_price'])
+                    bars_held = max(0, i - pos['entry_index'])
+                    funding = self._funding_cost(pos['quantity'] * fill, bars_held)
+                    total_funding_paid[0] += funding
+                    liq = self._liq_price_long(pos['entry_price'])
+                    liquidated = self._touched_liq(data[symbol], pos['entry_index'], i, liq)
+                    if liquidated:
+                        exit_px = liq if liq is not None else fill
+                        exit_fee = self._fee(quantity * exit_px)
+                        # Margin lost; only exit fee + funding leave the account
+                        # (entry fee + margin were already deducted at entry)
+                        current_capital -= (exit_fee + funding)
+                        pnl = -margin - pos['entry_commission'] - exit_fee - funding
+                        num_liquidations[0] += 1
+                    else:
+                        exit_px = fill
+                        # Return margin + price PnL net of exit fee + funding
+                        # (entry fee already deducted at entry)
+                        current_capital += (margin + (fill - pos['entry_price'])
+                                            * pos['quantity'] - exit_fee - funding)
+                        pnl = ((fill - pos['entry_price']) * pos['quantity']
+                               - pos['entry_commission'] - exit_fee - funding)
+                    pnl_pct = pnl / margin * 100 if margin else 0.0
                     trade = Trade(
                         trade_id=f"TRD-{len(trades):06d}",
                         symbol=symbol,
                         side='buy',
                         quantity=pos['quantity'],
                         entry_price=pos['entry_price'],
-                        exit_price=price,
+                        exit_price=exit_px,
                         pnl=pnl,
                         pnl_pct=pnl_pct,
-                        hold_duration=1.0,
+                        hold_duration=float(bars_held),
                         entry_time=pos['entry_index'],
                         exit_time=i,
-                        commission=pos['entry_commission'] + max(self.min_commission, quantity * price * self.commission_rate)
+                        commission=pos['entry_commission'] + exit_fee,
+                        liquidated=liquidated,
+                        funding_paid=funding
                     )
                     trades.append(trade)
                     del open_positions[symbol]
@@ -707,24 +819,41 @@ class Backtester:
                 equity_curve.append(current_capital)
 
         # Close any remaining open positions at final price
+        # (record only — legacy behaviour keeps equity_curve cash-only)
         for symbol, pos in open_positions.items():
-            final_price = data[symbol][-1]
-            commission = max(self.min_commission, pos['quantity'] * final_price * self.commission_rate)
-            pnl = (final_price - pos['entry_price']) * pos['quantity'] - pos['entry_commission'] - commission
-            pnl_pct = (final_price - pos['entry_price']) / pos['entry_price'] * 100
+            fill = self._adverse_fill(data[symbol][-1], 'sell')
+            commission = self._fee(pos['quantity'] * fill)
+            margin = pos.get('margin', pos['quantity'] * pos['entry_price'])
+            bars_held = max(0, len(orders) - 1 - pos['entry_index'])
+            funding = self._funding_cost(pos['quantity'] * fill, bars_held)
+            total_funding_paid[0] += funding
+            liq = self._liq_price_long(pos['entry_price'])
+            liquidated = self._touched_liq(data[symbol], pos['entry_index'],
+                                           len(orders) - 1, liq)
+            if liquidated:
+                exit_px = liq if liq is not None else fill
+                pnl = -margin - pos['entry_commission'] - commission - funding
+                num_liquidations[0] += 1
+            else:
+                exit_px = fill
+                pnl = ((fill - pos['entry_price']) * pos['quantity']
+                       - pos['entry_commission'] - commission - funding)
+            pnl_pct = pnl / margin * 100 if margin else 0.0
             trade = Trade(
                 trade_id=f"TRD-{len(trades):06d}",
                 symbol=symbol,
                 side='buy',
                 quantity=pos['quantity'],
                 entry_price=pos['entry_price'],
-                exit_price=final_price,
+                exit_price=exit_px,
                 pnl=pnl,
                 pnl_pct=pnl_pct,
-                hold_duration=1.0,
+                hold_duration=float(bars_held),
                 entry_time=pos['entry_index'],
                 exit_time=len(orders) - 1,
-                commission=pos['entry_commission'] + commission
+                commission=pos['entry_commission'] + commission,
+                liquidated=liquidated,
+                funding_paid=funding
             )
             trades.append(trade)
 
@@ -763,7 +892,9 @@ class Backtester:
             avg_loss=avg_loss,
             profit_factor=pf,
             trades=trades,
-            equity_curve=list(zip(range(len(equity_curve)), equity_curve))
+            equity_curve=list(zip(range(len(equity_curve)), equity_curve)),
+            num_liquidations=num_liquidations[0],
+            total_funding_paid=total_funding_paid[0]
         )
 
         return result

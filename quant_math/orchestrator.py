@@ -24,9 +24,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from quant_math.decision_engine import DecisionEngine
+from quant_math.risk.circuit_breaker import DailyGuard, utc_day_start_ts
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,16 @@ class OrchestratorConfig:
     # Classic-mode leverage (1 = no leverage)
     leverage: int = 1                       # leverage multiplier for classic mode
 
+    # Circuit breaker (Fase 1b) — enforced in run_cycle before new entries
+    max_daily_loss_usd: float = 2.5         # block entries rest of UTC day
+    max_open_positions: int = 5             # block entries at/above this count
+    drawdown_limit: float = 0.2             # block entries past this drawdown
+    max_position_pct: float = 0.2           # max margin per entry vs account
+
+    # Live-trading path (Fase 2-4)
+    shadow_live: bool = False               # log shadow_orders.jsonl intent
+    testnet: bool = True                    # live orders only allowed on testnet
+
     def __post_init__(self):
         if not self.symbols:
             raise ValueError("symbols no puede estar vacío")
@@ -78,11 +89,34 @@ class OrchestratorConfig:
             raise ValueError(f"hypotheses_per_cycle inválido: {self.hypotheses_per_cycle}")
         if self.mode not in ("classic", "burst"):
             raise ValueError(f"mode debe ser 'classic' o 'burst', recibido '{self.mode}'")
+        # Circuit-breaker sanity
+        if self.max_daily_loss_usd < 0:
+            raise ValueError("max_daily_loss_usd debe ser >= 0")
+        if self.max_open_positions < 1:
+            raise ValueError("max_open_positions debe ser >= 1")
+        if not 0 < self.drawdown_limit <= 1:
+            raise ValueError("drawdown_limit debe estar en (0, 1]")
+        if not 0 < self.max_position_pct <= 1:
+            raise ValueError("max_position_pct debe estar en (0, 1]")
         if self.dry_run is False:
-            raise NotImplementedError(
-                "trading real no implementado aún: dry_run=False no disponible "
-                "(los datos son SIEMPRE reales; dry_run solo controla ejecución)"
-            )
+            # Fase 3: testnet live OK con API keys.
+            # Fase 4: mainnet exige acción explícita del operador:
+            #   QUANTMATH_ALLOW_MAINNET=1 en el entorno + doble confirmación
+            #   en el wizard. Sin eso, bloqueado por diseño.
+            from data_acquisition.data_sources.exchanges import api_keys_present
+            if not api_keys_present():
+                raise RuntimeError(
+                    "dry_run=False requiere BYBIT_API_KEY y BYBIT_API_SECRET "
+                    "en .env (los datos son SIEMPRE reales; dry_run solo "
+                    "controla ejecución)"
+                )
+            if not self.testnet and os.environ.get(
+                    "QUANTMATH_ALLOW_MAINNET") != "1":
+                raise NotImplementedError(
+                    "mainnet bloqueado por diseño: exporta "
+                    "QUANTMATH_ALLOW_MAINNET=1 y confirma dos veces en el "
+                    "wizard para operar con dinero real"
+                )
         # Burst-mode constraints — dynamic per-asset max (BTC 150, SOL 100, etc.)
         # Wizard already validates against Bybit max via get_max_leverage(); here we
         # only enforce lower bound and absolute Bybit ceiling 150.
@@ -205,6 +239,15 @@ class Orchestrator:
         if self.burst_tracker and self.burst_tracker.state.last_entry_cycle > 0:
             self.burst_tracker.state.last_entry_cycle = 0
             self.burst_tracker._save()
+        # Fase 1b: circuit breaker (persistent daily guard per mode)
+        self.guard = DailyGuard(
+            config.state_dir,
+            max_daily_loss_usd=config.max_daily_loss_usd,
+            max_open_positions=config.max_open_positions,
+            drawdown_limit=config.drawdown_limit,
+        )
+        self._risk_manager = None  # lazy RiskManager (margin checks)
+        self._last_realized_total = 0.0
         # Runtime stats consumed by external monitors (CLI)
         self.stats = {
             "state": "RUNNING",
@@ -218,9 +261,17 @@ class Orchestrator:
             "paper_trades_taken": 0,
             "started_at": time.time(),
             "last_cycle_at": None,
+            "risk_halt": None,
+            "realized_today": 0.0,
+            "realized_total": 0.0,
         }
         self.stats_path = os.path.join(self.config.state_dir, "runtime_stats.json")
         self._write_stats()
+        # Fase 2: validate live access once at startup (warn-only).
+        # Paper trading proceeds regardless; shadow records flag validated.
+        self._live_validated = (
+            self._validate_live_access() if config.shadow_live else False
+        )
 
     def _write_stats(self):
         try:
@@ -595,6 +646,67 @@ class Orchestrator:
         for record in records:
             self.engine.register_hypothesis(record)
 
+    def _ledger_pnl(self) -> Tuple[float, float]:
+        """(realized_today, realized_total) scanned from the permanent ledger.
+
+        realized_today counts closures with exit_time >= UTC midnight.
+        Cheap full scan; ledger is small (hundreds of lines).
+        """
+        day_start = utc_day_start_ts()
+        today = total = 0.0
+        path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if "motivo_cierre" not in rec:
+                        continue
+                    try:
+                        pnl = float(rec.get("pnl", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    total += pnl
+                    try:
+                        if float(rec.get("exit_time") or 0) >= day_start:
+                            today += pnl
+                    except (TypeError, ValueError):
+                        pass
+        except OSError:
+            pass
+        return today, total
+
+    def _apply_margin_cap(self, notional: float, lev_used: int,
+                          hypothesis_id: str) -> float:
+        """Fase 1b: enforce RiskManager max margin per entry.
+
+        Returns possibly-capped notional. Never raises (fail-open with log).
+        """
+        try:
+            from quant_math.risk.risk_manager import RiskManager
+            if self._risk_manager is None:
+                self._risk_manager = RiskManager(
+                    max_position_size_pct=self.config.max_position_pct,
+                    drawdown_limit=self.config.drawdown_limit,
+                )
+            margin_used = notional / max(1, lev_used)
+            account = self.config.initial_capital + self._last_realized_total
+            chk = self._risk_manager.check_position_size(
+                hypothesis_id, margin_used, account)
+            if not chk["approved"]:
+                capped = float(chk["approved_size"]) * max(1, lev_used)
+                print(f"  [risk] margin cap: notional ${notional:.2f} -> "
+                      f"${capped:.2f} ({'; '.join(chk['reasons'])})")
+                return capped
+        except Exception as exc:
+            logger.warning("[risk] margin check fallo (%s); sin cap", exc)
+        return notional
+
     def _execute_paper_trade(self, signal: Dict) -> Dict:
         """Fill a paper trade at the signal price with configured sizing/TP."""
         price = float(signal["price"])
@@ -613,11 +725,24 @@ class Orchestrator:
                       f"+ new={margin:.0f} > {BurstStateTracker.MAX_EXPOSURE_USD:.0f}")
                 return {"action": "exposure_capped"}
             notional = margin * leverage
+            lev_used = leverage
         else:
             # O6: nocional escalado por vol-target (clampeado en el engine)
             base_notional = (self.config.initial_capital * self.config.entry_pct
                              * float(signal.get("sizing_mult", 1.0)))
             notional = base_notional * self.config.leverage
+            lev_used = max(1, self.config.leverage)
+        # Fase 1b: RiskManager margin cap (never raises)
+        notional = self._apply_margin_cap(
+            notional, lev_used, str(signal.get("hypothesis_id", "")))
+        if self.config.mode == "burst":
+            margin = notional / max(1, lev_used)
+        # Fase 3: live path (config guard guarantees testnet + keys,
+        # or mainnet with QUANTMATH_ALLOW_MAINNET=1 — see __post_init__).
+        if not self.config.dry_run:
+            return self._execute_live_order(
+                signal, price, side, notional, lev_used,
+                margin if self.config.mode == "burst" else None)
         quantity = notional / price
         tp_price = price * (1 + self.config.take_profit_pct) if side == "buy" \
             else price * (1 - self.config.take_profit_pct)
@@ -649,7 +774,141 @@ class Orchestrator:
         logger.info("[paper_trade] %s %s qty=%.6f @ %.2f TP=%.2f (hyp=%s)",
                     side.upper(), trade["symbol"], quantity, price, tp_price,
                     trade["hypothesis_id"])
+        # Fase 2: shadow live intent — what WOULD be sent to the exchange.
+        # No API call; paper trading continues untouched.
+        if self.config.shadow_live:
+            self._log_shadow_order(trade, signal, price)
         return trade
+
+    def _execute_live_order(self, signal: Dict, price: float, side: str,
+                            notional: float, lev_used: int,
+                            margin: Optional[float]) -> Dict:
+        """Fase 3/4: place a REAL order (testnet or mainnet per config).
+
+        Never raises: failures return {"action": "live_failed", ...} so one
+        bad order does not kill the cycle.
+        """
+        from data_acquisition.data_sources.exchanges import ExchangeAPI
+        trade: Dict = {"action": "live_failed", "symbol": signal.get("symbol")}
+        try:
+            api = ExchangeAPI(self.config.exchange_id,
+                              sandbox=self.config.testnet)
+            try:
+                api.set_margin_mode(signal["symbol"], "isolated")
+            except Exception as exc:
+                logger.warning("[live] set_margin_mode fallo (%s); continúo", exc)
+            try:
+                api.set_leverage(signal["symbol"], lev_used)
+            except Exception as exc:
+                logger.warning("[live] set_leverage fallo (%s); continúo", exc)
+            qty = notional / price
+            order = api.create_order(signal["symbol"], side, qty,
+                                     order_type="market")
+            try:
+                api.close()
+            except Exception:
+                pass
+            mode = "live-testnet" if self.config.testnet else "live-mainnet"
+            trade = {
+                "mode": mode,
+                "key": f"{signal['hypothesis_id']}:{signal['symbol']}",
+                "symbol": signal["symbol"],
+                "side": side,
+                "quantity": float(order.get("amount") or qty),
+                "entry_price": float(order.get("average")
+                                     or order.get("price") or price),
+                "notional_usd": notional,
+                "take_profit_price": (
+                    price * (1 + self.config.take_profit_pct)
+                    if side == "buy"
+                    else price * (1 - self.config.take_profit_pct)),
+                "hypothesis_id": signal["hypothesis_id"],
+                "expectancy": signal["expectancy"],
+                "timestamp": signal["timestamp"],
+                "cycle": self.cycle_count,
+                "leverage": lev_used,
+                "exchange_order_id": order.get("id"),
+                "testnet": self.config.testnet,
+            }
+            if margin is not None:
+                trade["margin_usd"] = margin
+            trades_path = os.path.join(self.config.state_dir,
+                                       "paper_executions.jsonl")
+            os.makedirs(self.config.state_dir, exist_ok=True)
+            with open(trades_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(trade, ensure_ascii=False,
+                                    default=str) + "\n")
+            logger.info("[live_order] %s %s qty=%.6f (hyp=%s id=%s)",
+                        side.upper(), trade["symbol"], trade["quantity"],
+                        trade["hypothesis_id"], trade.get("exchange_order_id"))
+        except Exception as exc:
+            logger.error("[live_order] fallo (%s)", exc)
+            trade = {"action": "live_failed", "symbol": signal.get("symbol"),
+                     "error": str(exc)}
+        return trade
+
+    def _log_shadow_order(self, trade: Dict, signal: Dict, price: float) -> None:
+        """Append a shadow live-order intent record (no API call)."""
+        try:
+            lev = int(trade.get("leverage")
+                      or signal.get("leverage")
+                      or self.config.leverage or 1)
+            swap = trade["symbol"]
+            if ":" not in swap and swap.endswith("/USDT"):
+                swap += ":USDT"
+            rec = {
+                "type": "shadow_order",
+                "symbol": swap,
+                "side": trade["side"],
+                "quantity": trade["quantity"],
+                "price": price,
+                "order_type": "market",
+                "leverage": lev,
+                "margin_mode": "isolated",
+                "reduce_only": False,
+                "testnet": self.config.testnet,
+                "paper_notional_usd": trade.get("notional_usd"),
+                "hypothesis_id": trade.get("hypothesis_id"),
+                "expectancy": trade.get("expectancy"),
+                "                timestamp": trade.get("timestamp"),
+                "cycle": self.cycle_count,
+                "validated": bool(getattr(self, "_live_validated", False)),
+            }
+            path = os.path.join(self.config.state_dir, "shadow_orders.jsonl")
+            os.makedirs(self.config.state_dir, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("[shadow] log fallo (%s)", exc)
+
+    def _validate_live_access(self) -> bool:
+        """Fase 2: verify API keys + testnet balance. Warn-only (never raises).
+
+        Returns True when keys exist and a sandbox balance fetch succeeds.
+        """
+        try:
+            from data_acquisition.data_sources.exchanges import (
+                ExchangeAPI, api_keys_present,
+            )
+            if not api_keys_present():
+                logger.warning("[live] sin API keys en .env — shadow sin validar; "
+                               "paper trading continúa")
+                return False
+            api = ExchangeAPI(self.config.exchange_id,
+                              sandbox=self.config.testnet)
+            bal = api.fetch_balance()
+            total = (bal.get("total") or {}).get("USDT", "?")
+            logger.info("[live] keys OK (testnet=%s) balance USDT=%s",
+                        self.config.testnet, total)
+            try:
+                api.close()
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            logger.warning("[live] validación falló (%s); paper trading continúa",
+                           exc)
+            return False
 
     # ------------------------------------------------------------------
     # One full cycle
@@ -736,8 +995,25 @@ class Orchestrator:
                   f"pnl={closure['pnl']:+.4f}")
         summary["exits"] = len(exits)
 
+        # Fase 1b: circuit breaker — block NEW entries on breach.
+        # Exits already ran above; monitoring continues regardless.
+        realized_today, realized_total = self._ledger_pnl()
+        self._last_realized_total = realized_total
+        equity = self.config.initial_capital + realized_total
+        open_count = len(getattr(self.engine, "open_positions", {}) or {})
+        risk_ok, risk_reason = self.guard.check(
+            realized_today, equity, open_count)
+        self.stats["risk_halt"] = risk_reason
+        self.stats["realized_today"] = round(realized_today, 4)
+        self.stats["realized_total"] = round(realized_total, 4)
+        if not risk_ok:
+            print(f"  [RISK-HALT] {risk_reason}")
+
         # 5. Decide per symbol; execute paper trades; engine handles feedback
         for symbol in cfg.symbols:
+            if not risk_ok:
+                summary["no_entry"] += 1
+                continue
             # V2 B3: burst cooldown gate
             if (self.burst_tracker
                     and not self.burst_tracker.can_enter(self.cycle_count)):
@@ -753,6 +1029,10 @@ class Orchestrator:
                 trade = self._execute_paper_trade(outcome)
                 if trade.get("action") == "exposure_capped":
                     summary["no_entry"] += 1
+                elif trade.get("action") == "live_failed":
+                    summary["live_failed"] = summary.get("live_failed", 0) + 1
+                    print(f"  [live] orden fallida {symbol}: "
+                          f"{trade.get('error', '?')}")
                 else:
                     summary["trades"].append(trade)
                     if self.burst_tracker:

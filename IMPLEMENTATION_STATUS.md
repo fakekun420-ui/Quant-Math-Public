@@ -40,7 +40,20 @@ Estado real verificado con la suite completa (137 tests, 0 warnings).
 | **Graphify index** | ✅ | Knowledge graph regenerado (2,713 nodos, 4,488 edges) |
 | **Versión** | ✅ | Unificada a 1.5.0 en todo el codebase |
 
-## 🟡 v1.5.0 — Futures Integration + Risk Management (previo)
+## ✅ v1.6.0 — Real-money groundwork (Fases 1-4, solo CLI)
+
+| Feature | Estado | Detalle |
+|---|---|---|
+| Backtester futuros | ✅ | `slippage_pct`, `leverage` (margen + liquidación), `funding_rate_8h` — defaults preservan números legacy |
+| Circuit breaker | ✅ | `DailyGuard` (`daily_pnl.json`): max_daily_loss_usd=$2.50, drawdown 20%, max 5 posiciones — bloquea entradas, no ciclos |
+| `RiskManager` cableado | ✅ | Cap de margen por entrada vía `check_position_size` en `_execute_paper_trade` |
+| `ExchangeAPI` live | ✅ | `create_order`/`set_leverage`/`set_margin_mode`/`fetch_position` (swap USDT perps), requiere keys, `.env` + `BYBIT_TESTNET` |
+| Shadow live | ✅ | `shadow_orders.jsonl` + validación de keys al inicio (warn-only) |
+| Testnet live | ✅ | `dry_run=False` solo con `testnet=True` + keys; wizard con confirmación; `live_failed` no tumba el ciclo |
+| Mainnet | 🔒 | Bloqueado por diseño: exige `QUANTMATH_ALLOW_MAINNET=1` + keys + doble confirmación |
+| WebUI live | ⏸️ | Congelada por decisión — controles reales quedan para futuro |
+
+## 🟡 v1.5.0 — Futures Integration + Risk Management (previo, alcance papel)
 
 | Feature | Estado | Detalle |
 |---|---|---|

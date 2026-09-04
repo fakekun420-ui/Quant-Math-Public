@@ -463,6 +463,10 @@ def wizard() -> Optional[Dict]:
         if hypotheses_per_cycle is None:
             return None
 
+        exec_flags = _ask_execution_mode(initial_capital)
+        if exec_flags is None:
+            return None
+
         state_dir = os.path.join(PROJECT_ROOT, "runtime", "state")
         os.makedirs(state_dir, exist_ok=True)
 
@@ -480,7 +484,9 @@ def wizard() -> Optional[Dict]:
             "log_path": LOG_PATH,
             "interval_seconds": 60,
             "exchange_id": "bybit",
-            "dry_run": True,                # paper trading only
+            "dry_run": exec_flags["dry_run"],
+            "testnet": exec_flags["testnet"],
+            "shadow_live": exec_flags["shadow_live"],
             "leverage": leverage,
         }
     except (AttributeError):
@@ -566,6 +572,10 @@ def burst_wizard() -> Optional[Dict]:
         if hyp_per_cycle is None:
             return None
 
+        exec_flags = _ask_execution_mode(50.0)
+        if exec_flags is None:
+            return None
+
         state_dir = os.path.join(PROJECT_ROOT, "runtime", "state_burst")
         os.makedirs(state_dir, exist_ok=True)
 
@@ -583,7 +593,9 @@ def burst_wizard() -> Optional[Dict]:
             "log_path": BURST_LOG_PATH,
             "interval_seconds": 15,
             "exchange_id": "bybit",
-            "dry_run": True,
+            "dry_run": exec_flags["dry_run"],
+            "testnet": exec_flags["testnet"],
+            "shadow_live": exec_flags["shadow_live"],
             "mode": "burst",
             "burst_margin": margin,
             "burst_leverage": leverage,
@@ -716,6 +728,57 @@ def ask_leverage(symbol: str, exchange_id: str = "bybit", mode: str = "classic")
     if lev is None:
         return None
     return lev
+
+
+def _ask_execution_mode(initial_capital: float) -> Optional[Dict]:
+    """Ask paper / testnet-live / mainnet-live. Returns execution flags.
+
+    - paper: dry_run=True (default, no keys needed).
+    - testnet: dry_run=False + testnet=True + shadow log. Requires .env keys.
+    - mainnet: dry_run=False + testnet=False. Requires
+      QUANTMATH_ALLOW_MAINNET=1 in env + .env keys + double confirmation.
+    Returns None if cancelled or requirements unmet.
+    """
+    from data_acquisition.data_sources.exchanges import api_keys_present
+    mode = questionary.select(
+        "Modo de ejecución:",
+        choices=[
+            questionary.Choice("Paper trading (recomendado)", value="paper"),
+            questionary.Choice("Testnet live (Bybit Testnet, requiere API keys)",
+                               value="testnet"),
+            questionary.Choice("Mainnet live (DINERO REAL, doble confirmación)",
+                               value="mainnet"),
+        ]).unsafe_ask()
+    if mode is None or mode == "paper":
+        return {"dry_run": True, "testnet": True, "shadow_live": False}
+    if not api_keys_present():
+        console.print("[red]Modo live requiere BYBIT_API_KEY y BYBIT_API_SECRET "
+                      "en .env (ver .env.example)[/red]")
+        return None
+    if mode == "testnet":
+        ok = questionary.confirm(
+            "Confirmar trading REAL en TESTNET (sin dinero real)?",
+            default=False).unsafe_ask()
+        if not ok:
+            return None
+        console.print("[yellow]Testnet live activado + shadow log.[/yellow]")
+        return {"dry_run": False, "testnet": True, "shadow_live": True}
+    # mainnet — Fase 4
+    if os.environ.get("QUANTMATH_ALLOW_MAINNET") != "1":
+        console.print("[red]Mainnet bloqueado por diseño: exporta "
+                      "QUANTMATH_ALLOW_MAINNET=1 primero[/red]")
+        return None
+    console.print(f"[bold red]VAS A OPERAR CON DINERO REAL "
+                  f"(capital ${initial_capital:.2f}).[/bold red]")
+    ok1 = questionary.confirm("Confirmación 1/2: ¿entendido el riesgo?",
+                              default=False).unsafe_ask()
+    if not ok1:
+        return None
+    ok2 = questionary.confirm("Confirmación 2/2: ¿iniciar mainnet live?",
+                              default=False).unsafe_ask()
+    if not ok2:
+        return None
+    return {"dry_run": False, "testnet": False, "shadow_live": True}
 
 
 def _read_paper_trades(state_dir: str):

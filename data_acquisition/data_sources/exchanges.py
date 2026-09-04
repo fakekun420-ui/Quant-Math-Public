@@ -22,6 +22,16 @@ except ImportError:
     pass
 
 
+def api_keys_present() -> bool:
+    """True if both BYBIT_API_KEY and BYBIT_API_SECRET are set (env or .env)."""
+    return bool(os.getenv("BYBIT_API_KEY") and os.getenv("BYBIT_API_SECRET"))
+
+
+def is_testnet() -> bool:
+    """True unless BYBIT_TESTNET is explicitly false."""
+    return os.getenv("BYBIT_TESTNET", "true").lower() not in ("0", "false", "no")
+
+
 class ExchangeAPI:
     """
     CCXT-based exchange interface
@@ -200,6 +210,79 @@ class ExchangeAPI:
         except Exception as e:
             logger.error(f"Failed to fetch balance: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # Live trading (Fase 2-4: Bybit USDT perpetuals). All methods require
+    # API keys (.env BYBIT_API_KEY/SECRET) and raise RuntimeError otherwise.
+    # Nothing here is called while dry_run=True.
+    # ------------------------------------------------------------------
+
+    def _require_auth(self) -> None:
+        if self.exchange is None:
+            raise RuntimeError("exchange not initialized")
+        if not self.exchange.apiKey or not self.exchange.secret:
+            raise RuntimeError(
+                "live trading needs BYBIT_API_KEY and BYBIT_API_SECRET in .env"
+            )
+
+    @staticmethod
+    def _to_swap_symbol(symbol: str) -> str:
+        """BTC/USDT -> BTC/USDT:USDT for Bybit perpetuals."""
+        if ":" not in symbol and symbol.endswith("/USDT"):
+            return symbol + ":USDT"
+        return symbol
+
+    def set_sandbox_mode(self, enabled: bool = True) -> None:
+        """Route to Bybit Testnet (sandbox) or Mainnet."""
+        self.exchange.set_sandbox_mode(enabled)
+        logger.info("sandbox mode: %s", enabled)
+
+    def set_leverage(self, symbol: str, leverage: int,
+                     params: Optional[Dict] = None) -> Any:
+        """Set leverage for a perpetual symbol."""
+        self._require_auth()
+        swap = self._to_swap_symbol(symbol)
+        result = self.exchange.set_leverage(int(leverage), swap, params or {})
+        logger.info("set leverage %sx on %s", leverage, swap)
+        return result
+
+    def set_margin_mode(self, symbol: str, mode: str = "isolated",
+                        params: Optional[Dict] = None) -> Any:
+        """Set margin mode ('isolated' or 'cross') for a perpetual symbol."""
+        self._require_auth()
+        if mode not in ("isolated", "cross"):
+            raise ValueError("margin mode must be 'isolated' or 'cross'")
+        swap = self._to_swap_symbol(symbol)
+        result = self.exchange.set_margin_mode(mode, swap, params or {})
+        logger.info("set margin mode %s on %s", mode, swap)
+        return result
+
+    def create_order(self, symbol: str, side: str, amount: float,
+                     price: Optional[float] = None,
+                     order_type: str = "market",
+                     params: Optional[Dict] = None) -> Dict[str, Any]:
+        """Place a live order. Returns the ccxt order dict."""
+        self._require_auth()
+        if side not in ("buy", "sell"):
+            raise ValueError("side must be 'buy' or 'sell'")
+        swap = self._to_swap_symbol(symbol)
+        amount = float(self.exchange.amount_to_precision(swap, amount))
+        if price is not None:
+            price = float(self.exchange.price_to_precision(swap, price))
+        order = self.exchange.create_order(swap, order_type, side,
+                                           amount, price, params or {})
+        logger.info("live order %s %s %s @ %s -> id=%s",
+                    side, amount, swap, price, order.get("id"))
+        return order
+
+    def cancel_order(self, order_id: str, symbol: str) -> Any:
+        self._require_auth()
+        return self.exchange.cancel_order(order_id, self._to_swap_symbol(symbol))
+
+    def fetch_position(self, symbol: str) -> Dict[str, Any]:
+        self._require_auth()
+        positions = self.exchange.fetch_positions([self._to_swap_symbol(symbol)])
+        return positions[0] if positions else {}
 
     def get_available_symbols(self) -> List[str]:
         """
