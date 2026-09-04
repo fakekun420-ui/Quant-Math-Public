@@ -83,14 +83,16 @@ class OrchestratorConfig:
                 "trading real no implementado aún: dry_run=False no disponible "
                 "(los datos son SIEMPRE reales; dry_run solo controla ejecución)"
             )
-        # Burst-mode constraints
+        # Burst-mode constraints — dynamic per-asset max (BTC 150, SOL 100, etc.)
+        # Wizard already validates against Bybit max via get_max_leverage(); here we
+        # only enforce lower bound and absolute Bybit ceiling 150.
         if self.mode == "burst":
             self.interval_seconds = min(self.interval_seconds, 15)
             self.burst_margin = max(1.0, self.burst_margin)
-            self.burst_leverage = max(1, min(20, self.burst_leverage))
+            self.burst_leverage = max(1, min(150, int(self.burst_leverage)))
             self.take_profit_pct = max(0.02, min(0.50, self.take_profit_pct))
-        # Classic leverage validation
-        self.leverage = max(1, int(self.leverage))
+        # Classic leverage validation — same 150 ceiling (Bybit max for BTC/ETH)
+        self.leverage = max(1, min(150, int(self.leverage)))
 
 
 # ---------------------------------------------------------------------------

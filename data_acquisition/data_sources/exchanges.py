@@ -3,6 +3,8 @@ CCXT Exchange Integration
 Provides unified interface to multiple cryptocurrency exchanges
 """
 
+import os
+
 import ccxt
 from typing import List, Dict, Any, Optional
 import time
@@ -11,6 +13,13 @@ import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Load .env if present (Bybit keys for future live trading)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
 class ExchangeAPI:
@@ -46,10 +55,19 @@ class ExchangeAPI:
 
         exchange_class = getattr(ccxt, exchange_id)
 
+        # Auto-load from .env if not passed explicitly (for future live trading)
+        if api_key is None:
+            api_key = os.getenv("BYBIT_API_KEY") or None
+        if api_secret is None:
+            api_secret = os.getenv("BYBIT_API_SECRET") or None
+        env_testnet = os.getenv("BYBIT_TESTNET", "").lower() in ("1", "true", "yes")
+        if env_testnet:
+            sandbox = True
+
         exchange_config = {
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'spot',
+                'defaultType': 'swap',  # USDT perpetuals (Futures)
             }
         }
 

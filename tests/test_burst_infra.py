@@ -45,7 +45,15 @@ def test_mode_burst_clamps_leverage():
         min_paper_trades=3, hypotheses_per_cycle=5,
         kb_path="/tmp/kb.jsonl", state_dir="/tmp/state",
         mode="burst", burst_leverage=50)
-    assert cfg.burst_leverage == 20
+    assert cfg.burst_leverage == 50
+    # Absolute ceiling 150 (Bybit max for BTC)
+    cfg2 = OrchestratorConfig(
+        symbols=["BTC/USDT"], timeframe="5m", lookback_days=14,
+        initial_capital=50, entry_pct=0.1, take_profit_pct=0.20,
+        min_paper_trades=3, hypotheses_per_cycle=5,
+        kb_path="/tmp/kb.jsonl", state_dir="/tmp/state",
+        mode="burst", burst_leverage=200)
+    assert cfg2.burst_leverage == 150
 
 
 def test_mode_burst_clamps_tp():

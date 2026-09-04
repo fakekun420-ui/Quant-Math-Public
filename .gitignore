@@ -15,6 +15,10 @@ runtime/
 .opencode/
 .pytest_cache/
 
+# Secrets — Bybit API keys (never commit)
+.env
+.env.local
+
 # Knowledge graph index (generated, large)
 graphify-out/
 .venv/

@@ -19,7 +19,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 
 # Add project root to path
-sys.path.insert(0, '/data/data/com.termux/files/home/quant-math')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from quant_math.autonomous_research import (
     ResearchManager,
