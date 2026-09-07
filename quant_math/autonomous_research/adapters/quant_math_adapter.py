@@ -28,7 +28,6 @@ except ImportError:
 
 try:
     from backtesting import Backtester, BacktestResult, PerformanceMetrics, Trade
-    from data_acquisition.data_sources.exchanges import ExchangeAPI
     from order_management import OrderManager
     import numpy as np
     import pandas as pd
@@ -48,19 +47,24 @@ class QuantMathAdapter:
     """
 
     def __init__(self, exchange_id: str = "binance",
+                 market: str = "crypto",
                  knowledge_base_path: str = "autonomous_research/data/hypotheses"):
         """
         Initialize the adapter.
 
         Args:
-            exchange_id: CCXT exchange identifier (default: 'binance')
+            exchange_id: CCXT exchange identifier (default: 'binance'),
+                or 'yahoo' for forex
+            market: 'crypto' or 'forex' (selects ccxt vs Yahoo provider)
             knowledge_base_path: Path for persistent hypothesis storage
         """
         # Initialize knowledge base
         self.knowledge_base = HypothesisKnowledgeBase(storage_path=knowledge_base_path)
+        self.market = (market or "crypto").lower()
 
         if HAS_QUANT_MATH:
-            self.exchange = ExchangeAPI(exchange_id=exchange_id)
+            from data_acquisition.data_sources.forex import get_market_api
+            self.exchange = get_market_api(exchange_id, market=self.market)
             self.backtester = Backtester()
             self.metrics = PerformanceMetrics()
             self.order_manager = OrderManager()

@@ -37,6 +37,7 @@ dependencies = [
     "matplotlib>=3.8.0",
     "cvxpy>=1.4.0",
     "ccxt>=4.0.0",
+    "yfinance>=0.2.40",
     "questionary>=1.10.0",
     "rich>=13.0.0",
     "jupyter>=1.0.0",

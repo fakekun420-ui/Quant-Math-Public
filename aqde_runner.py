@@ -50,6 +50,7 @@ class AQDERunner:
     def __init__(
         self,
         exchange_id: str = "bybit",
+        market: str = "crypto",
         knowledge_base_path: str = "autonomous_research/data/hypotheses",
         top_n_symbols: int = 20,
         min_volume_usd: float = 1_000_000,
@@ -62,6 +63,7 @@ class AQDERunner:
         hypothesis_ranker=None
     ):
         self.exchange_id = exchange_id
+        self.market = (market or "crypto").lower()
         self.knowledge_base_path = knowledge_base_path
         self.top_n_symbols = top_n_symbols
         self.min_volume_usd = min_volume_usd
@@ -81,6 +83,7 @@ class AQDERunner:
         # Initialize components
         self.adapter = QuantMathAdapter(
             exchange_id=exchange_id,
+            market=self.market,
             knowledge_base_path=knowledge_base_path
         )
         self.knowledge_base = self.adapter.knowledge_base
@@ -154,10 +157,19 @@ class AQDERunner:
         return market_data
 
     def fetch_top_symbols(self) -> List[CryptoSymbol]:
-        """Fetch top N symbols by volume from Bybit"""
+        """Fetch top N symbols by volume from Bybit (or FX majors)."""
         print(f"\n{'='*60}")
         print(f"Fetching top {self.top_n_symbols} symbols from {self.exchange_id}...")
         print(f"{'='*60}")
+
+        if self.market == "forex":
+            from data_acquisition.data_sources.forex import MAJORS
+            self.symbols = [CryptoSymbol(s, 0, i + 1)
+                            for i, s in enumerate(MAJORS[:self.top_n_symbols])]
+            print(f"\nForex majors ({self.exchange_id}):")
+            for sym in self.symbols:
+                print(f"  {sym.rank}. {sym.symbol}")
+            return self.symbols
 
         if self.dry_run:
             # Return synthetic symbols for testing
@@ -597,8 +609,8 @@ class AQDERunner:
         now = time.time()
         if cached and cached[0] == symbol and now - cached[1] < 300:
             return cached[2]
-        from data_acquisition.data_sources.exchanges import ExchangeAPI
-        ex = ExchangeAPI(exchange_id=self.exchange_id)
+        from data_acquisition.data_sources.forex import get_market_api
+        ex = get_market_api(self.exchange_id, market=self.market)
         ohlcv = ex.fetch_ohlcv(symbol, self.timeframe, limit=limit)
         closes = [c[4] for c in (ohlcv or []) if c and c[4] is not None]
         self._closes_cache = (symbol, now, closes)

@@ -58,6 +58,7 @@ class DecisionEngine:
         kb_path: str = "autonomous_research/data/hypotheses.jsonl",
         state_dir: str = "quant_math/decision_engine/state",
         exchange_id: str = "bybit",
+        market: str = "crypto",
         timeframe: str = "1h",
         candle_limit: int = 100,
         min_paper_trades: int = DEFAULT_MIN_PAPER_TRADES,
@@ -76,6 +77,7 @@ class DecisionEngine:
         self.kb_path = kb_path
         self.state_dir = state_dir
         self.exchange_id = exchange_id
+        self.market = (market or "crypto").lower()
         self.timeframe = timeframe
         self.candle_limit = candle_limit
         self.min_paper_trades = min_paper_trades
@@ -197,8 +199,8 @@ class DecisionEngine:
             self._data_provider = data_provider
             self._exchange = None
         else:
-            from data_acquisition.data_sources.exchanges import ExchangeAPI
-            self._exchange = ExchangeAPI(exchange_id=exchange_id)
+            from data_acquisition.data_sources.forex import get_market_api
+            self._exchange = get_market_api(exchange_id, market=self.market)
             self._data_provider = lambda symbol: self._exchange.fetch_ohlcv(
                 symbol, self.timeframe, limit=self.candle_limit)
 

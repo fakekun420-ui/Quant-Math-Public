@@ -55,6 +55,7 @@ class OrchestratorConfig:
     state_dir: str                          # DecisionEngine state directory
     interval_seconds: int = 3600            # period between continuous cycles
     exchange_id: str = "bybit"              # REAL data source, always
+    market: str = "crypto"                  # "crypto" (ccxt) or "forex" (Yahoo)
     dry_run: bool = True                    # True=paper trading ONLY (no live path yet)
     use_postgres: bool = False               # KB storage: always JSONL (PG removed)
     mode: str = "classic"                   # "classic" or "burst"
@@ -89,6 +90,9 @@ class OrchestratorConfig:
             raise ValueError(f"hypotheses_per_cycle inválido: {self.hypotheses_per_cycle}")
         if self.mode not in ("classic", "burst"):
             raise ValueError(f"mode debe ser 'classic' o 'burst', recibido '{self.mode}'")
+        self.market = (self.market or "crypto").lower()
+        if self.market not in ("crypto", "forex"):
+            raise ValueError(f"market debe ser 'crypto' o 'forex', recibido '{self.market}'")
         # Circuit-breaker sanity
         if self.max_daily_loss_usd < 0:
             raise ValueError("max_daily_loss_usd debe ser >= 0")
@@ -117,16 +121,15 @@ class OrchestratorConfig:
                     "QUANTMATH_ALLOW_MAINNET=1 y confirma dos veces en el "
                     "wizard para operar con dinero real"
                 )
-        # Burst-mode constraints — dynamic per-asset max (BTC 150, SOL 100, etc.)
-        # Wizard already validates against Bybit max via get_max_leverage(); here we
-        # only enforce lower bound and absolute Bybit ceiling 150.
+        # Leverage constraints — dynamic per-asset max (BTC 150x crypto,
+        # FX majors up to 500x). Wizard validates against the venue max
+        # (Bybit per-asset / FX 500); here only lower bound + absolute 500.
         if self.mode == "burst":
             self.interval_seconds = min(self.interval_seconds, 15)
             self.burst_margin = max(1.0, self.burst_margin)
-            self.burst_leverage = max(1, min(150, int(self.burst_leverage)))
+            self.burst_leverage = max(1, min(500, int(self.burst_leverage)))
             self.take_profit_pct = max(0.02, min(0.50, self.take_profit_pct))
-        # Classic leverage validation — same 150 ceiling (Bybit max for BTC/ETH)
-        self.leverage = max(1, min(150, int(self.leverage)))
+        self.leverage = max(1, min(500, int(self.leverage)))
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +312,7 @@ class Orchestrator:
         from aqde_runner import AQDERunner
         self.runner = AQDERunner(
             exchange_id=self.config.exchange_id,
+            market=self.config.market,
             timeframe=self.config.timeframe,
             lookback_days=self.config.lookback_days,
             dry_run=self.config.dry_run,
@@ -371,6 +375,7 @@ class Orchestrator:
             kb_path=self.config.kb_path,
             state_dir=self.config.state_dir,
             exchange_id=self.config.exchange_id,
+            market=self.config.market,
             timeframe=self.config.timeframe,
             min_paper_trades=self.config.min_paper_trades,
             use_postgres=self.config.use_postgres,
