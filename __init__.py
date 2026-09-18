@@ -51,7 +51,7 @@ def __getattr__(name):
         from quant_math.monte_carlo import MonteCarloSimulator
         return MonteCarloSimulator
     if name in ('MeanVarianceOptimizer', 'AdaptiveSizer'):
-        from quant_math.optimization import MeanVarianceOptimizer, AdaptiveSizer
+        from legacy.optimization import MeanVarianceOptimizer, AdaptiveSizer
         return locals()[name]
     if name in ('PCAAnalyzer', 'ReturnsDecomposition', 'RiskFactorAnalyzer', 'CovarianceShrinkage'):
         from quant_math.pca_analysis import PCAAnalyzer, ReturnsDecomposition, RiskFactorAnalyzer, CovarianceShrinkage

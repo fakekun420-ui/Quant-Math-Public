@@ -3,9 +3,13 @@ PostgreSQL Database Connector
 Provides data storage and retrieval with metadata tracking
 """
 
-import psycopg2
-from psycopg2 import pool, sql
-from psycopg2.extras import RealDictCursor
+try:
+    import psycopg2
+    from psycopg2 import pool, sql
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    psycopg2 = None  # type: ignore
+    pool = sql = RealDictCursor = None  # type: ignore  # SQLite fallback sigue ok
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from datetime import datetime

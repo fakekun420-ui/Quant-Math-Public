@@ -70,7 +70,7 @@ aqde = "quant_math.autonomous_research.cli:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["quant_math*", "autonomous_research*", "algo_trading*", "backtesting*", "data*", "execution*", "ml_quant*", "order_management*", "pca_analysis*", "portfolio_construction*", "regime_detection*", "risk_management*", "signal_processing*", "spectral_analysis*"]
+include = ["quant_math*", "backtesting*", "data*", "legacy*", "order_management*", "pca_analysis*"]
 
 [tool.setuptools.package-dir]
 "" = "."
@@ -103,7 +103,7 @@ disallow_untyped_defs = true
 ignore_missing_imports = true
 
 [tool.coverage.run]
-source = ["quant_math", "autonomous_research", "algo_trading", "backtesting", "data_acquisition", "data_processing", "execution", "ml_quant", "order_management", "pca_analysis", "portfolio_construction", "regime_detection", "risk_management", "signal_processing", "spectral_analysis"]
+source = ["quant_math", "backtesting", "data_acquisition", "data_processing", "legacy", "order_management", "pca_analysis"]
 branch = true
 
 [tool.coverage.report]

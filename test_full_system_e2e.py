@@ -460,7 +460,7 @@ def run_full_e2e_test():
     print_stage(7, "PORTFOLIO CONSTRUCTION - EfficientFrontier, BlackLitterman, RiskParity")
 
     try:
-        from portfolio_construction import EfficientFrontier, BlackLitterman, RiskParity
+        from legacy.portfolio_construction import EfficientFrontier, BlackLitterman, RiskParity
 
         # Generate multi-asset returns for portfolio construction
         n_assets = 5
@@ -514,7 +514,7 @@ def run_full_e2e_test():
     print_stage(8, "OPTIMIZATION - AdaptiveSizer, KellyCriterion, MeanVarianceOptimizer")
 
     try:
-        from optimization import AdaptiveSizer, KellyCriterion, MeanVarianceOptimizer
+        from legacy.optimization import AdaptiveSizer, KellyCriterion, MeanVarianceOptimizer
 
         # Kelly Criterion
         win_rate = 0.55
@@ -533,8 +533,14 @@ def run_full_e2e_test():
         )
         print_result("AdaptiveSizer", True, f"Position size: {position:.2f} units")
 
-        # Mean-Variance Optimization
-        mv = MeanVarianceOptimizer(expected_returns, cov_matrix)
+        # Mean-Variance Optimization — usa expected_returns/cov de stage 7 o genera
+        try:
+            _er = expected_returns  # type: ignore  # definido en stage 7 si pasó
+            _cm = cov_matrix  # type: ignore
+        except NameError:
+            _er = np.array([0.0005, 0.0006, 0.0004, 0.0007, 0.0005])
+            _cm = np.eye(5) * 0.0004 + np.ones((5, 5)) * 0.0001
+        mv = MeanVarianceOptimizer(_er, _cm)
         mv_weights = mv.optimize()
         print_result("MeanVarianceOptimizer", True,
                      f"MV weights: {np.round(mv_weights, 4)}")
@@ -556,9 +562,9 @@ def run_full_e2e_test():
     print_stage(9, "PAPER TRADING - ExchangeManager, OrderRouter, OrderManager, SlippageModel, AlgoTradingSystem")
 
     try:
-        from execution import ExchangeManager, OrderRouter, OrderType, Order
+        from legacy.execution import ExchangeManager, OrderRouter, OrderType, Order
         from order_management import OrderManager, SlippageModel, ExecutionStrategy, TransactionCostModel
-        from algo_trading import AlgoTradingSystem, TWAP, VWAP, POV
+        from legacy.algo_trading import AlgoTradingSystem, TWAP, VWAP, POV
 
         # Order Router
         router = OrderRouter()

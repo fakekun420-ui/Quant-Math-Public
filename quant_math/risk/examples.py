@@ -12,11 +12,6 @@ This module demonstrates all risk management capabilities including:
 """
 
 import numpy as np
-import sys
-import os
-
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from quant_math.risk import (
     ValueAtRisk, ExpectedShortfall, PortfolioRisk, RiskBudget, StressTesting

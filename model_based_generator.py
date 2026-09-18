@@ -44,7 +44,7 @@ def _dominant_cycle(closes):
     existente (sin duplicar implementacion). None si no hay pico claro."""
     try:
         import numpy as _np
-        from spectral_analysis.fft import FastFourierTransform
+        from legacy.spectral_analysis.fft import FastFourierTransform
         rets = _np.diff(_np.log(_np.asarray(closes, dtype=float)))
         fft = FastFourierTransform(sampling_rate=1.0)
         peak_freq, peak_mag = fft.find_peak_frequency(

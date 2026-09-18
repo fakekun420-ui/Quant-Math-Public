@@ -31,7 +31,10 @@ try:
     from order_management import OrderManager
     import numpy as np
     import pandas as pd
-    import ccxt
+    try:
+        import ccxt  # noqa: F401  # optional: solo live ExchangeAPI, backtester no lo necesita
+    except ImportError:
+        ccxt = None  # type: ignore  # forex/crypto live deshabilitado sin ccxt; backtest sigue ok
 
     HAS_QUANT_MATH = True
 except ImportError as e:

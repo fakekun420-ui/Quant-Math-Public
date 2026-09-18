@@ -5,7 +5,10 @@ Provides unified interface to multiple cryptocurrency exchanges
 
 import os
 
-import ccxt
+try:
+    import ccxt
+except ImportError:
+    ccxt = None  # type: ignore  # optional: solo live trading; synthetic/forex-Yahoo sigue ok
 from typing import List, Dict, Any, Optional
 import time
 from datetime import datetime
@@ -63,6 +66,8 @@ class ExchangeAPI:
             logger.info("Initialized synthetic (offline) exchange mode")
             return
 
+        if ccxt is None:
+            raise ImportError("ccxt no instalado — solo modo 'synthetic' disponible offline. Instalar ccxt para live trading.")
         exchange_class = getattr(ccxt, exchange_id)
 
         # Auto-load from .env if not passed explicitly (for future live trading)
@@ -360,7 +365,7 @@ def get_available_exchanges() -> List[str]:
     Returns:
         List of exchange names
     """
-    exchanges = ccxt.exchanges
+    exchanges = getattr(ccxt, "exchanges", []) if ccxt else []
     return exchanges
 
 

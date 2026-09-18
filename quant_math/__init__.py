@@ -70,12 +70,9 @@ from quant_math.monte_carlo import (
     calculate_var_es,
 )
 
-# Optimization (root package - not yet consolidated)
-from optimization import (
-    KellyCriterion as OptKellyCriterion,
-    MeanVarianceOptimizer,
-    AdaptiveSizer,
-)
+# Optimization — legacy/research (ver legacy/optimization/). No re-export fantasma.
+# Usar: from legacy.optimization import KellyCriterion, MeanVarianceOptimizer, AdaptiveSizer
+# o el canónico: from quant_math.risk import KellyCriterion, PositionSizer
 
 # Autonomous Research (AQDE)
 from quant_math.autonomous_research import (
@@ -132,11 +129,6 @@ __all__ = [
     "bootstrap_simulation",
     "parametric_simulation",
     "calculate_var_es",
-
-    # Optimization
-    "OptKellyCriterion",
-    "MeanVarianceOptimizer",
-    "AdaptiveSizer",
 
     # Autonomous Research
     "ResearchManager",

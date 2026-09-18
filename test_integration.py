@@ -20,9 +20,9 @@ import numpy as np
 # Import modules
 from backtesting import Backtester, PerformanceMetrics, Trade, BacktestResult
 from order_management import OrderManager
-from algo_trading import AlgoTradingSystem
+from legacy.algo_trading import AlgoTradingSystem
 from quant_math.risk import PositionSizer, ValueAtRisk, ExpectedShortfall
-from optimization import KellyCriterion
+from legacy.optimization import KellyCriterion
 from quant_math.expectation import ReturnCalculator, DrawdownAnalyzer, SharpeMetrics
 
 
@@ -116,7 +116,7 @@ def test_order_management():
     print("TEST 3: Order Management")
     print("="*70)
 
-    from execution import OrderRouter, OrderType, Order
+    from legacy.execution import OrderRouter, OrderType, Order
 
     router = OrderRouter()
 
@@ -153,7 +153,7 @@ def test_algo_trading():
     print("TEST 4: Algorithmic Trading")
     print("="*70)
 
-    from execution import OrderRouter, OrderType, Order
+    from legacy.execution import OrderRouter, OrderType, Order
 
     router = OrderRouter()
     router.register_exchange("binance", priority=1)
@@ -265,7 +265,7 @@ def test_full_workflow():
     )
 
     # Step 4: Order Management
-    from execution import OrderRouter, OrderType, Order
+    from legacy.execution import OrderRouter, OrderType, Order
     router = OrderRouter()
     router.register_exchange("binance", priority=1)
     

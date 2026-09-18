@@ -1,0 +1,9 @@
+# Legacy research / academic modules — not on live path (0 incoming_from_quant_math)
+# Movidos a legacy/ pero se excluyen del grafo foco para eficiencia
+legacy/
+graphify-out/
+.venv/
+__pycache__/
+*.pyc
+runtime/
+*.log
