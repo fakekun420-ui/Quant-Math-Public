@@ -223,3 +223,8 @@ MIT
 ## Disclaimer
 
 Research/paper-trading system. Not financial advice. Trading involves risk.
+
+## v1.5.1 Update (Refactoring)
+- **Technical Debt:** Obsolete legacy folder and redundant documents (`ARCHITECTURE_REUSE_REPORT.md`, `IMPLEMENTATION_STATUS.md`) removed to clean up the workspace and graph.
+- **Garbage Collection (JSONL):** `JSONLKnowledgeBase` now automatically archives dead/failed hypotheses into `*_archive.jsonl` to prevent O(N) linear slowdown over time.
+- **Event Bus Decoupling:** `DecisionEngine` now implements a Pub/Sub `EventBus` (`event_bus.py`). It emits `trade_opened` and `trade_closed` events, decoupling the engine to safely pipe live metrics to external handlers without modifying the core.

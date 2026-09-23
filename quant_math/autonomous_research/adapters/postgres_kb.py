@@ -81,6 +81,13 @@ class JSONLKnowledgeBase:
 
     def _save_all(self, records: Dict[str, Dict[str, Any]]):
         """Atomically write all records to JSONL (atomic via tmp+rename)."""
+        # Garbage Collection (Architect Optimization)
+        # Move dead/failed hypotheses to archive if corpus grows large > 500
+        if len(records) > 500:
+            from .postgres_kb_patch import archive_dead_hypotheses
+            records = archive_dead_hypotheses(self.jsonl_path, records)
+            self._index = records
+            
         tmp = self.jsonl_path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:

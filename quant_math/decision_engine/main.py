@@ -19,6 +19,8 @@ import time
 from collections import deque
 from typing import Any, Callable, Dict, List, Optional
 
+from quant_math.decision_engine.event_bus import bus
+
 logger = logging.getLogger(__name__)
 
 QUERYABLE_STATUSES = ("validated", "backtested", "monte_carlo_tested", "failed")
@@ -371,6 +373,10 @@ class DecisionEngine:
             "motivo_cierre": motivo,
         }
         self._append_state(self.ledger_path, closure)
+        
+        # Publish Event (Architect Pub/Sub Enhancement)
+        bus.publish("trade_closed", closure)
+        
         logger.info("[cierre] %s %s motivo=%s exit=%.8g pnl=%.4f (%+.3f%%)",
                     side.upper(), symbol, motivo, exit_px, pnl, pnl_pct)
         self._refresh_live_expectancy(hypothesis_id, symbol)
@@ -964,6 +970,9 @@ class DecisionEngine:
         self._maybe_deliver_feedback(best, symbol)
         fam = self._family_of(hypothesis_id)
         self._maybe_deliver_family_feedback(symbol, family=fam)
+        
+        # Publish Entry Event (Architect Pub/Sub Enhancement)
+        bus.publish("trade_opened", symbol=symbol, hypothesis_id=hypothesis_id, side=side)
 
         logger.info("[entry] %s %s (hyp=%s, expectancy=%.4f)",
                     side.upper(), symbol, hypothesis_id, signal["expectancy"])

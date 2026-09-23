@@ -29,6 +29,13 @@ def main():
 
     cfg_dict = json.loads(config_json)
 
+    # RuntimeState envía claves de gestión de sesión (session, log_path)
+    # que no pertenecen a OrchestratorConfig — se descartan aquí.
+    # Sin este pop, toda sesión con nombre muere al nacer con:
+    #   TypeError: OrchestratorConfig.__init__() got an unexpected
+    #   keyword argument 'session' (ver quant_math_<session>.log).
+    cfg_dict.pop("session", None)
+
     # Termux wakelock
     _is_termux = os.path.exists("/data/data/com.termux")
 
@@ -114,13 +121,28 @@ def main():
     from quant_math.orchestrator import Orchestrator, OrchestratorConfig
 
     config = OrchestratorConfig(**cfg_dict)
-    orch = Orchestrator(config)
+    orch = None
+    try:
+        orch = Orchestrator(config)
+    except Exception:
+        # __init__ puede fallar (datos/API/estado) — nunca dejar PID stale.
+        # Sin este guard, el PID file sobrevive al crash y la sesión aparece
+        # "corriendo" en el menú aunque el proceso murió (menú congelado).
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
+        raise
 
     _acquire_wakelock()
     try:
         orch.run_forever()
     finally:
-        orch.mark_stopped()
+        if orch is not None:
+            try:
+                orch.mark_stopped()
+            except Exception:
+                pass
         _release_wakelock()
         try:
             os.remove(pid_file)

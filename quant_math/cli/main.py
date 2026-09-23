@@ -145,12 +145,23 @@ class _DetachedProcess:
         self._proc: Optional[subprocess.Popen] = None
 
     def is_alive(self) -> bool:
-        """Check if the process is still running via PID file + os.kill."""
+        """Check if the process is still running via PID + zombie check.
+
+        os.kill(pid, 0) miente para zombies (siguen "vivos" tras morir).
+        /proc/<pid>/stat estado Z = muerto aunque el PID exista.
+        """
         try:
             os.kill(self.pid, 0)
-            return True
         except (OSError, ProcessLookupError):
             return False
+        try:
+            with open(f"/proc/{self.pid}/stat") as fh:
+                state = fh.read().rsplit(")", 1)[-1].split()[0]
+            if state == "Z":
+                return False
+        except (OSError, IndexError, ValueError):
+            pass  # sin /proc (no-Linux) — kill(0) manda
+        return True
 
     @property
     def exitcode(self) -> Optional[int]:
@@ -246,8 +257,14 @@ class RuntimeState:
                 try:
                     pid = int(open(pid_file).read().strip())
                     os.kill(pid, 0)  # check alive
+                    try:
+                        with open(f"/proc/{pid}/stat") as fh:
+                            if fh.read().rsplit(")", 1)[-1].split()[0] == "Z":
+                                raise ProcessLookupError  # zombie = muerto
+                    except FileNotFoundError:
+                        raise ProcessLookupError
                     active[session] = pid
-                except (OSError, ValueError):
+                except (OSError, ValueError, ProcessLookupError):
                     try:
                         os.remove(pid_file)
                     except OSError:
