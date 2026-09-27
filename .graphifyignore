@@ -7,3 +7,14 @@ __pycache__/
 *.pyc
 runtime/
 *.log
+
+# Config de agentes (plugin graphify-staleness): no es codigo del proyecto y solo
+# genera falsos positivos de STALE en ponytail §4.3.1.
+.opencode/
+
+# node_modules/ (3652 ficheros, casi todos dentro de .opencode/): sin esto,
+# detect() los recorre en cada comprobacion y cuesta 0.25-0.40 s. El plugin
+# graphify-staleness lo paga en cada mensaje, no solo al commitear. Aegis ya lo
+# tenia; aqui faltaba. No hay ningun node_modules en el manifest (ya lo
+# excluia .opencode/), asi que esto no cambia el grafo: solo deja de pagarlo.
+node_modules/
