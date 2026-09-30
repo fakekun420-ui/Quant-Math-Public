@@ -13,6 +13,19 @@ each hypothesis's own real backtested expectancy > 0.
 Activation policy (anti-data-starvation):
     total records >= MIN_TOTAL  -> mode "active"   (ranking applied)
     otherwise                   -> mode "collecting" (input returned untouched)
+
+SIS coupling (correccion 4, 2026-09-29)
+---------------------------------------
+`family_prior` inyecta el aprendizaje NO supervisado del SIS
+(`OperationLearningLoop.family_prior`) en la puntuacion de cada plantilla:
+
+    score = (1 - w) * positive_rate(tipo, simbolo) + w * wr_familia(regimen)
+    w     = n_familia / (n_familia + PRIOR_K)
+
+Es decir: con 0 cierres de esa familia w=0 y el prior se comporta EXACTAMENTE
+que antes (los tests de B3 siguen valiendo); con evidencia, la familia que
+esta funcionando EN EL REGIMEN ACTUAL pesa mas en que se genera despues.
+Sigue siendo advisory: no abre ni cierra operaciones.
 """
 
 from __future__ import annotations
@@ -22,21 +35,40 @@ import os
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from quant_math.ml import families
+
 logger = logging.getLogger(__name__)
 
 MIN_TOTAL = int(os.environ.get("QUANTMATH_ML_MIN_RECORDS", "100"))
 MIN_CELL = 8
 SHRINK_K = 5.0
+#: Peso maximo del prior de familia del SIS. Igual que SHRINK_K: con
+#: n=5 cierres w=0,50; con n=15, w=0,75. La constante es la misma que la
+#: del SIS para que las dos mitades del bucle midan "evidencia" igual.
+PRIOR_K = 5.0
+
+# Vocabulario UNICO de familias (quant_math/ml/families.py). Antes estaba
+# escrito aqui y otra vez en `regime_learning`, con semanticas distintas: el
+# SIS emitia claves hoja y este modulo buscaba canonicas -> `.get()` daba
+# `None` -> w=0.0 y el aprendizaje no entraba en NADA (correccion 4).
+# Re-exportado para no romper los llamantes que importan de aqui.
+FAMILIES = families.FAMILIES
+family_of = families.family_of
 
 
 def _norm_type(strategy_type: Any) -> str:
+    """Clave de CELDA (tipo, simbolo). NO canonicar: es el granulo del KB."""
     return str(getattr(strategy_type, "value", strategy_type) or "unknown")
 
 
 class HypothesisPrior:
     """Explainable positive-expectancy prior over (strategy_type, symbol)."""
 
-    def __init__(self, records: Iterable[Dict[str, Any]]):
+    def __init__(self, records: Iterable[Dict[str, Any]],
+                 family_prior: Optional[Dict[str, Tuple[float, int]]] = None):
+        #: {(familia): (win_rate_encogido, n)} del SIS en el regimen actual.
+        #: Vacio por defecto -> el prior se comporta como antes de existir.
+        self.family_prior: Dict[str, Tuple[float, int]] = dict(family_prior or {})
         self.total = 0
         self.positives = 0
         cells: Dict[Tuple[str, str], List[float]] = {}
@@ -70,8 +102,44 @@ class HypothesisPrior:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_records(cls, records: Iterable[Dict[str, Any]]) -> "HypothesisPrior":
-        return cls(records)
+    def from_records(cls, records: Iterable[Dict[str, Any]],
+                     family_prior: Optional[Dict[str, Tuple[float, int]]] = None
+                     ) -> "HypothesisPrior":
+        return cls(records, family_prior=family_prior)
+
+    # ------------------------------------------------------------------
+
+    def family_weight(self, strategy_type: Any) -> float:
+        """w con la que la evidencia del SIS entra en el score de `stype`.
+
+        0.0 si el SIS no tiene evidencia de esa familia -> score identico al
+        anterior. Con n cierres, w = n / (n + PRIOR_K).
+        """
+        hit = self.family_prior.get(family_of(strategy_type))
+        if not hit:
+            return 0.0
+        _wr, n = hit
+        try:
+            n = float(n)
+        except (TypeError, ValueError):
+            return 0.0
+        if n <= 0:
+            return 0.0
+        return n / (n + PRIOR_K)
+
+    def score(self, strategy_type: Any, symbol: str) -> float:
+        """Puntuacion con la que se rankea una plantilla.
+
+        Base: positive_rate(tipo, simbolo) del KB. Si el SIS tiene evidencia
+        de la familia en el regimen vigente, se mezcla con su win-rate
+        encogido. NUNCA sale del rango [0, 1] porque ambas fases lo estan.
+        """
+        base = self.positive_rate(strategy_type, symbol)
+        w = self.family_weight(strategy_type)
+        if w <= 0.0:
+            return base
+        hit = self.family_prior.get(family_of(strategy_type))
+        return (1.0 - w) * base + w * float(hit[0])
 
     @property
     def is_active(self) -> bool:
@@ -129,12 +197,20 @@ class HypothesisPrior:
         exploring beyond the prior's favourites.
         """
         info = {"mode": self.mode, "total": self.total,
-                "global_rate": round(self.global_rate, 4), "reordered": False}
+                "global_rate": round(self.global_rate, 4), "reordered": False,
+                "family_prior": {f: (round(w, 3), n)
+                                 for f, (w, n) in self.family_prior.items()},
+                "family_prior_max_w": round(
+                    max([self.family_weight(t.get("strategy_type"))
+                         for t in templates], default=0.0), 3)}
         if not self.is_active or not templates:
             return templates, info
 
         scored = [
-            (_score_of(t, symbol, self), i)
+            (self.score(t.get("strategy_type"),
+                        (t.get("parameters") or {}).get("symbol")
+                        if isinstance((t.get("parameters") or {}).get("symbol"), str)
+                        else symbol), i)
             for i, t in enumerate(templates)
         ]
         exploration = max(1, top_n // 4)
@@ -171,18 +247,25 @@ class HypothesisPrior:
 
 def _score_of(template: Dict[str, Any], symbol: str,
               prior: HypothesisPrior) -> float:
+    """Score de una plantilla: base del KB mezclada con el SIS si lo hay."""
     st = template.get("strategy_type")
     params = template.get("parameters", {}) or {}
     inner_sym = params.get("symbol", symbol)
-    return prior.positive_rate(st, inner_sym if isinstance(inner_sym, str)
-                               else symbol)
+    return prior.score(st, inner_sym if isinstance(inner_sym, str)
+                       else symbol)
 
 
 def build_prior_from_kb(kb_path: str,
-                        dsn: Optional[str] = None) -> HypothesisPrior:
-    """Load every historical record (PG first, JSONL fallback) and fit."""
+                        dsn: Optional[str] = None,
+                        family_prior: Optional[Dict[str, Tuple[float, int]]] = None
+                        ) -> HypothesisPrior:
+    """Load every historical record (PG first, JSONL fallback) and fit.
+
+    `family_prior` = salida de `OperationLearningLoop.family_prior()` (SIS).
+    """
     from quant_math.autonomous_research.adapters.postgres_kb import (
         JSONLKnowledgeBase,
     )
     kb = JSONLKnowledgeBase(jsonl_path=kb_path)
-    return HypothesisPrior.from_records(kb.load_records().values())
+    return HypothesisPrior.from_records(kb.load_records().values(),
+                                        family_prior=family_prior)

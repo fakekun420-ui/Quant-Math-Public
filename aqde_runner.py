@@ -627,14 +627,16 @@ class AQDERunner:
             feedback = self.analyze_performance(symbol)
             templates = self.generate_adaptive_hypotheses(symbol, feedback)
 
-        if self.hypothesis_ranker is not None:
-            try:
-                templates = self.hypothesis_ranker(templates, symbol)
-            except Exception as exc:
-                print(f"  [ml-prior] ranker error ({exc}); orden original")
-
         # Generacion basada en modelos cientificos (ARIMA/GARCH) como fuente
         # ADICIONAL de candidatos; su ausencia nunca rompe el flujo.
+        #
+        # Se ejecuta ANTES del ranker a proposito (correccion 4, 2026-09-29):
+        # es la UNICA fuente que trae `parameters._regime`, el contexto de
+        # mercado que el SIS necesita para condicionar el orden por ventana.
+        # Antes el ranker corria primero y siempre recibia `regime=None`, de
+        # modo que la segmentacion por regimen existia en el dataset pero no
+        # llegaba nunca a decidir nada. Los scientificos entran en la lista
+        # para ser rankeados, no por delante del rankeo.
         try:
             from model_based_generator import (HAS_MODEL_BASED_GENERATOR,
                                                generate_model_hypotheses)
@@ -648,6 +650,12 @@ class AQDERunner:
                           f"para {symbol}")
         except Exception as exc:
             print(f"  [model-gen] no disponible ({type(exc).__name__}: {exc})")
+
+        if self.hypothesis_ranker is not None:
+            try:
+                templates = self.hypothesis_ranker(templates, symbol)
+            except Exception as exc:
+                print(f"  [ml-prior] ranker error ({exc}); orden original")
 
         # Select top N hypotheses
         for i, template in enumerate(templates[:self.hypotheses_per_symbol]):
