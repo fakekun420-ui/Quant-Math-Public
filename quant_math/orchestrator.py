@@ -638,6 +638,17 @@ class Orchestrator:
             lookback_days=self.config.lookback_days,
             dry_run=self.config.dry_run,
             force_real_data=True,
+            # MEDIDO el 2026-09-30: esto NO se pasaba. El AQDERunner se
+            # quedaba con su defecto
+            # "autonomous_research/data/hypotheses", mientras el motor
+            # leia y escribia `config.kb_path`
+            # (runtime/hypotheses_<sesion>.jsonl). Dos ficheros distintos,
+            # y por eso lo que generaba el ResearchManager no llegaba
+            # donde lo leía el motor: `registros=0` y `generadas=0` en
+            # cada arranque, con el log limpio.
+            # Aunque la base ahora PERSISTA, si no se le pasa la ruta
+            # correcta persistirá en un fichero que nadie lee.
+            knowledge_base_path=self.config.kb_path,
             hypothesis_ranker=self._rank_hypotheses,
         )
 

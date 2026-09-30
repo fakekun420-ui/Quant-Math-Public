@@ -266,9 +266,17 @@ class DecisionEngine:
                 from quant_math.autonomous_research.adapters import (
                     HypothesisKnowledgeBase,
                 )
-                self._kb = HypothesisKnowledgeBase(
-                    storage_path=os.path.dirname(kb_path) or "."
-                )
+                # MEDIDO el 2026-09-30: se pasaba el DIRECTORIO. Como
+                # todas las sesiones comparten dirname, y la KB resuelve
+                # un directorio a `<dir>/hypotheses.jsonl`, el motor
+                # escribia sus realimentaciones en `runtime/hypotheses.jsonl`
+                # (0 bytes) en vez de en `runtime/hypotheses_<sesion>.jsonl`,
+                # que es donde el orquestador y el prior leen. Se leia de
+                # un sitio y se escribia en otro, y el learning se quedaba
+                # sin el retorno.
+                # Se pasa el FICHERO. `kb_path` ya viene normalizado por el
+                # orquestador, y la KB normaliza igual por si acaso.
+                self._kb = HypothesisKnowledgeBase(storage_path=kb_path)
             except ImportError:
                 self._kb = None
 
