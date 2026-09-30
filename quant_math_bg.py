@@ -115,8 +115,27 @@ def main():
     signal.signal(signal.SIGINT, _handle_sigint)
     signal.signal(signal.SIGTERM, _handle_sigint)
 
-    # Set learn mode
-    os.environ.setdefault("QUANTMATH_LEARN_MODE", "1")
+    # Gate de decision (correccion no3, 2026-09-29): aqui NO se enciende
+    # nada. Esta linea hacia `setdefault("QUANTMATH_LEARN_MODE", "1")`, que
+    # gana siempre que la variable no exista, y como este es el UNICO
+    # camino de produccion el gate expectancy>0 nunca estuvo cerrado
+    # (5 de 5 operaciones con expectancy negativa en el run real, F3).
+    #
+    # Ahora la exploracion solo se activa si el operador la pide de forma
+    # EXPLICITA: `learn_mode` en la config del wizard o
+    # QUANTMATH_LEARN_MODE=1 en el entorno. Si no se pide, la variable se
+    # deja como estuviera y la politica (quant_math/risk/gate_policy.py)
+    # resuelve GATE CERRADO. La resolucion queda registrada en
+    # <state_dir>/learn_mode_audit.jsonl.
+    _learn_requested = cfg_dict.get("learn_mode")
+    if _learn_requested is not None:
+        os.environ["QUANTMATH_LEARN_MODE"] = (
+            "1" if _learn_requested else "0")
+        print(f"[gate] learn_mode={bool(_learn_requested)} pedido "
+              f"explicitamente en la config")
+    else:
+        print("[gate] learn_mode NO pedido: gate expectancy>0 CERRADO "
+              "(igual que el motor; la exploracion hay que pedirla)")
 
     from quant_math.orchestrator import Orchestrator, OrchestratorConfig
 
