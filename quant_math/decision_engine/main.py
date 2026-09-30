@@ -612,7 +612,14 @@ class DecisionEngine:
         """SL/TP para TODAS las posiciones abiertas, incluidas las de simbolos
         que ya no estan en la configuracion (posiciones huerfas tras un cambio
         de universo). Sin esto quedan abiertas para siempre."""
-        symbols = sorted({k.rsplit(":", 1)[-1]
+        # La clave es "{hipotesis_id}:{simbolo}" y el simbolo PERPETUAL
+        # contiene dos puntos ("BTC/USDT:USDT"). Con rsplit(":", 1) se
+        # parte por el ULTIMO y sale "USDT" pelado: medido en el run real
+        # del 2026-09-30, "bybit does not have market symbol USDT", y las
+        # salidas de los perps no se podian comprobar. El hipotesis_id
+        # nunca lleva dos puntos, asi que partir por el PRIMERO devuelve
+        # el simbolo entero.
+        symbols = sorted({k.split(":", 1)[-1]
                           for k in self.open_positions})
         closed = []
         for symbol in symbols:
@@ -683,7 +690,9 @@ class DecisionEngine:
         total = 0.0
         by_symbol: Dict[str, List[str]] = {}
         for key in self.open_positions:
-            symbol = key.rsplit(":", 1)[-1]
+            # Partir por el PRIMERO dos puntos: el simbolo perp los lleva
+            # (ver nota en check_exits_all).
+            symbol = key.split(":", 1)[-1]
             by_symbol.setdefault(symbol, []).append(key)
         for symbol, keys in sorted(by_symbol.items()):
             price = self._last_close(symbol)

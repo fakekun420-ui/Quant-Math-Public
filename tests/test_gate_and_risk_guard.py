@@ -921,3 +921,71 @@ if __name__ == "__main__":
             fails += 1
             print("FAIL " + name + ": " + str(exc)[:120])
     raise SystemExit(1 if fails else 0)
+
+
+# ---------------------------------------------------------------------------
+# Exploracion con dinero real (2026-09-30)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def claves_de_test(monkeypatch):
+    """Claves FICTICIAS para poder construir una config live.
+
+    El bloqueo de claves de __post_init__ esta a proposito y estos tests
+    comprueban el guard de EXPLORACION, no el de credenciales. Se asignan
+    con monkeypatch (no con setdefault) porque .env trae BYBIT_API_KEY=""
+    y load_dotenv ya lo dejo en el entorno como cadena vacia, que es falsy.
+    """
+    monkeypatch.setenv("BYBIT_API_KEY", "CLAVE_DE_TEST")
+    monkeypatch.setenv("BYBIT_API_SECRET", "SECRETO_DE_TEST")
+    monkeypatch.setenv("BYBIT_TESTNET", "true")
+    return "CLAVE_DE_TEST"
+
+
+def _cfg_live(tmp, learn_mode, testnet):
+    from quant_math.orchestrator import OrchestratorConfig
+    return OrchestratorConfig(
+        symbols=["BTC/USDT:USDT"], timeframe="1h", lookback_days=30,
+        min_paper_trades=1, hypotheses_per_cycle=1,
+        kb_path=f"{tmp}/kb.jsonl", state_dir=tmp,
+        initial_capital=1000.0, entry_pct=0.05, take_profit_pct=0.05,
+        leverage=10, mode="classic", dry_run=False, testnet=testnet,
+        learn_mode=learn_mode)
+
+
+def test_learn_mode_bloqueado_en_mainnet(tmp_path, claves_de_test):
+    """Explorar con dinero real es perdida garantizada: no se arranca.
+
+    `learn_mode` abre el gate expectancy>0 y opera con expectativa negativa
+    a PROPOSITO. En mainnet eso es cada trade perdiendo dinero.
+    """
+    with pytest.raises(ValueError, match="learn_mode=True esta BLOQUEADO"):
+        _cfg_live(str(tmp_path), learn_mode=True, testnet=False)
+
+
+def test_learn_mode_permitido_en_testnet(tmp_path, claves_de_test):
+    """Testnet es dinero del exchange: el circuito se ejercita sin coste."""
+    cfg = _cfg_live(str(tmp_path), learn_mode=True, testnet=True)
+    assert cfg.learn_mode is True
+
+
+def test_learn_mode_permitido_en_paper(tmp_path):
+    """El paper ilimitado en tiempo es la forma correcta de explorar."""
+    from quant_math.orchestrator import OrchestratorConfig
+    cfg = OrchestratorConfig(
+        symbols=["BTC/USDT:USDT"], timeframe="1h", lookback_days=30,
+        min_paper_trades=1, hypotheses_per_cycle=1,
+        kb_path=f"{tmp_path}/kb.jsonl", state_dir=str(tmp_path),
+        initial_capital=1000.0, entry_pct=0.05, take_profit_pct=0.05,
+        leverage=10, mode="classic", dry_run=True, testnet=True,
+        learn_mode=True)
+    assert cfg.learn_mode is True
+
+
+def test_el_bloqueo_no_se_esquiva_con_entorno(monkeypatch, tmp_path):
+    """Ni una variable de entorno lo esquiva. Perdida garantizada, no
+    una preferencia: por eso no hay mando trasero."""
+    monkeypatch.setenv("QUANTMATH_LEARN_MODE", "1")
+    monkeypatch.setenv("QUANTMATH_ALLOW_LIVE_LEARN_MODE", "1")
+    with pytest.raises(ValueError, match="BLOQUEADO"):
+        _cfg_live(str(tmp_path), learn_mode=True, testnet=False)

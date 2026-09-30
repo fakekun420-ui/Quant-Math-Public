@@ -210,3 +210,49 @@ def test_el_cierre_exitoso_si_quita_la_posicion(fake_api):
     closure = e.close_position("h1", "BTC/USDT:USDT", motivo="tp", exit_price=105.0)
     assert key not in e.open_positions, "una cerrada correcta se quita"
     assert closure["live_close"]["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# La clave de posicion y el simbolo PERPETUAL (2026-09-30)
+# ---------------------------------------------------------------------------
+
+def test_la_clave_de_posicion_no_parte_mal_el_simbolo_perp():
+    """La clave es "hipotesis_id:symbol" y el simbolo perp lleva dos puntos.
+
+    Con rsplit(":", 1) se parte por el ULTIMO y sale "USDT" pelado. Se vio
+    en el run real del 2026-09-30: "bybit does not have market symbol USDT",
+    y las salidas de los perps no se podian comprobar. Este test es el que
+    faltaba y por eso el bug llego a produccion.
+    """
+    key = "hyp_ae287e64:BTC/USDT:USDT"
+    assert key.rsplit(":", 1)[-1] == "USDT", "el bug: sale el ticker solo"
+    assert key.split(":", 1)[-1] == "BTC/USDT:USDT", "el arreglo"
+
+
+def test_check_exits_ve_los_simbolos_perp_completos():
+    """check_exits_all() tiene que devolver 'BTC/USDT:USDT', no 'USDT'."""
+    from quant_math.decision_engine.main import DecisionEngine
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="perp-")
+    e = DecisionEngine(symbols=["BTC/USDT:USDT"], kb_path=f"{tmp}/kb.jsonl",
+                       state_dir=tmp, take_profit_pct=0.05)
+    e.open_positions["hyp_1:BTC/USDT:USDT"] = {
+        "side": "buy", "entry_price": 100.0, "quantity": 1.0}
+    e.open_positions["hyp_2:ETH/USDT:USDT"] = {
+        "side": "buy", "entry_price": 200.0, "quantity": 1.0}
+
+    vistos = []
+    e._check_exits = lambda sym: vistos.append(sym) or []
+    e.check_exits_all()
+
+    assert sorted(vistos) == ["BTC/USDT:USDT", "ETH/USDT:USDT"], (
+        f"los simbolos perp deben llegar completos, llegaron {vistos}")
+
+
+def test_reconcile_tambien_parte_por_el_primer_dos_puntos():
+    """La reconciliacion copio el patron roto; ahora queda fijado."""
+    from quant_math.orchestrator import Orchestrator
+    from quant_math.autonomous_research.adapters.quant_math_adapter import (
+        QuantMathAdapter)
+    key = "hyp_x:BTC/USDT:USDT"
+    assert key.split(":", 1)[-1] == "BTC/USDT:USDT"

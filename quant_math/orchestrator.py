@@ -181,6 +181,34 @@ class OrchestratorConfig:
             raise ValueError("drawdown_limit debe estar en (0, 1]")
         if not 0 < self.max_position_pct <= 1:
             raise ValueError("max_position_pct debe estar en (0, 1]")
+        # EXPLORACION + DINERO REAL = PERDIDA GARANTIZADA.
+        #
+        # `learn_mode` abre el gate `expectancy > 0`, es decir: admite operar
+        # con expectativa MATEMATICA NEGATIVA a proposito, para reunir datos con
+        # los que el SIS aprenda. En paper no cuesta nada: por eso el paper
+        # ilimitado en tiempo es la forma correcta de explorar.
+        #
+        # En MAINNET eso es cada trade perdiendo dinero, y el "aprendizaje"
+        # seria en realidad una donacion. Por eso se BLOQUEA, y sin mando
+        # trasero: no hay variable de entorno que lo esquive. Si hay que
+        # explorar en vivo, se hace en TESTNET, que es dinero del exchange y
+        # no tuyo.
+        #
+        # Medido antes de poner esto: no existia NINGUNA proteccion — ni aqui
+        # ni en el motor, que ni siquiera recibe `dry_run`.
+        if not self.dry_run and not self.testnet and self.learn_mode:
+            raise ValueError(
+                "learn_mode=True esta BLOQUEADO en mainnet por diseno: abre "
+                "el gate expectancy>0 y opera con expectativa negativa a "
+                "proposito, lo que es perdida garantizada con dinero real. "
+                "Opciones: (a) explorar en paper, que es gratis y es donde el "
+                "aprendizaje tiene sentido; (b) explorar en testnet "
+                "(testnet=True, dry_run=False), que ejercita el circuito "
+                "completo sin dinero propio; (c) si de verdad quieres aceptar "
+                "la perdida en mainnet, deja learn_mode=False y baja "
+                "min_expectancy, que si queda registrado en "
+                "learn_mode_audit.jsonl y en cada entrada del ledger"
+            )
         if self.dry_run is False:
             # Fase 3: testnet live OK con API keys.
             # Fase 4: mainnet exige acción explícita del operador:
@@ -764,7 +792,10 @@ class Orchestrator:
         # "hipotesis_id:s simbolo". La cantidad sale del ledger de entradas.
         local_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         for key, pos in local.items():
-            symbol = pos.get("symbol") or key.rsplit(":", 1)[-1]
+            # Partir por el PRIMERO dos puntos: el simbolo perp los lleva
+            # ("BTC/USDT:USDT"). Con rsplit salia "USDT" pelado, y las
+            # posiciones de perps no se podian ni marcar ni cerrar.
+            symbol = pos.get("symbol") or key.split(":", 1)[-1]
             qty = 0.0
             try:
                 qty, _notional = engine._last_entry_sizing(key)
