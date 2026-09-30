@@ -588,7 +588,15 @@ class Backtester:
     # Futures realism defaults (Bybit USDT perpetuals)
     DEFAULT_FUNDING_8H = 0.0001      # 0.01% per 8h funding interval
     DEFAULT_SLIPPAGE_PCT = 0.0001   # 1bp adverse fill
-    MAINTENANCE_MARGIN_RATE = 0.005  # 0.5% maintenance margin
+    #: MMR por defecto = 0,0033, LEIDO del endpoint publico de Bybit el
+    #: 2026-09-30 (`/v5/market/risk-limit`, primer tramo, que es el que
+    #: corresponde a un nocional pequeno). Antes estaba HARDCODEADO en 0,005,
+    #: que era el segundo tramo y ademas un supuesto: eso ponia la
+    #: liquidacion MAS CERCA de lo real, o sea que el backtest era
+    #: OPTIMISTA y se:"-subestimaba" el riesgo de liquidacion.
+    #: El MMR real es ESCALONADO por nocional; ver
+    #: `quant_math.risk.roe_targets.BYBIT_MMR_TIERS` y `mmr_for_notional()`.
+    MAINTENANCE_MARGIN_RATE = 0.0033  # primer tramo real de Bybit (2026-09-30)
 
     def __init__(self, initial_capital: float = 100000.0,
                  commission_rate: float = 0.001,
@@ -596,7 +604,8 @@ class Backtester:
                  slippage_pct: float = 0.0,
                  leverage: float = 1.0,
                  funding_rate_8h: float = 0.0,
-                 timeframe: str = "1h"):
+                 timeframe: str = "1h",
+                 maintenance_margin_rate: Optional[float] = None):
         """
         Initialize backtester.
 
@@ -628,6 +637,12 @@ class Backtester:
         self.leverage = max(1.0, float(leverage))
         self.funding_rate_8h = float(funding_rate_8h)
         self.timeframe = timeframe
+        # MMR configurable: el real de Bybit es escalonado por nocional y el
+        # valor hardcodeado (0,005) era del segundo tramo. Con None se usa el
+        # primer tramo real, que es el que corresponde a un nocional pequeno.
+        self.maintenance_margin_rate = float(
+            self.MAINTENANCE_MARGIN_RATE
+            if maintenance_margin_rate is None else maintenance_margin_rate)
 
     # ------------------------------------------------------------------
     # Futures realism helpers
@@ -667,7 +682,7 @@ class Backtester:
         """Liquidation price for a long at configured leverage (None if spot)."""
         if self.leverage <= 1.0:
             return None
-        drop = 1.0 / self.leverage - self.MAINTENANCE_MARGIN_RATE
+        drop = 1.0 / self.leverage - self.maintenance_margin_rate
         if drop <= 0:
             return None
         return entry_price * (1.0 - drop)
