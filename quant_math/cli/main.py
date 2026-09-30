@@ -652,6 +652,38 @@ def _roe_plan_panel(plan) -> str:
 from quant_math.risk.roe_targets import DEFAULT_MAX_RISK_PER_TRADE_PCT
 
 
+def _ask_reconcile() -> bool:
+    """Pregunta si la reconciliacion debe REGISTRAR los cierres del exchange.
+
+    MEDIDO el 2026-09-30 con el brazo corriendo: se abrieron 5 cortas de XRP,
+    Bybit las fusiono en una sola de 33 XRP, el TP del exchange la cerro de
+    golpe y el motor se quedo con 5 posiciones fantasma y CERO cierres en el
+    libro. El SIS se alimenta de cierres, luego no aprendio nada de todo
+    eso, y el brazo quedo bloqueado con `open positions 5 >= max 5`.
+
+    El arreglo ya existia (la reconciliacion localiza el relleno REAL con
+    `fetch_my_trades` y lo registra), pero vivia detras de un interruptor
+    en `False` que NADIE preguntaba. Un arreglo que no se puede activar no
+    arregla nada: hay que preguntar.
+    """
+    console.print()
+    console.print("[yellow]Cierres que ejecuta el exchange:[/yellow]")
+    console.print(
+        "  El TP y el SL los pone Bybit, y los ejecuta Bybit. El motor no "
+        "decide ese cierre,\n  luego no se entera salvo por la "
+        "reconciliación. Sin ella:\n"
+        "    - el cierre NO entra al libro y el SIS no aprende de el\n"
+        "    - el estado local cree que la posicion sigue abierta\n"
+        "    - el equity muestra un PnL flotante que ya no existe")
+    console.print(
+        "[dim]MEDIDO: con esto apagado, 5 posiciones cerradas por el exchange "
+        "dejaron 0 cierres\n  y el brazo bloqueado.[/dim]")
+    return bool(questionary.confirm(
+        "¿Registrar automáticamente esos cierres? "
+        "(SÍ = aprende de ellos; NO = el bot no verá sus propios cierres)",
+        default=True).unsafe_ask())
+
+
 def _ask_isolated(initial_capital: float, roe_plan) -> bool:
     """Pregunta si exigir margen AISLADO, y enseña lo que cuesta cruzarse.
 
@@ -919,6 +951,8 @@ def wizard() -> Optional[Dict]:
                 initial_capital, leverage, roe_plan.sl_price_distance),
             "require_isolated_margin": _ask_isolated(initial_capital,
                                                      roe_plan),
+            "reconcile_auto_close": _ask_reconcile(),
+            "one_position_per_symbol": True,
         }
     except (AttributeError):
         # ESC / pregunta cancelada -> volver al menú.
@@ -1317,7 +1351,22 @@ def _learning_panel_data(state_dir: str, trades, stats: Dict) -> Dict:
 def render_monitor(runtime: RuntimeState, mode: str = "classic"):
     stats = runtime.stats_for(mode)
     cfg = stats.get("config", {})
-    state_dir = cfg.get("state_dir", "runtime/state")
+    # MEDIDO el 2026-09-30: `cfg.get("state_dir", "runtime/state")` caia en
+    # la ruta POR DEFECTO, que es una sesion VIEJA, cuando el stats no traia
+    # state_dir. El monitor enseaba 0 posiciones y equity inicial con 5
+    # posiciones vivas en el exchange.
+    #
+    # Ahora la ruta se resuelve por el MISMO orden que usa el motor, y si no
+    # aparece se DICE en vez de fingir: un panel que muestra ceros sin
+    # avisar de que esta mirando otro sitio es peor que no mostrarlo, porque
+    # parece que el bot no esta haciendo nada.
+    state_dir = (cfg.get("state_dir")
+                 or (runtime.configs.get(mode) or {}).get("state_dir")
+                 or runtime._default_state_dir(mode))
+    if not os.path.isdir(state_dir):
+        console.print(f"[yellow]El monitor no encuentra el estado en "
+                      f"{state_dir}; no se puede mostrar el ciclo real.[/]")
+        return None
     state = "RUNNING" if runtime.running_mode(mode) else "STOPPED"
 
     header = Table.grid(padding=(0, 2))
@@ -1445,13 +1494,30 @@ def render_monitor(runtime: RuntimeState, mode: str = "classic"):
             body.add_row("Pérdidas consecutivas",
                          Text(str(cl), style="red"))
 
+    # Solo lo que el operador metio y necesita reconocer. MEDIDO el
+    # 2026-09-30: el panel era una lista de 12 claves techniques y le
+    # faltaba el APALANCAMIENTO, que es lo primero que uno quiere ver.
     config_panel = Table.grid(padding=(0, 1))
-    for key in ("symbols", "timeframe", "initial_capital", "entry_pct",
-                "take_profit_pct", "stop_loss_pct", "lookback_days",
-                "min_paper_trades", "hypotheses_per_cycle", "exchange_id",
-                "mode", "leverage"):
+    for etiqueta, key, sufijo in (
+            ("capital", "initial_capital", " USDT"),
+            ("apalancamiento", "leverage", "x"),
+            ("simbolo", "symbols", ""),
+            ("temporalidad", "timeframe", ""),
+            ("TP / SL", None, ""),
+            ("modo", "mode", ""),
+            ("exchange", "exchange_id", "")):
+        if key is None:
+            tp = cfg.get("take_profit_pct")
+            sl = cfg.get("stop_loss_pct")
+            if tp is not None and sl is not None:
+                config_panel.add_row(etiqueta,
+                                     f"{tp*100:.3f}% / {sl*100:.3f}%")
+            continue
         if key in cfg:
-            config_panel.add_row(key, str(cfg[key]))
+            valor = cfg[key]
+            if isinstance(valor, list):
+                valor = ", ".join(str(v) for v in valor)
+            config_panel.add_row(etiqueta, f"{valor}{sufijo}")
 
     outer = Table.grid()
     outer.add_row(header)

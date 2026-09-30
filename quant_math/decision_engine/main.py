@@ -96,6 +96,7 @@ class DecisionEngine:
         stop_loss_roe: Optional[float] = None,
         leverage: int = 1,
         learn_mode: Optional[bool] = None,
+        one_position_per_symbol: bool = True,
         auto_graduate: Optional[bool] = None,
         graduate_window: Optional[int] = None,
         # Umbrales del gate (correccion no3). min_expectancy esta en la
@@ -141,6 +142,11 @@ class DecisionEngine:
                                      else bool(learn_mode))
         self.min_expectancy, self.min_scientific_score = (
             resolve_gate_thresholds(min_expectancy, min_scientific_score))
+        # Una posicion por simbolo. Bybit funde las ordenes del mismo
+        # simbolo (modo net) y el motor no, luego abrir dos sobre el mismo
+        # activo deja mas posiciones locales que reales. MEDIDO el
+        # 2026-09-30: 5 locales contra 1 en el exchange.
+        self.one_position_per_symbol = one_position_per_symbol
         logger.info(
             "[gate] umbral: expectancy > %.5f (%% capital/trade), "
             "scientific_score > %.3f",
@@ -437,6 +443,39 @@ class DecisionEngine:
         if self.take_profit_pct is None:
             return None
         return self.take_profit_pct / 2.0
+
+    def symbols_with_open_positions(self) -> set:
+        """Simbolos con AL MENOS una posicion viva, de cualquier hipotesis.
+
+        Existe por un fallo medido el 2026-09-30 con el brazo corriendo en
+        testnet. Bybit funciona en modo NET: dos ordenes en la MISMA
+        direccion sobre el MISMO simbolo NO abren dos posiciones, se
+        FUSIONAN en una sola con entrada ponderada. El sistema, en cambio,
+        guardaba una posicion local por hipotesis:
+
+            local:      5 posiciones (5 hipotesis distintas)
+            exchange:   1 posicion  (33 XRP, entrada 1,4977)
+
+        Las consecuencias fueron tres y todas malas:
+
+        1. El libro local deia 5 y el exchange 1, luego al cerrar de golpe
+           (el TP del exchange) quedaron 5 posiciones fantasma y el brazo
+           quedo bloqueado con `open positions 5 >= max 5`, sin poder
+           operar nunca mas.
+        2. El PnL flotante que se mostraba (+0,15 USDT) era FICTICIO: la
+           posicion ya estaba cerrada y solo local seguia mirandola.
+        3. Los 5 closeres no entraron al libro (0 cierres), luego el SIS
+           no aprendio nada de ellos.
+
+        Root cause, no un detalle: el exchange NETEA y el motor no.
+        """
+        salida = set()
+        for key in self.open_positions:
+            pos = self.open_positions.get(key) or {}
+            simbolo = pos.get("symbol") or key.split(":", 1)[-1]
+            if simbolo:
+                salida.add(simbolo)
+        return salida
 
     def has_open_position(self, hypothesis_id: str, symbol: str) -> bool:
         return self._position_key(hypothesis_id, symbol) in self.open_positions
@@ -1276,6 +1315,11 @@ class DecisionEngine:
         candidates = self.ranked_candidates(symbol)
         chosen = None
         first_guard_hyp = None
+        # Simbolos ya ocupados ANTES de elegir. Se calcula una vez por ciclo
+        # y no en cada candidato: el bucle recorre decenas de hipotesis y
+        # recorrerlas todas en cada vuelta es cuadratico.
+        ya_ocupados = (self.symbols_with_open_positions()
+                       if self.one_position_per_symbol else set())
 
         for cand in candidates:
             exp_c = float(cand.get("expectancy", 0.0))
@@ -1298,6 +1342,14 @@ class DecisionEngine:
                 if first_guard_hyp is None:
                     first_guard_hyp = cand_id
                 continue                   # probar siguiente mejor
+            # Bybit fusiona por simbolo (modo net), luego abrir una segunda
+            # posicion en el MISMO activo deja el estado local con mas
+            # posiciones que el exchange. Ver `symbols_with_open_positions`.
+            if (self.one_position_per_symbol
+                    and symbol in ya_ocupados):
+                if first_guard_hyp is None:
+                    first_guard_hyp = cand_id
+                continue
             chosen = cand
             break
 

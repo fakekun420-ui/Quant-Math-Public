@@ -158,7 +158,12 @@ def test_o3_multi_symbol_independent_decisions():
         assert r1["action"] == "entry" and r2["action"] == "entry"
         assert eng.has_open_position("h_xrp", "XRP/USDT")
         assert eng.has_open_position("h_btc", "BTC/USDT")
-        # re-decidir XRP con su hipotesis abierta y otra libre -> P1 fallback
+        # Re-decidir XRP con su hipotesis abierta y otra libre del MISMO
+        # simbolo. MEDIDO el 2026-09-30: antes caia al siguiente mejor y
+        # abria una SEGUNDA posicion de XRP. Bybit funde las del mismo
+        # simbolo (modo net), luego el exchange acababa con UNA posicion de
+        # 33 XRP y el estado local con 5. Ahora NO se abre: es preferible
+        # perder una entrada que desfasar el libro entero.
         rows.append({"hypothesis_id": "h_xrp2", "symbol": "XRP/USDT",
                      "status": "backtested", "strategy_type": "momentum",
                      "expectancy": 0.04})
@@ -166,10 +171,13 @@ def test_o3_multi_symbol_independent_decisions():
             fh.write(json.dumps(rows[-1]) + "\n")
         eng._load_jsonl()
         r3 = eng.decide("XRP/USDT")
-        assert r3["action"] == "entry"
-        assert r3["hypothesis_id"] == "h_xrp2"     # cayo al siguiente mejor
-        assert not eng.has_open_position("h_btc", "XRP/USDT") or True
-        # el guard es por key simbolo-especifico
+        assert r3["action"] != "entry", (
+            "ha abierto una segunda posicion del mismo simbolo: el exchange "
+            "la fusionaria y el estado local quedaria desfasado")
+        # Y BTC sigue libre: el bloqueo es POR SIMBOLO, no global
+        r4 = eng.decide("BTC/USDT")
+        assert r4["action"] in ("entry", "skip_position_guard"), r4
+        # el guard original, por key, sigue intacto
         assert eng.has_open_position("h_xrp", "XRP/USDT")
     print("PASS O3: decisiones multi-simbolo aisladas por key")
 

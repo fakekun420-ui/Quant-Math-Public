@@ -172,13 +172,20 @@ def _orchestrator(tmp, candles, *, capital=50.0, hypotheses=(),
 
 def _abrir(o, n=3, entry=100.0, notional=10.0, side="buy",
            take_profit_pct=0.25, stop_loss_pct=0.125, opened_at=None,
-           con_margin=True, prefix="h"):
+           con_margin=True, prefix="h", symbols=None):
     """Abre n posiciones VIVAS de forma coherente libro<->motor.
 
     El libro lleva las filas de entrada que escribe
     _execute_paper_trade y el motor lleva open_positions. Las dos
     mitades tienen que cuadrar: si no, el orquestador las declara SIN
     MARCAR y el guard bloquea.
+
+    `symbols` reparte las n posiciones entre VARIOS activos. Hace falta
+    desde el 2026-09-30: Bybit funde las ordenes del mismo simbolo (modo
+    net) y el motor ya no abre dos sobre el mismo activo, luego un test que
+    abra n posiciones del MISMO simbolo ya no mide el tope de posiciones sino
+    otra cosa. Con simbolos distintos, `max_open_positions` vuelve a ser lo
+    que se esta probando.
     """
     if opened_at is None:
         opened_at = time.time()
@@ -187,9 +194,10 @@ def _abrir(o, n=3, entry=100.0, notional=10.0, side="buy",
     with open(path, "a", encoding="utf-8") as fh:
         for i in range(n):
             hid = prefix + str(i + 1)
-            key = hid + ":" + SYMBOL
+            sym = symbols[i % len(symbols)] if symbols else SYMBOL
+            key = hid + ":" + sym
             row = {
-                "mode": "paper", "key": key, "symbol": SYMBOL, "side": side,
+                "mode": "paper", "key": key, "symbol": sym, "side": side,
                 "quantity": notional / entry, "notional_usd": notional,
                 "entry_price": entry, "timestamp": opened_at,
                 "hypothesis_id": hid, "cycle": 0,
@@ -199,7 +207,7 @@ def _abrir(o, n=3, entry=100.0, notional=10.0, side="buy",
                 row["leverage"] = 1
             fh.write(json.dumps(row) + "\n")
             pos = {"key": key, "opened_at": opened_at, "side": side,
-                   "entry_price": entry, "leverage": 1}
+                   "symbol": sym, "entry_price": entry, "leverage": 1}
             if take_profit_pct is not None:
                 pos["take_profit_pct"] = take_profit_pct
                 pos["stop_loss_pct"] = stop_loss_pct
@@ -892,7 +900,8 @@ def test_el_tope_de_posiciones_simultaneas_lo_aplica_el_guard(
     o = _orchestrator(tmp_path, _ohlc(100.0), max_open_positions=5,
                       hypotheses=[_hyp("h_ok", 0.50)], monkeypatch=monkeypatch,
                       state_name="p5")
-    _abrir(o, n=5, entry=100.0, notional=1.0)
+    _abrir(o, n=5, entry=100.0, notional=1.0,
+           symbols=["XRP/USDT", "BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"])
     o.run_cycle()
     reason = o.stats["risk_halt"]
     assert reason and "open positions" in reason
@@ -903,7 +912,10 @@ def test_el_tope_de_posiciones_simultaneas_lo_aplica_el_guard(
     o2 = _orchestrator(tmp_path, _ohlc(100.0), max_open_positions=5,
                        hypotheses=[_hyp("h_ok", 0.50)], monkeypatch=monkeypatch,
                        state_name="p4")
-    _abrir(o2, n=4, entry=100.0, notional=1.0)
+    # Ninguno de los cuatro es SYMBOL: el simbolo que decide el ciclo tiene
+    # que estar LIBRE, o el bloqueo seria por simbolo y no por tope.
+    _abrir(o2, n=4, entry=100.0, notional=1.0,
+           symbols=["XRP/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"])
     o2.run_cycle()
     assert o2.stats["risk_halt"] is None
     assert o2.stats["signals"] == 1
@@ -1134,3 +1146,54 @@ def test_el_suelo_de_coste_es_un_parametro_apagado_por_defecto():
         assert env_float(COST_FLOOR_GATE_ENV, DEFAULT_COST_FLOOR_GATE) == 1.0
     finally:
         del _os.environ[COST_FLOOR_GATE_ENV]
+
+
+# ---------------------------------------------------------------------------
+# MONITOR: tiene que mirar la sesion que esta CORRIENDO (2026-09-30)
+#
+# MEDIDO: el monitor enseño 0 posiciones, 0 equity y 0 PnL mientras el
+# bot tenia 5 posiciones vivas en el exchange. La causa era que
+# `render_monitor` hacia
+#
+#     cfg = stats.get("config", {})
+#     state_dir = cfg.get("state_dir", "runtime/state")
+#
+# y el bloque `config` de `runtime_stats.json` NO llevaba `state_dir`
+# (tampoco `session`, ni `leverage`). Con eso caia en la ruta POR DEFECTO,
+# que es una sesion VIEJA y vacia. El panel moria justo cuando habia algo
+# que mirar, que es el peor momento posible para un panel.
+# ---------------------------------------------------------------------------
+
+def test_el_stats_es_autodescriptivo():
+    """`runtime_stats.json` tiene que decir DONDE esta su propio estado.
+
+    Sin esto el monitor no tiene forma de saber a donde mirar, y su
+    unica salida es la ruta por defecto, que no es la de la sesion.
+    """
+    from quant_math.orchestrator import OrchestratorConfig
+    import inspect
+    src = inspect.getsource(Orchestrator)
+    for clave in ('"state_dir": self.config.state_dir',
+                  '"leverage": self.config.leverage',
+                  '"session": getattr'):
+        assert clave in src, f"el stats no escribe {clave}: el monitor no " \
+                            f"puede resolver donde esta el estado"
+
+
+def test_el_monitor_no_cae_en_la_ruta_por_defecto():
+    """Si el estado no existe, el monitor AVISA; no enseña ceros."""
+    import inspect
+    src = inspect.getsource(
+        __import__("quant_math.cli.main", fromlist=["render_monitor"])
+        .render_monitor)
+    # Se mira el CODIGO, no el texto: el comentario que explica el bug
+    # contiene la cadena prohibida y hacia fallar el test contra si mismo.
+    # Un test que se lee a si mismo no prueba nada.
+    codigo = "\n".join(l for l in src.splitlines()
+                        if not l.strip().startswith("#"))
+    prohibido = 'cfg.get("state_dir", "runtime/state")'
+    assert prohibido not in codigo, (
+        "el monitor sigue cayendo en la ruta por defecto: eso es lo que le "
+        "hizo enseñar la sesion vieja")
+    assert "no se puede mostrar el ciclo real" in codigo, (
+        "y tiene que decir que no puede, en vez de fingir que todo va bien")

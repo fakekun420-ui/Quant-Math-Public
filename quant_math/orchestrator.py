@@ -173,6 +173,22 @@ class OrchestratorConfig:
     # una consecuencia de medir. Por defecto solo avisa y deja que un humano
     # (o el ciclo siguiente) decida. Poner True para cerrar automaticamente.
     reconcile_auto_close: bool = False
+    # Una posicion por simbolo. Bybit funde las ordenes del mismo activo
+    # (modo net): dos cortas sobre XRP se convierten en UNA sola posicion
+    # con entrada ponderada. Si el motor guarda una posicion local por
+    # hipotesis, el estado local acaba teniendo MAS posiciones que el
+    # exchange, y al cerrar de golpe el TP quedan todas como fantasma.
+    #
+    # MEDIDO el 2026-09-30 con el brazo corriendo: 5 posiciones locales
+    # (5 hipotesis) contra 1 en el exchange (33 XRP). Consecuencias: el
+    # brazo quedo bloqueado con `open positions 5 >= max 5`, el PnL
+    # flotante que se mostraba (+0,15) era FICTICIO porque la posicion ya
+    # estaba cerrada, y los 5 cierres no entraron al libro, luego el SIS
+    # no aprendio nada.
+    #
+    # False solo tiene sentido en modo HEDGE, donde el exchange SI admite
+    # posiciones separadas en la misma direccion. En net no.
+    one_position_per_symbol: bool = True
     # Posiciones vivas que pueden quedar SIN marcar (sin precio o sin
     # tamano en el libro) antes de bloquear entradas. 0 = falla cerrado.
     max_unpriced_positions: int = 0
@@ -546,6 +562,25 @@ class Orchestrator:
             with open(self.stats_path, "w", encoding="utf-8") as fh:
                 json.dump({**self.stats,
                            "config": {
+                               # MEDIDO el 2026-09-30: faltaban. El monitor
+                               # hace `cfg = stats.get("config", {})` y luego
+                               # `state_dir = cfg.get("state_dir",
+                               # "runtime/state")`. Sin este campo caia en la
+                               # ruta POR DEFECTO, que es una sesion VIEJA, y
+                               # el monitor enseñaba 0 posiciones y 0 equity
+                               # mientras el bot tenia 5 posiciones vivas.
+                               # O sea: el panel moria exactamente cuando
+                               # habia algo que mirar.
+                               "state_dir": self.config.state_dir,
+                               "session": getattr(self.config, "session", None),
+                               # El monitor pide la clave `leverage` y sin
+                               # esto no la encuentra: `effective_leverage`
+                               # es el MISMO numero con otro nombre, y el
+                               # panel lo descartaba en silencio. El
+                               # apalancamiento es justo lo que el operador
+                               # quiere ver, asi que se escribe con el
+                               # nombre que el panel lee.
+                               "leverage": self.config.leverage,
                                "symbols": self.config.symbols,
                                "initial_capital": self.config.initial_capital,
                                "entry_pct": self.config.entry_pct,
@@ -766,6 +801,7 @@ class Orchestrator:
             burst_leverage=self.config.burst_leverage,
             # Gate: cerrado por defecto, y con umbral explicito.
             learn_mode=self.config.learn_mode,
+            one_position_per_symbol=self.config.one_position_per_symbol,
             min_expectancy=self.config.min_expectancy,
             min_scientific_score=self.config.min_scientific_score,
         )

@@ -500,3 +500,85 @@ def test_el_ledger_no_se_toca(fake_api):
     orch.reconcile_positions(dry=False)
     with open(ledger, "r", encoding="utf-8") as fh:
         assert fh.read() == original, "el libro permanente fue modificado"
+
+
+# ---------------------------------------------------------------------------
+# FUSION DE POSICIONES (2026-09-30)
+#
+# Bybit funciona en modo NET: dos ordenes en la MISMA direccion sobre el
+# MISMO simbolo NO abren dos posiciones, se fusionan en una con entrada
+# ponderada. El motor guardaba una posicion local por hipotesis, luego:
+#
+#     local:      5 posiciones (5 hipotesis)
+#     exchange:   1 posicion  (33 XRP @ 1,4977)
+#
+# Al cerrar el TP de golpe quedaron 5 fantasmas, el brazo se bloqueo con
+# `open positions 5 >= max 5`, el PnL flotante que se mostraba era
+# FICTICIO y el SIS no aprendio de ningun cierre.
+# ---------------------------------------------------------------------------
+
+def test_el_exchange_fusiona_y_el_motor_no_debe_dejarlo_pasar(monkeypatch):
+    """Dos hipotesis sobre el MISMO simbolo: solo se abre una posicion.
+
+    Se comprueba contra un cliente que MENTA la fusion, que es lo que hace
+    Bybit de verdad: si el motor abriera las dos, la prueba falla.
+    """
+    from quant_math.decision_engine import DecisionEngine
+    import tempfile, pandas as pd
+    tmp = tempfile.mkdtemp(prefix="net-")
+    # `fetch_real_data` espera una LISTA de [t,o,h,l,c,v]. Pasarle un
+    # DataFrame revienta en `if not ohlcv` con "truth value of a DataFrame
+    # is ambiguous": el motor hace una comprobacion de verdadidad, no de
+    # contenido.
+    vel = [[i, 100.0, 101.0, 99.0, 100.0, 1.0] for i in range(120)]
+    kb = os.path.join(tmp, "kb.jsonl")
+    filas = [
+        {"hypothesis_id": "h_a", "symbol": "XRP/USDT", "status": "backtested",
+         "strategy_type": "momentum", "expectancy": 0.20,
+         "scientific_score": 0.9},
+        {"hypothesis_id": "h_b", "symbol": "XRP/USDT", "status": "backtested",
+         "strategy_type": "momentum", "expectancy": 0.15,
+         "scientific_score": 0.8},
+    ]
+    with open(kb, "w", encoding="utf-8") as fh:
+        for f in filas:
+            fh.write(json.dumps(f) + "\n")
+    eng = DecisionEngine(symbols=["XRP/USDT"], kb_path=kb, state_dir=tmp,
+                         min_paper_trades=1, use_postgres=False,
+                         data_provider=lambda s: vel, learn_mode=True)
+
+    # 1) primera entrada: entra
+    r1 = eng.decide("XRP/USDT")
+    assert r1["action"] == "entry", r1
+    assert len(eng.open_positions) == 1
+
+    # 2) con XRP ya ocupado, la MEJOR hipotesis no puede meter una segunda
+    assert eng.symbols_with_open_positions() == {"XRP/USDT"}
+    r2 = eng.decide("XRP/USDT")
+    assert r2["action"] != "entry", (
+        "ha abierto una segunda posicion del mismo simbolo: Bybit la "
+        "fusionaria y el estado local quedaria con mas posiciones que el "
+        "exchange")
+
+
+def test_reconciliar_es_lo_que_hace_que_el_bot_aprenda():
+    """El arreglo de los cierres del exchange existe pero hay que ACTIVARLO.
+
+    Con `reconcile_auto_close=False` la reconciliacion va en seco: solo
+    informa. El cierre sigue sin entrar al libro y el SIS sigue sin
+    aprender. Un arreglo que no se puede activar no arregla nada.
+    """
+    import inspect
+    from quant_math.orchestrator import Orchestrator, OrchestratorConfig
+    # La llamada con el valor viene del CICLO, no de `_run_reconcile`, asi
+    # que se mira el cuerpo entero de la clase.
+    src = inspect.getsource(Orchestrator)
+    assert "dry=not self.config.reconcile_auto_close" in src, (
+        "la reconciliacion debe quedar en seco cuando auto_close=False")
+    # Y el wizard tiene que preguntar por ello
+    cli_src = inspect.getsource(
+        __import__("quant_math.cli.main", fromlist=["wizard"]).wizard)
+    assert '"reconcile_auto_close"' in cli_src, (
+        "el wizard no pregunta por la reconciliacion: el interruptor queda "
+        "en False y el bot no ve sus propios cierres")
+    assert "_ask_reconcile" in cli_src
