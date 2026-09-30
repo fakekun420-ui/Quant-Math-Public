@@ -59,6 +59,26 @@ GATE_AUDIT_FILENAME = "learn_mode_audit.jsonl"
 MIN_EXPECTANCY_ENV = "QUANTMATH_MIN_EXPECTANCY"
 DEFAULT_MIN_EXPECTANCY: float = 0.0
 
+#: SUELO DE COSTE REAL como umbral del gate (correccion 2026-09-30).
+#:
+#: Ponerlo a 1 hace que el gate_compare `expectancy` CONTRA el coste real de
+#: operar, en vez de contra cero. Es distinto de `min_expectancy` a proposito:
+#: `min_expectancy` esta en % de CAPITAL por operacion, y este suelo esta en
+#: % del NOCIONAL; por eso no se mezclan.
+#:
+#: Por que importa: con taker, operar cuesta 0,22% del nocional ida y vuelta.
+#: Una hipotesis con expectancy de +0,10% es "positiva" para `min_expectancy`
+#: y aun asi pierde dinero al pagar por entrar y salir. Medido el 2026-09-30:
+#: el mejor edge bruto fuera de muestra fue +0,1052% (4h), que con taker queda
+#: en -0,1148%. Sin este suelo, el gate llama "buena" a una estrategia que
+#: pierde dinero.
+#:
+#: Por defecto 0 (desactivado) porque el gate esta en modo exploracion y
+#: explores se con universo abierto. Para operar de verdad hay que ponerlo a
+#: 1, o a un valor propio si el backtest conoce mejor el coste.
+COST_FLOOR_GATE_ENV = "QUANTMATH_COST_FLOOR_GATE"
+DEFAULT_COST_FLOOR_GATE: float = 0.0
+
 #: Suelo opcional de `scientific_score`. OJO: hoy el umbral de 0.6 que
 #: degrada a `failed` NO filtra nada, porque `failed` esta en
 #: QUERYABLE_STATUSES y por tanto sigue operable. Este parametro es la
@@ -66,14 +86,29 @@ DEFAULT_MIN_EXPECTANCY: float = 0.0
 MIN_SCIENTIFIC_SCORE_ENV = "QUANTMATH_MIN_SCIENTIFIC_SCORE"
 DEFAULT_MIN_SCIENTIFIC_SCORE: float = 0.0
 
-#: Modelo de coste que usa el motor de paper (VERIFICADO en el codigo):
-#: `DecisionEngine.slippage_pct` = 0.0005 por LADO (entrada y salida),
-#: aplicado con `_slip()`. La comision del exchange NO se modela en el
-#: motor de paper; el backtester si la usa (0.001 por lado).
-#: 2 x 0.0005 = 0.001 = 0.10% del nocional por ida y vuelta.
+#: COMISION REAL de Bybit (LEIDA el 2026-09-30 del endpoint publico de
+#: mercados, campo `taker`/`maker` del mercado, NO una cifra de wiki):
+#:
+#:     ex.load_markets()['BTC/USDT:USDT']['taker'] = 0.0006   (0,06% por lado)
+#:     ex.load_markets()['BTC/USDT:USDT']['maker'] = 0.0001   (0,01% por lado)
+#:
+#: Antes este modulo accounted SOLO del slippage y decia explicitamente que
+#: la comision no se modelaba. Eso hacia que el gate creyera que operar
+#: cuesta 0,10% cuando en realidad cuesta **0,22% con taker**: se
+#: inflaba la ventaja un 2,2x. Y el edge medido es de 0,01-0,10% por
+#: operacion, o sea que la diferencia decidia si habia negocio o no.
+TAKER_FEE: float = 0.0006
+MAKER_FEE: float = 0.0001
+
+#: Slippage del motor de paper (VERIFICADO en el codigo):
+#: `DecisionEngine.slippage_pct` = 0.0005 por LADO, aplicado con `_slip()`.
+DEFAULT_SLIPPAGE_PCT: float = 0.0005
+
 COST_MODEL_NOTE = (
-    "paper: 2 x slippage_pct = 0.10% del nocional por round trip "
-    "(comision del exchange NO modelada en paper)"
+    "round trip = 2 x (slippage + comision). Con taker: "
+    "2 x (0,05% + 0,06%) = 0,22% del nocional. Con maker: "
+    "2 x (0,05% + 0,01%) = 0,12%. Comisiones leidas del API de Bybit el "
+    "2026-09-30; el slippage es el del motor de paper."
 )
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -213,11 +248,29 @@ def resolve_gate_thresholds(explicit_min_expectancy: Optional[float] = None,
     return min_exp, min_score
 
 
-def round_trip_cost_pct(slippage_pct: float) -> float:
-    """Coste de ida y vuelta en % del nocional segun el motor de paper.
+def round_trip_cost_pct(slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
+                        taker: bool = True) -> float:
+    """Coste REAL de ida y vuelta en % del nocional.
 
-    2 x slippage por lado. Es el suelo que el edge debe superar para que
-    operar tenga sentido; se expone como diagnostico, no como umbral
-    (ver el docstring del modulo).
+    `2 x (slippage + comision)`. Antes solo contaba el slippage, o sea
+    0,10%, y el gate creia que eso era todo lo que costaba operar. Con la
+    comision real de Bybit el taker son 0,22%: el gate estaba inflando la
+    ventaja un 2,2x. Como el edge medido anda en 0,01-0,10% por operacion,
+    esa diferencia decide si hay negocio o no.
+
+    Se expone como diagnostico, no como umbral (ver el docstring del
+    modulo): lo que decide es `min_expectancy`, no esta cifra.
     """
-    return 2.0 * abs(float(slippage_pct or 0.0)) * 100.0
+    slip = abs(float(slippage_pct or 0.0))
+    fee = TAKER_FEE if taker else MAKER_FEE
+    return 2.0 * (slip + fee) * 100.0
+
+
+def break_even_expectancy_pct(taker: bool = True) -> float:
+    """El expectancy minimo por operacion para no perder dinero.
+
+    Es el suelo REAL, con comision incluida. Si un hypothesis esta por
+    debajo, da igual que su expectancy sea positivo: al pagar por operar
+    se pierde. Con taker son 0,22% por operacion.
+    """
+    return round_trip_cost_pct(DEFAULT_SLIPPAGE_PCT, taker=taker)

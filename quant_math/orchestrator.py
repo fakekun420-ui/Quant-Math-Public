@@ -119,12 +119,17 @@ class OrchestratorConfig:
     max_open_positions: int = 5             # block entries at/above this count
     drawdown_limit: float = 0.2             # block entries past this drawdown
     max_position_pct: float = 0.2           # max margin per entry vs account
-    # Cada cuantociclar se reconcilian las posiciones contra el exchange.
-    # 0 = desactivado (por defecto). Razon: cada reconciliacion abre conexion
-    # y consulta posiciones; con interval_seconds=3600, cada ciclo daria
-    # 86.400 llamadas al dia para mirar lo mismo. Poner un numero alto (p.ej.
-    # 24 con ciclo horario) antes que 1.
-    reconcile_every_n_cycles: int = 0
+    # Cada cuantos ciclos se reconcilian las posiciones contra el exchange.
+    # Por defecto TODAS LAS HORAS (24 ciclos a intervalo 1h = una vez por
+    # hora), no 0. Con 0 no se comparaba nunca y una posicion huerfana con
+    # apalancamiento es dinero en riesgo que nadie vigila; pero 1 por ciclo
+    # daria 86.400 llamadas al dia al exchange, que es peor. A 24 el coste
+    # es 24 llamadas al dia y la ventana de datos sucios es de una hora.
+    reconcile_every_n_cycles: int = 24
+    # Al detectar una huerfana en el exchange, cerrarla es una DECISION, no
+    # una consecuencia de medir. Por defecto solo avisa y deja que un humano
+    # (o el ciclo siguiente) decida. Poner True para cerrar automaticamente.
+    reconcile_auto_close: bool = False
     # Posiciones vivas que pueden quedar SIN marcar (sin precio o sin
     # tamano en el libro) antes de bloquear entradas. 0 = falla cerrado.
     max_unpriced_positions: int = 0
@@ -1892,7 +1897,7 @@ class Orchestrator:
         # posiciones. Con interval_seconds=3600 serian 86.400 llamadas al dia
         # para mirar lo mismo. Activar con reconcile_every_n_cycles>0.
         if self.config.reconcile_every_n_cycles > 0 and not self.config.dry_run:
-            self._run_reconcile(dry=True)
+            self._run_reconcile(dry=not self.config.reconcile_auto_close)
         while max_cycles is None or cycles < max_cycles:
             if self._stop_requested:
                 break
@@ -1904,7 +1909,7 @@ class Orchestrator:
             every = self.config.reconcile_every_n_cycles
             if (every > 0 and cycles % every == 0
                     and not self.config.dry_run):
-                self._run_reconcile(dry=True)
+                self._run_reconcile(dry=not self.config.reconcile_auto_close)
             if max_cycles is None or cycles < max_cycles:
                 # Adaptive sleep: shorter intervals to allow signal processing
                 sleep_time = self.config.interval_seconds

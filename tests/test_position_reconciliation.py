@@ -191,9 +191,14 @@ def test_idempotente(fake_api):
     assert segundo["orphan_exchange"] == []
 
 
-def test_reconciliacion_desactivada_por_defecto(fake_api):
-    """0 ciclos = no se llama nunca. El coste esta medido: por ciclo daria
-    86.400 llamadas al dia al exchange."""
+def test_reconciliacion_horaria_no_nunca(fake_api):
+    """Default = 24 ciclos (una vez por hora a intervalo 1h).
+
+    Antes era 0 (nunca), y entonces una posicion huerfana con apalancamiento
+    es dinero en riesgo que nadie vigila. Y 1 por ciclo daria 86.400 llamadas
+    al dia al exchange, que es peor que el problema que arregla. 24 son 24
+    llamadas al dia y una ventana de datos sucios de una hora.
+    """
     from quant_math.orchestrator import OrchestratorConfig
     import tempfile
     tmp = tempfile.mkdtemp(prefix="rec-cfg-")
@@ -204,7 +209,27 @@ def test_reconciliacion_desactivada_por_defecto(fake_api):
         initial_capital=1000.0, entry_pct=0.05, take_profit_pct=0.05,
         leverage=10, mode="classic", dry_run=True, testnet=True,
     )
-    assert cfg.reconcile_every_n_cycles == 0
+    assert cfg.reconcile_every_n_cycles == 24
+
+
+def test_cerrar_huerfanas_es_opt_in(fake_api):
+    """Detectar una huerfana avisa; cerrarla es una decision.
+
+    Por defecto `reconcile_auto_close=False`: el sistema informa y sigue. Un
+    reconciliador que cierra solo es un peligro, y cerrar de mas es tan caro
+    como no cerrar nunca.
+    """
+    from quant_math.orchestrator import OrchestratorConfig
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="rec-close-")
+    cfg = OrchestratorConfig(
+        symbols=["BTC/USDT:USDT"], timeframe="1h", lookback_days=30,
+        min_paper_trades=1, hypotheses_per_cycle=1,
+        kb_path=f"{tmp}/kb.jsonl", state_dir=tmp,
+        initial_capital=1000.0, entry_pct=0.05, take_profit_pct=0.05,
+        leverage=10, mode="classic", dry_run=True, testnet=True,
+    )
+    assert cfg.reconcile_auto_close is False
 
 
 def test_una_reconciliacion_fallida_no_tumba_el_ciclo(fake_api):

@@ -45,6 +45,7 @@ from quant_math.risk.gate_policy import (
     MIN_EXPECTANCY_ENV,
     MIN_SCIENTIFIC_SCORE_ENV,
     gate_audit_records,
+    break_even_expectancy_pct,
     resolve_learn_mode,
     round_trip_cost_pct,
 )
@@ -476,15 +477,22 @@ def test_coste_de_ejecucion_es_diagnostico_y_no_umbral(tmp_path, monkeypatch):
 
     NO es un umbral del gate: el gate vive en % de capital por trade
     (otra unidad) y solo el backtest conoce el nocional desplegado.
-    Con los defaults de paper: 2 x 0,05% = 0,10% del nocional.
+    Con los defaults de paper y la comision REAL de Bybit (taker 0,06%
+    por lado, leida del API el 2026-09-30):
+        2 x (0,05% + 0,06%) = 0,22% del nocional con taker
+        2 x (0,05% + 0,01%) = 0,12% del nocional con maker
+    Antes solo se contaba el slippage (0,10%), y eso inflaba la ventaja
+    un 2,2x.
     """
-    assert round_trip_cost_pct(SLIP) == pytest.approx(0.10)
-    assert round_trip_cost_pct(0.0003) == pytest.approx(0.06)
+    assert round_trip_cost_pct(SLIP, taker=True) == pytest.approx(0.22)
+    assert round_trip_cost_pct(SLIP, taker=False) == pytest.approx(0.12)
+    assert round_trip_cost_pct(0.0003, taker=True) == pytest.approx(0.18)
+    assert break_even_expectancy_pct(taker=True) == pytest.approx(0.22)
     assert _engine(tmp_path, [_hyp("h", 0.05)]
-                   ).cost_floor_pct == pytest.approx(0.10)
+                   ).cost_floor_pct == pytest.approx(0.22)
     monkeypatch.setenv("QUANTMATH_BURST_SLIPPAGE_PCT", "0.0003")
     assert _engine(tmp_path, [_hyp("h", 0.05)], mode="burst"
-                   ).cost_floor_pct == pytest.approx(0.06)
+                   ).cost_floor_pct == pytest.approx(0.18)
 
 
 # ======================================================================
@@ -885,7 +893,7 @@ def test_la_entrada_de_exploracion_queda_marcada_en_el_libro(
     assert entrada["learn_entry"] is True
     assert entrada["gate_open"] is True
     assert entrada["gate_min_expectancy"] == 0.0
-    assert entrada["cost_floor_pct"] == pytest.approx(0.10)
+    assert entrada["cost_floor_pct"] == pytest.approx(0.22)
     # Y el rastro del gate, aparte, con el PID que lo decidio.
     audit = gate_audit_records(o.config.state_dir)
     assert audit and audit[0]["source"] == "explicit"
@@ -1037,3 +1045,46 @@ def test_cerrar_el_gate_a_mano_sigue_siendo_posible():
         leverage=10, mode="classic", dry_run=True, testnet=True,
         learn_mode=False)
     assert cfg.learn_mode is False
+
+
+# ---------------------------------------------------------------------------
+# Suelo de coste REAL (2026-09-30)
+# ---------------------------------------------------------------------------
+
+def test_la_comision_real_estaba_inflando_la_ventaja():
+    """El gate contaba 0,10% de coste; el real con taker es 0,22%.
+
+    Con la comision omitida, una hipotesis con +0,10% de expectancy parecia
+    rentable cuando al pagar por entrar y salir se perdia. Medido: el mejor
+    edge bruto fuera de muestra fue +0,1052% (4h), que con taker queda en
+    -0,1148%.
+    """
+    from quant_math.risk.gate_policy import TAKER_FEE, MAKER_FEE
+    # Comisiones leidas del API de Bybit (load_markets), no de wiki.
+    assert TAKER_FEE == 0.0006
+    assert MAKER_FEE == 0.0001
+    # Y el coste tiene que incluir slippage + comision, no solo slippage.
+    assert round_trip_cost_pct(0.0005, taker=True) == pytest.approx(0.22)
+    assert round_trip_cost_pct(0.0005, taker=True) > round_trip_cost_pct(
+        0.0005, taker=True) - MAKER_FEE * 200
+
+
+def test_el_suelo_de_coste_es_un_parametro_apagado_por_defecto():
+    """Existe para cuando se opere de verdad, no se impone en exploracion.
+
+    Explorar con universo abierto es correcto: si no, no hay datos para el
+    SIS. El suelo se enciende cuando se quiere operar.
+    """
+    import os as _os
+    from quant_math.risk.gate_policy import (COST_FLOOR_GATE_ENV,
+                                             DEFAULT_COST_FLOOR_GATE,
+                                             break_even_expectancy_pct)
+    assert DEFAULT_COST_FLOOR_GATE == 0.0, "explorar no debe filtrar por coste"
+    assert break_even_expectancy_pct(taker=True) == pytest.approx(0.22)
+    # Y se puede encender por entorno.
+    _os.environ[COST_FLOOR_GATE_ENV] = "1"
+    try:
+        from quant_math.risk.gate_policy import env_float
+        assert env_float(COST_FLOOR_GATE_ENV, DEFAULT_COST_FLOOR_GATE) == 1.0
+    finally:
+        del _os.environ[COST_FLOOR_GATE_ENV]
