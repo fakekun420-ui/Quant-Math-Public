@@ -12,6 +12,9 @@ ninguna orden. Un reconciliador que cierra solo es un peligro.
 OFFLINE: se intercepta ExchangeAPI. Ningun test sale a la red.
 """
 
+import json
+import os
+
 import pytest
 
 
@@ -20,6 +23,8 @@ class FakeAPI:
 
     #: {"BTC/USDT:USDT": {"contracts": 0.5, "side": "long", ...}}
     POSITIONS = {}
+    #: rellenos que el exchange devolveria en fetch_my_trades
+    TRADES = []
     instances = []
 
     def __init__(self, exchange_id="bybit", sandbox=False, api_key=None,
@@ -28,7 +33,14 @@ class FakeAPI:
         self.sandbox = sandbox
         self.orders = []
         self.closed = False
+        # `exchange` es el cliente ccxt: el resolver de cierres fantasma
+        # lee los rellenos por ahi (`fetch_my_trades`), que es de donde sale
+        # el precio REAL de salida y no de una estimacion.
+        self.exchange = self
         FakeAPI.instances.append(self)
+
+    def fetch_my_trades(self, symbol, limit=50):
+        return list(FakeAPI.TRADES)
 
     def fetch_position(self, symbol):
         return dict(self.POSITIONS.get(symbol, {}))
@@ -61,6 +73,10 @@ class FakeEngine:
     def __init__(self, positions):
         self.open_positions = dict(positions)
         self.persisted = 0
+        #: cierres que se le pidieron registrar. Con el doble NO se escribe
+        #: nada en un libro: para comprobar que el cierre llega al libro hace
+        #: falta el motor de verdad (ver `_orch(motor_real=True)`).
+        self.cierres_registrados = []
 
     def _last_entry_sizing(self, key):
         return 0.5, 500.0
@@ -68,8 +84,25 @@ class FakeEngine:
     def _persist_positions(self):
         self.persisted += 1
 
+    def record_external_closure(self, hypothesis_id, symbol, exit_price,
+                                motivo=None, opened_at=None, extra=None):
+        self.cierres_registrados.append(
+            {"hypothesis_id": hypothesis_id, "symbol": symbol,
+             "exit_price": exit_price, "motivo": motivo,
+             "opened_at": opened_at, "extra": extra})
+        self.open_positions.pop(f"{hypothesis_id}:{symbol}", None)
+        return {"type": "closure", "symbol": symbol,
+                "exit_price": exit_price}
 
-def _orch(dry_run=True, symbols=("BTC/USDT:USDT",), positions=None):
+
+def _orch(dry_run=True, symbols=("BTC/USDT:USDT",), positions=None,
+          motor_real=False):
+    """Orquestador minimo.
+
+    `motor_real=True` monta el DecisionEngine de verdad, para los tests que
+    necesitan comprobar que un cierre LLEGA AL LIBRO. Con el doble eso no
+    se puede ver, y un test que verifica un doble no verifica nada.
+    """
     from quant_math.orchestrator import Orchestrator, OrchestratorConfig
     import tempfile
     tmp = tempfile.mkdtemp(prefix="rec-")
@@ -83,8 +116,39 @@ def _orch(dry_run=True, symbols=("BTC/USDT:USDT",), positions=None):
     orch = Orchestrator.__new__(Orchestrator)
     orch.config = cfg
     orch.cycle_count = 1
-    orch.engine = FakeEngine(positions or {})
+    if motor_real:
+        from quant_math.decision_engine import DecisionEngine
+        eng = DecisionEngine(symbols=list(symbols), kb_path=f"{tmp}/kb.jsonl",
+                             state_dir=tmp, min_paper_trades=1,
+                             use_postgres=False,
+                             data_provider=lambda s: _velas(83000.0))
+        eng.open_positions = dict(positions or {})
+        orch.engine = eng
+    else:
+        orch.engine = FakeEngine(positions or {})
     return orch
+
+
+def _velas(precio, n=120):
+    """Serie plana. Solo hace falta que el motor tenga precio para marcar."""
+    import pandas as pd
+    idx = pd.date_range("2026-01-01", periods=n, freq="h", tz="UTC")
+    return pd.DataFrame({
+        "open": [precio] * n, "high": [precio * 1.001] * n,
+        "low": [precio * 0.999] * n, "close": [precio] * n,
+        "volume": [1.0] * n}, index=idx)
+
+
+def _abrir_en_libro(orch, key, symbol, side, entry_price, qty):
+    """Escribe la ENTRADA en el libro, que es de donde el motor saca el
+    tamano para calcular el PnL del cierre. Sin ella, el PnL caeria en el
+    fallback de 1.0 y no estariamos midiendo nada."""
+    os.makedirs(orch.config.state_dir, exist_ok=True)
+    rec = {"type": "entry", "key": key, "symbol": symbol, "side": side,
+           "hypothesis_id": key.split(":", 1)[0], "entry_price": entry_price,
+           "quantity": qty, "notional_usd": qty * entry_price}
+    with open(orch.engine.ledger_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec) + "\n")
 
 
 def test_detecta_orphan_exchange(fake_api):
@@ -140,19 +204,151 @@ def test_dry_false_cierra_la_huerfana(fake_api):
 
 
 def test_phantom_local_no_manda_orden_al_exchange(fake_api):
-    """Un phantom local se corrige SOLO en local.
+    """Un phantom local NO genera ordenes, pero se busca su cierre REAL.
 
     Mandar una orden para "cerrar" algo que no existe seria inventar
-    posicion — el error mas caro posible aqui.
+    posicion, el error mas caro posible aqui. Pero tampoco basta con
+    borrarlo: si no se busca el cierre en el exchange, el cierre se pierde
+    y el SIS no aprende de el, que es justo para lo que esta el SIS.
+
+    En este test el exchange NO devuelve ningun relleno, asi que no se
+    puede saber el precio y NO se inventa: se retira del estado vivo y se
+    deja constancia de que el cierre se perdio.
     """
     fake_api.POSITIONS["BTC/USDT:USDT"] = {}
+    fake_api.TRADES = []
     pos = {"h1:BTC/USDT:USDT": {"side": "buy", "entry_price": 83000.0}}
     orch = _orch(dry_run=False, positions=pos)
     r = orch.reconcile_positions(dry=False)
-    assert r["phantom_local"][0]["corregida_en_local"] is True
+
+    ph = r["phantom_local"][0]
+    assert ph["registrada_como_cierre"] is False, "sin precio real, sin cierre"
+    assert ph["cierre_perdido"], "y no se puede tapar que se perdio"
     assert "h1:BTC/USDT:USDT" not in orch.engine.open_positions
     assert all(not api.orders for api in fake_api.instances), (
         "un phantom local no puede generar ordenes en el exchange")
+
+
+def test_phantom_con_cierre_real_se_registra_para_que_el_sis_aprenda(fake_api,
+                                                                       tmp_path):
+    """EL CASO QUE SE MIDIO el 2026-09-30: el exchange cerro y nadie se
+    entero.
+
+    El TP/SL del exchange ejecuto el cierre; el motor no lo decidio, asi
+    que `close_position` nunca corrio y el libro no recibio nada. Con
+    `max_open_positions=1` el brazo quedaba muerto con un RISK-HALT
+    eterno, y el SIS sin cierres que aprender.
+
+    Aqui se comprueba que con el relleno real disponible, el cierre entra
+    al libro con la MISMA forma que cualquier otro.
+    """
+    fake_api.POSITIONS["BTC/USDT:USDT"] = {}
+    abierto = 1_700_000_000_000.0          # ms de la apertura
+    fake_api.TRADES = [
+        # Un relleno de salida ANTERIOR a la apertura: NO es el nuestro.
+        {"side": "sell", "price": 1.0, "timestamp": abierto - 60_000,
+         "fee": {"cost": 0.0}},
+        # El nuestro: cierre real, 1% por encima de la entrada.
+        {"side": "sell", "price": 83000.0 * 1.01, "timestamp": abierto + 5_000,
+         "fee": {"cost": 0.42}},
+    ]
+    pos = {"h1:BTC/USDT:USDT": {
+        "side": "buy", "entry_price": 83000.0,
+        "opened_at": abierto / 1000.0}}
+    orch = _orch(dry_run=False, positions=pos, motor_real=True)
+    _abrir_en_libro(orch, "h1:BTC/USDT:USDT", "BTC/USDT:USDT", "buy",
+                    83000.0, 0.5)
+    r = orch.reconcile_positions(dry=False)
+
+    ph = r["phantom_local"][0]
+    assert ph["registrada_como_cierre"] is True
+    assert ph["cierre_real"]["ok"] is True
+    assert ph["cierre_real"]["exit_price"] == pytest.approx(83000.0 * 1.01)
+    assert "h1:BTC/USDT:USDT" not in orch.engine.open_positions
+    assert all(not api.orders for api in fake_api.instances), (
+        "el exchange ya lo cerro: no se manda ninguna orden")
+
+    # Y lo importante: el cierre esta en el libro, para que el SIS lo vea.
+    with open(orch.engine.ledger_path, encoding="utf-8") as fh:
+        filas = [json.loads(l) for l in fh if l.strip()]
+    cierres = [f for f in filas if f.get("type") == "closure"]
+    assert cierres, "el cierre tiene que estar en el libro"
+    c = cierres[-1]
+    assert c["cierre_externo"] is True, "hay que poder distinguirlo"
+    assert c["exit_price"] == pytest.approx(83000.0 * 1.01)
+    assert c["entry_price"] == pytest.approx(83000.0)
+    # +1% de precio en largo, 0,5 de cantidad: +415 USDT. Si saliera
+    # negativo o cero, se habria resuelto mal el lado o el tamano.
+    assert c["pnl"] == pytest.approx(415.0, rel=1e-3), f"pnl: {c['pnl']}"
+    assert c["quantity"] == pytest.approx(0.5)
+    # Y el precio de salida es el REAL, sin slippage por encima: el
+    # relleno ya ocurrio, aplicarle el adverso otra vez seria cobrar dos
+    # veces por lo mismo.
+    assert c["exit_price"] == pytest.approx(83000.0 * 1.01)
+
+
+def test_sin_precio_real_no_se_inventa_un_pnl(fake_api):
+    """Lo que NO se hace: fabricar un cierre con el precio de entrada.
+
+    Poner el precio de entrada daria un PnL de cero y parece inocente, pero
+    es un numero que no ocurrio. El SIS aprenderia de un cierre que no
+    existio, que es el "operar con datos falsos" que no se permite.
+    """
+    fake_api.POSITIONS["BTC/USDT:USDT"] = {}
+    abierto = 1_700_000_000_000.0
+    # Solo hay una COMPRA posterior: no hay ninguna salida que la cierre.
+    fake_api.TRADES = [
+        {"side": "buy", "price": 83000.0, "timestamp": abierto + 1_000,
+         "fee": {"cost": 0.1}},
+    ]
+    pos = {"h1:BTC/USDT:USDT": {
+        "side": "buy", "entry_price": 83000.0,
+        "opened_at": abierto / 1000.0}}
+    orch = _orch(dry_run=False, positions=pos)
+    r = orch.reconcile_positions(dry=False)
+
+    ph = r["phantom_local"][0]
+    assert ph["registrada_como_cierre"] is False
+    ledger = os.path.join(orch.config.state_dir, "paper_executions.jsonl")
+    escrito = os.path.exists(ledger) and os.path.getsize(ledger) > 0
+    if escrito:
+        with open(ledger, encoding="utf-8") as fh:
+            filas = [json.loads(l) for l in fh if l.strip()]
+        assert not [f for f in filas if f.get("type") == "closure"], (
+            "no debe haber ningun cierre sin precio real")
+
+
+def test_reconciliar_dos_veces_no_escribe_dos_cierres(fake_api):
+    """Idempotente: la segunda pasada no duplica el cierre.
+
+    Si duplicara, el SIS aprenderia el mismo cierre dos veces y contaria
+    operaciones que ocurrieron una sola vez.
+    """
+    fake_api.POSITIONS["BTC/USDT:USDT"] = {}
+    abierto = 1_700_000_000_000.0
+    fake_api.TRADES = [
+        {"side": "sell", "price": 83000.0 * 1.01, "timestamp": abierto + 5_000,
+         "fee": {"cost": 0.42}},
+    ]
+    pos = {"h1:BTC/USDT:USDT": {
+        "side": "buy", "entry_price": 83000.0,
+        "opened_at": abierto / 1000.0}}
+    orch = _orch(dry_run=False, positions=pos, motor_real=True)
+    _abrir_en_libro(orch, "h1:BTC/USDT:USDT", "BTC/USDT:USDT", "buy",
+                    83000.0, 0.5)
+
+    orch.reconcile_positions(dry=False)
+    with open(orch.engine.ledger_path, encoding="utf-8") as fh:
+        n1 = len([l for l in fh if l.strip() and json.loads(l).get("type")
+                  == "closure"])
+    assert n1 == 1
+
+    r2 = orch.reconcile_positions(dry=False)
+    assert not r2["phantom_local"], "la posicion ya no esta: no hay phantom"
+    with open(orch.engine.ledger_path, encoding="utf-8") as fh:
+        n2 = len([l for l in fh if l.strip() and json.loads(l).get("type")
+                  == "closure"])
+    assert n2 == n1, "no se puede escribir el mismo cierre dos veces"
 
 
 def test_falla_cerrado_sin_claves(fake_api, monkeypatch):

@@ -441,6 +441,88 @@ class DecisionEngine:
     def has_open_position(self, hypothesis_id: str, symbol: str) -> bool:
         return self._position_key(hypothesis_id, symbol) in self.open_positions
 
+    def record_external_closure(self, hypothesis_id: str, symbol: str,
+                                exit_price: float,
+                                motivo: str = "cerrada_en_el_exchange",
+                                opened_at: Optional[float] = None,
+                                extra: Optional[Dict[str, Any]] = None):
+        """Registra un cierre que YA OCURRIO en el exchange, no aqui.
+
+        Existe por un fallo medido el 2026-09-30: el TP/SL que puso el
+        propio exchange ejecuto el cierre, y el motor no se entero porque
+        `close_position` solo se llama cuando el cierre lo decide el motor.
+        El resultado era doble y malo a la vez:
+
+        - el libro no recibia el cierre, o sea que el SIS no tenia nada que
+          aprender (que es justo para lo que se le puso a aprender);
+        - el estado local seguia diciendo "abierta", luego con
+          `max_open_positions=1` el brazo se quedaba bloqueado para
+          siempre con `[RISK-HALT] open positions 1 >= max 1`.
+
+        Por eso esto escribe el MISMO closure que `close_position`, con la
+        misma forma, para que el SIS lo vea igual. Y con TRES diferencias
+        deliberadas:
+
+        1. NO se aplica `_slip()`: el precio es el relleno real que ya
+           pago el exchange. Aplicar el adverso otra vez seria cobrar dos
+           veces por lo mismo, que es justo el error que se corrigio en
+           el modelo de coste.
+        2. NO se llama a `live_close_hook`: no hay nada que cerrar, el
+           exchange ya lo hizo.
+        3. NO se inventa nada: si no se sabe el precio de salida, este
+           metodo no se llama. Un PnL inventado seria exactamente el
+           "operar con datos falsos" que no se permite.
+
+        Idempotente por construccion: si la posicion ya no esta en
+        `open_positions` devuelve None y no escribe nada.
+        """
+        key = self._position_key(hypothesis_id, symbol)
+        pos = self.open_positions.pop(key, None)
+        if pos is None:
+            return None
+        self._persist_positions()
+
+        entry_price = float(pos.get("entry_price", 0.0))
+        side = pos.get("side", "buy")
+        direction = 1 if side == "buy" else -1
+        qty, notional = self._last_entry_sizing(key)
+        exit_px = float(exit_price)
+        pnl = qty * (exit_px - entry_price) * direction
+        pnl_pct = (pnl / notional * 100.0) if notional else 0.0
+        closure = {
+            "type": "closure",
+            "key": key,
+            "symbol": symbol,
+            "hypothesis_id": hypothesis_id,
+            "side": side,
+            "entry_price": entry_price,
+            "exit_price": exit_px,
+            "quantity": qty,
+            "pnl": round(pnl, 10),
+            "pnl_pct": round(pnl_pct, 6),
+            "entry_time": opened_at if opened_at is not None
+                           else pos.get("opened_at"),
+            "exit_time": time.time(),
+            "motivo_cierre": motivo,
+            # Que el cierre lo hizo el exchange y no este codigo. Sin esto
+            # no se podria distinguir un TP normal de uno disparado a
+            # mercado, que rellena al libro y no al precio del trigger.
+            "cierre_externo": True,
+        }
+        if extra:
+            closure.update(extra)
+        self._append_state(self.ledger_path, closure)
+        try:
+            bus.publish("trade_closed", closure)
+        except Exception as exc:            # pragma: no cover
+            logger.warning("[cierre_externo] no se pudo publicar: %s", exc)
+        logger.info("[cierre_externo] %s %s motivo=%s exit=%.8g pnl=%.4f "
+                    "(%+.3f%%) | lo ejecuto el exchange, no el motor",
+                    side.upper(), symbol, motivo, exit_px, pnl, pnl_pct)
+        self._refresh_live_expectancy(hypothesis_id, symbol)
+        self._maybe_graduate()
+        return closure
+
     def close_position(self, hypothesis_id: str, symbol: str,
                        motivo: str = "manual",
                        exit_price: Optional[float] = None):

@@ -754,6 +754,90 @@ class Orchestrator:
             except Exception:
                 pass
 
+    def _resolver_cierre_fantasma(self, api, symbol: str,
+                                  local_rows: List[Dict[str, Any]]) -> Dict:
+        """Busca en el exchange el cierre REAL de una posicion fantasma.
+
+        "Fantasma" = el estado local la da por abierta y el exchange no la
+        tiene. Casi siempre significa que el TP/SL que puso el exchange la
+        cerro y el motor no se entero.
+
+        Devuelve el relleno real, no una estimacion:
+            {"ok": True, "exit_price": ..., "motivo": ..., "fuente": ...}
+
+        Y si no lo encuentra, `ok=False` con el motivo. En ese caso NO se
+        inventa el precio: quien llama decide que hacer con un cierre
+        desconocido, que es cosa distinta de cerrar con un numero
+        Mentira.
+        """
+        vacio = {"ok": False}
+        if not local_rows:
+            return dict(vacio, motivo_error="no hay posicion local")
+        fila = local_rows[0]
+        lado = str(fila.get("side") or "buy").lower()
+        salida_esperada = "sell" if lado == "buy" else "buy"
+        swap = symbol if ":" in symbol else (
+            symbol + ":USDT" if symbol.endswith("/USDT") else symbol)
+        try:
+            trades = api.exchange.fetch_my_trades(swap, limit=50)
+        except Exception as exc:
+            return dict(vacio, motivo_error=
+                        f"no se pudieron leer los rellenos del exchange: {exc}")
+        if not trades:
+            return dict(vacio, motivo_error="el exchange no devolvio rellenos")
+
+        # El cierre tiene que ser POSTERIOR a la apertura local. Sin ese
+        # filtro se cogeria un cierre de una operacion anterior, que es
+        # justo el error de mirar donde no toca.
+        abierto = None
+        try:
+            abierto = float(fila.get("opened_at") or 0) or None
+        except (TypeError, ValueError):
+            abierto = None
+        base = abierto or 0.0
+
+        candidatos = []
+        for t in trades:
+            try:
+                when = float(t.get("timestamp") or t.get("datetime_ms") or 0)
+                ms = (t.get("datetime") or "")
+                if not when and isinstance(ms, str) and ms:
+                    from datetime import datetime as _dt
+                    when = _dt.strptime(
+                        ms.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S.%f%z"
+                    ).timestamp()
+                if when <= base:
+                    continue
+            except Exception:
+                continue
+            if str(t.get("side") or "").lower() != salida_esperada:
+                continue
+            try:
+                precio = float(t.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if precio <= 0:
+                continue
+            candidatos.append((when, precio, t))
+        if not candidatos:
+            return dict(vacio, motivo_error=(
+                "no hay ningun relleno de salida posterior a la apertura "
+                f"(lado esperado: {salida_esperada})"))
+        # El ULTIMO es el que cerro: si se cerro por partes, el ultimo
+        # relleno es el que dejo la posicion en cero.
+        when, precio, t = max(candidatos, key=lambda c: c[0])
+        try:
+            comision = float((t.get("fee") or {}).get("cost") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            comision = 0.0
+        logger.info("[reconcile] cierre REAL de %s encontrado en el "
+                    "exchange: %s a %.8g (comision %.8f)",
+                    symbol, salida_esperada, precio, comision)
+        return {"ok": True, "exit_price": precio, "exit_time": when,
+                "opened_at": abierto, "fee": comision, "fuente":
+                    f"exchange:fetch_my_trades ({salida_esperada} @ {precio})",
+                "motivo": "cerrada_en_el_exchange_tp_sl"}
+
     def reconcile_positions(self, dry: bool = True) -> Dict:
         """Compara el estado LOCAL de posiciones contra el EXCHANGE.
 
@@ -897,19 +981,76 @@ class Orchestrator:
                                     "riesgo real es otro"),
                     }
                     report["phantom_local"].append(phantom)
+                    # QUE NO SE APRENDA DE UN CIERRE QUE NO SE CONOCE
+                    # (eleccion de Leonardo, 2026-09-30).
+                    #
+                    # Un cierre inventado (poner el precio de entrada, o un
+                    # cero) poisonaria el aprendizaje: el SIS aprenderia de
+                    # numeros que no son, que es lo unico que NO se permite.
+                    # Asi que primero se busca el cierre REAL en el
+                    # exchange.
                     if not dry and engine is not None:
-                        # Solo local, y con rastro. NO se manda orden al
-                        # exchange: no hay nada que cerrar ahi.
-                        for row in local_rows:
-                            engine.open_positions.pop(row["key"], None)
+                        cerrado = self._resolver_cierre_fantasma(
+                            api, symbol, local_rows)
+                        phantom["cierre_real"] = cerrado
+                        if cerrado.get("ok") and cerrado.get("exit_price"):
+                            # Con el cierre real: se registra COMO CIERRE,
+                            # para que el SIS lo vea igual que cualquier
+                            # otro, y la posicion desaparece del estado
+                            # vivo.
+                            #
+                            # OJO: la condicion mira `exit_price`, que es lo
+                            # que devuelve el resolver. Pedir `closure` aqui
+                            # seria pedir el resultado de una llamada que aun
+                            # no se ha hecho, y el camino bueno no se
+                            # ejecutaria nunca (asiemnte salio: 3 tests
+                            # en rojo por pedir lo que aun no existe).
+                            for row in local_rows:
+                                _cl = engine.record_external_closure(
+                                    row["key"].split(":", 1)[0], symbol,
+                                    cerrado["exit_price"],
+                                    motivo=cerrado.get("motivo",
+                                                       "cerrada_en_el_exchange"),
+                                    opened_at=cerrado.get("opened_at"),
+                                    extra={"exit_source":
+                                           cerrado.get("fuente"),
+                                           "exit_time_exchange":
+                                           cerrado.get("exit_time")})
+                                if _cl is not None:
+                                    cerrado["closure"] = _cl
+                            phantom["registrada_como_cierre"] = bool(
+                                cerrado.get("closure"))
+                            logger.warning(
+                                "[reconcile] phantom %s REGISTRADA como "
+                                "cierre real: salida=%s pnl=%s (fuente: %s). "
+                                "El SIS ya puede aprender de ella.",
+                                symbol, cerrado.get("exit_price"),
+                                cerrado.get("closure", {}).get("pnl"),
+                                cerrado.get("fuente"))
+                        else:
+                            # Sin precio real: NO se inventa. Se quita del
+                            # estado vivo (si se deja, con
+                            # max_open_positions=1 el brazo queda muerto)
+                            # pero se deja constancia de que ese cierre se
+                            # ha perdido, para que no se confunda con que
+                            # no ocurrio.
+                            for row in local_rows:
+                                engine.open_positions.pop(row["key"], None)
+                            phantom["registrada_como_cierre"] = False
+                            phantom["cierre_perdido"] = (
+                                cerrado.get("motivo_error")
+                                or "no se pudo determinar el precio real de "
+                                   "salida en el exchange")
+                            logger.error(
+                                "[reconcile] phantom %s: NO se pudo determinar "
+                                "el precio real de salida (%s). Se retira del "
+                                "estado vivo para no bloquear el brazo, pero "
+                                "ese cierre NO entra al aprendizaje.",
+                                symbol, cerrado.get("motivo_error"))
                         try:
                             engine._persist_positions()
                         except Exception as exc:
                             phantom["persist_error"] = str(exc)
-                        phantom["corregida_en_local"] = True
-                        logger.warning(
-                            "[reconcile] phantom_local corregida en local %s",
-                            symbol)
         finally:
             try:
                 api.close()
