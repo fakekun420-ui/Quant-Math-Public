@@ -86,3 +86,44 @@ walk-forward antes de creérselo. Antes de mainnet, el orden sensato es:
 
 Mientras tanto el sistema está **en paper y explorando**, que es lo correcto:
 no cuesta dinero y sigueacousticamente acumulando cierres para el SIS.
+
+## ACTUALIZADO 2026-09-30: la comisión real cambia el veredicto
+
+Lo de arriba está **desactualizado** y hay que leerlo con esta corrección encima.
+La comisión de Bybit estaba ausente: el gate contaba solo slippage (0,10% por
+ida y vuelta) cuando el real es **0,22% con taker**.
+
+Leída del API el 2026-09-30 (`load_markets()['BTC/USDT:USDT']`):
+`taker = 0,0006` (0,06% por lado) y `maker = 0,0001` (0,01% por lado).
+
+Y Leonardo opera a **1 m**, no a 1 h. Medido a cuatro temporalidades, BTCUSDT,
+fuera de muestra, 70/30, con las medias ajustadas a cada escala:
+
+| Temporalidad | Bruto | taker (0,22%) | maker (0,12%) |
+|---|---|---|---|
+| **1 m** | −0,0009% | −0,2209% | −0,1209% |
+| 5 m | +0,0027% | −0,2173% | −0,1173% |
+| 15 m | −0,0056% | −0,2256% | −0,1256% |
+| 1 h | +0,0161% | −0,2039% | −0,1039% |
+| 4 h | +0,1052% | −0,1148% | −0,0148% |
+
+**Ninguna temporalidad gana con taker. Con maker, la mejor (4 h) queda en
+−0,0148%.** El edge no cubre el coste de operar.
+
+### Qué cambia de la conclusión
+
+1. A 1 m **no hay ni edge bruto**: es −0,0009%, que es cero. El movimiento
+   por operación es cien veces más pequeño que el coste. Cruces de medias a
+   1 m no pueden funcionar, y no es cuestión de afinar parámetros.
+2. La temporalidad sigue siendo la palanca correcta *en dirección*, porque el
+   coste es por operación y cada vela debe mover más (0,001% a 1 m frente a
+   0,105% a 4 h), pero **subir a 4 h no basta**: se acerca al coste, no lo
+   supera.
+3. La conclusión de abajo («poner 4 h y repetir con walk-forward») queda
+   **desaconsejada con los números reales**: repetirla seguiría dando negativo.
+   Lo que hace falta es una estrategia cuyo movimiento medio por operación
+   supere 0,22%, no elegir mejor entre las que ya se han medido.
+4. Se ha añadido `QUANTMATH_COST_FLOOR_GATE` para que, cuando se opere, el
+   gate compare el expectancy contra el **coste real** y no contra cero. Con
+   el gate así, ninguna de las estrategias medidas de arriba sería aceptable:
+   eso es exactamente lo que tiene que hacer.
