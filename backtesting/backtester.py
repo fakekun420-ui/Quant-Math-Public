@@ -818,8 +818,11 @@ class Backtester:
             else:  # hold
                 equity_curve.append(current_capital)
 
-        # Close any remaining open positions at final price
-        # (record only — legacy behaviour keeps equity_curve cash-only)
+        # Cerrar las posiciones vivas al precio de la ultima vela.
+        # El PnL se suma al capital, no es solo registro: si el Trade
+        # cuenta en n_trades y en win_rate, su PnL tiene que contar
+        # tambien en final_capital. Si no, el retorno mide una
+        # poblacion distinta de la que cuentan las metricas de trade.
         for symbol, pos in open_positions.items():
             fill = self._adverse_fill(data[symbol][-1], 'sell')
             commission = self._fee(pos['quantity'] * fill)
@@ -832,10 +835,17 @@ class Backtester:
                                            len(orders) - 1, liq)
             if liquidated:
                 exit_px = liq if liq is not None else fill
+                # El margen y la comision de entrada ya se descontaron
+                # al abrir: de la cuenta solo salen salida y funding.
+                current_capital -= (commission + funding)
                 pnl = -margin - pos['entry_commission'] - commission - funding
                 num_liquidations[0] += 1
             else:
                 exit_px = fill
+                # Se devuelve margen + PnL de precio - salida - funding
+                # (la comision de entrada ya se desconto al abrir).
+                current_capital += (margin + (fill - pos['entry_price'])
+                                   * pos['quantity'] - commission - funding)
                 pnl = ((fill - pos['entry_price']) * pos['quantity']
                        - pos['entry_commission'] - commission - funding)
             pnl_pct = pnl / margin * 100 if margin else 0.0
@@ -856,6 +866,12 @@ class Backtester:
                 funding_paid=funding
             )
             trades.append(trade)
+
+        # Punto extra de la curva: la ultima vela ya esta liquidada.
+        # Uno solo, no uno por posicion: la curva es un punto por vela
+        # y final_capital sale de equity_curve[-1].
+        if open_positions:
+            equity_curve.append(current_capital)
 
         # Calculate metrics
         final_capital = equity_curve[-1]
