@@ -40,21 +40,44 @@ MIN_CLOSES = 80
 
 
 def _dominant_cycle(closes):
-    """Ciclo dominante en velas via FFT del paquete spectral_analysis
-    existente (sin duplicar implementacion). None si no hay pico claro."""
+    """Ciclo dominante en velas via FFT. None si no hay pico claro.
+
+    Antes importaba `legacy.spectral_analysis.fft.FastFourierTransform`, que
+    se borro en el commit fcfd0949. El `except Exception` de abajo se tragaba
+    el ModuleNotFoundError y devolvia None SIEMPRE: `cycle_len` era una
+    feature muerta que ademas entraba como columna del KMeans
+    (`ml/feature_store.py`), dejando una dimension constante en el SIS.
+    Ahora es FFT de numpy, que ya es dependencia, y un fallo real se ve.
+    """
     try:
         import numpy as _np
-        from legacy.spectral_analysis.fft import FastFourierTransform
         rets = _np.diff(_np.log(_np.asarray(closes, dtype=float)))
-        fft = FastFourierTransform(sampling_rate=1.0)
-        peak_freq, peak_mag = fft.find_peak_frequency(
-            rets, min_freq=1 / 120, max_freq=0.4)
+        # 16 es el minimo para que un pico tenga sentido; por debajo, ruido.
+        if rets.size < 16:
+            return None
+        n = rets.size
+        # sampling_rate=1.0 -> frecuencia en ciclos por vela. Se conserva la
+        # semantica del metodo borrado: espectro de potencia (magnitud al
+        # cuadrado, normalizada por n) y pico dentro de [1/120, 0.4].
+        spectrum = _np.fft.rfft(rets)
+        freqs = _np.fft.rfftfreq(n, d=1.0)
+        power = (_np.abs(spectrum) ** 2) / n
+        mask = (freqs >= 1 / 120) & (freqs <= 0.4)
+        if not mask.any():
+            return None
+        masked_freqs, masked_power = freqs[mask], power[mask]
+        peak_idx = int(_np.argmax(masked_power))
+        peak_freq = float(masked_freqs[peak_idx])
+        peak_mag = float(masked_power[peak_idx])
         if peak_freq <= 0 or peak_mag <= 0:
             return None
         cycle = int(round(1.0 / peak_freq))
         return cycle if 5 <= cycle <= 120 else None
     except Exception as exc:
-        logger.debug("FFT ciclo fallo: %s", exc)
+        # AVISO y no debug: si vuelve a fallar por un motivo de codigo, hay
+        # que enterarse. Con debug nadie lo ve nunca, que es como esta
+        # feature lleva rota desde fcfd0949 sin que nadie lo dijera.
+        logger.warning("FFT ciclo fallo (%s): %s", type(exc).__name__, exc)
         return None
 
 

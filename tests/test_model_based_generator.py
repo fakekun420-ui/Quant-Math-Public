@@ -14,7 +14,12 @@ def test_generates_executable_templates():
     closes = list(100 + i * 0.1 + ((i % 7) * 0.05) for i in range(300))
     out = generate_model_hypotheses("BTC/USDT", closes, max_hypotheses=2)
     assert 1 <= len(out) <= 2
-    valid = {"donchian_breakout", "rsi_reversion", "macd"}
+    # MEDIDO 2026-09-28: esta lista estaba escrita a mano con 3 nombres y el generador ya
+    # emitia 6, asi que el test llevaba tiempo fallando sin que hubiera un defecto. Ahora la
+    # lista valida es la del propio ejecutor (una sola fuente de verdad), de modo que esto no
+    # se vuelve a quedar viejo. Los tests del contrato entero estan en test_generator_contract.py
+    from quant_math.autonomous_research.adapters.quant_math_adapter import IMPLEMENTED_STRATEGIES
+    valid = IMPLEMENTED_STRATEGIES
     for t in out:
         st = t["parameters"]["strategy_type"]
         assert st in valid, f"estrategia no ejecutable por backtester: {st}"
