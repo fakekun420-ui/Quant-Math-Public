@@ -1037,10 +1037,13 @@ def _ask_learn_mode() -> Optional[bool]:
     decision queda escrita en <state_dir>/learn_mode_audit.jsonl y en cada
     fila del libro (learn_entry/gate_open).
     """
+    # default=True: en paper y testnet explorar es gratis, y sin operaciones
+    # el SIS no tiene nada que aprender. Para operar solo con expectativa
+    # positiva hay que decir que no (decision de Leonardo 2026-09-30).
     return questionary.confirm(
         "Exploracion (ABRE el gate expectancy>0: opera tambien hipotesis "
         "con expectativa negativa)?",
-        default=False).unsafe_ask()
+        default=True).unsafe_ask()
 
 
 def _ask_execution_mode(initial_capital: float) -> Optional[Dict]:

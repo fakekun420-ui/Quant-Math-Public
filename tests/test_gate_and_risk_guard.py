@@ -393,8 +393,15 @@ def test_el_motor_tampoco_usa_setdefault_para_el_gate():
     assert calls == []
 
 
-def test_el_wizard_pregunta_y_su_default_es_cerrado():
-    """El wizard PREGUNTA, y el default de la pregunta es no explorar."""
+def test_el_wizard_pregunta_y_por_defecto_explora():
+    """El wizard PREGUNTA, y el default de la pregunta es EXPLORAR.
+
+    Cambio de decision (Leonardo, 2026-09-30): antes el default era no
+    explorar. En paper y testnet abrir el gate no cuesta nada, y sin
+    operaciones el SIS no tiene material con el que aprender, asi que
+    explorar pasa a ser lo por defecto. Para operar solo con expectativa
+    positiva hay que decir que no en la pregunta.
+    """
     src = open(os.path.join(REPO, "quant_math/cli/main.py"),
                encoding="utf-8").read()
     tree = ast.parse(src)
@@ -404,7 +411,7 @@ def test_el_wizard_pregunta_y_su_default_es_cerrado():
             body = ast.get_source_segment(src, node)
             break
     assert body, "el wizard ya no pregunta por la exploracion"
-    assert "default=False" in body, "el default del wizard no es CERRADO"
+    assert "default=True" in body, "el default del wizard no es EXPLORAR"
     # Las dos config del wizard (classic y burst) llevan la respuesta.
     assert src.count('"learn_mode": bool(learn_mode)') == 2
 
@@ -989,3 +996,44 @@ def test_el_bloqueo_no_se_esquiva_con_entorno(monkeypatch, tmp_path):
     monkeypatch.setenv("QUANTMATH_ALLOW_LIVE_LEARN_MODE", "1")
     with pytest.raises(ValueError, match="BLOQUEADO"):
         _cfg_live(str(tmp_path), learn_mode=True, testnet=False)
+
+
+def test_explorar_es_el_default_y_no_hay_que_recalibrar_nada():
+    """Decision de Leonardo 2026-09-30: "que no haya min_expectancy".
+
+    El gate se abre por defecto, asi que el umbral deja de tener trabajo:
+    no hay numero que recalibrar y no hay OOS que justifique uno. Sigue
+    existiendo como parametro para quien quiera cerrar el gate a mano.
+    """
+    from quant_math.orchestrator import OrchestratorConfig
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="explora-")
+    cfg = OrchestratorConfig(
+        symbols=["BTC/USDT:USDT"], timeframe="1h", lookback_days=30,
+        min_paper_trades=1, hypotheses_per_cycle=1,
+        kb_path=f"{tmp}/kb.jsonl", state_dir=tmp,
+        initial_capital=1000.0, entry_pct=0.05, take_profit_pct=0.05,
+        leverage=10, mode="classic", dry_run=True, testnet=True)
+    assert cfg.learn_mode is True, "explorar deberia ser el default en paper"
+    # Y el umbral sigue siendo un parametro, por si alguien lo quiere usar.
+    # Aqui va None (no se fijó): lo resuelve el gate a DEFAULT_MIN_EXPECTANCY.
+    assert cfg.min_expectancy is None
+    from quant_math.risk.gate_policy import (resolve_gate_thresholds,
+                                             DEFAULT_MIN_EXPECTANCY)
+    min_exp, _ = resolve_gate_thresholds()
+    assert min_exp == DEFAULT_MIN_EXPECTANCY == 0.0
+
+
+def test_cerrar_el_gate_a_mano_sigue_siendo_posible():
+    """Poder operar solo con expectativa positiva no se pierde."""
+    from quant_math.orchestrator import OrchestratorConfig
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="cerrado-")
+    cfg = OrchestratorConfig(
+        symbols=["BTC/USDT:USDT"], timeframe="1h", lookback_days=30,
+        min_paper_trades=1, hypotheses_per_cycle=1,
+        kb_path=f"{tmp}/kb.jsonl", state_dir=tmp,
+        initial_capital=1000.0, entry_pct=0.05, take_profit_pct=0.05,
+        leverage=10, mode="classic", dry_run=True, testnet=True,
+        learn_mode=False)
+    assert cfg.learn_mode is False

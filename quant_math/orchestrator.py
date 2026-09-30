@@ -133,7 +133,21 @@ class OrchestratorConfig:
     # None = lo que diga QUANTMATH_LEARN_MODE. El DEFAULT es gate CERRADO
     # (solo expectancy > min_expectancy). True abre la exploracion de
     # forma EXPLICITA y queda registrada en learn_mode_audit.jsonl.
-    learn_mode: Optional[bool] = None
+    # EXPLORACION POR DEFECTO (decision de Leonardo, 2026-09-30).
+    #
+    # "Que no haya min_expectancy": el umbral de 0.0 solo servia para
+    # cerrar por defecto un gate que, en paper, no cuesta nada abrir. Sin
+    # umbral no hay nada que recalibrar y el sistema opera siempre, que es
+    # lo que hace falta para que el SIS tenga material con el que aprender.
+    #
+    # El default es True y por eso `None` significa "lo que toque". Para
+    # operar solo con expectativa positiva hay que pasar False
+    # explicitamente, que queda registrado en learn_mode_audit.jsonl.
+    #
+    # OJO: esto solo es gratis en paper y en testnet. En MAINNET sigue
+    # BLOQUEADO (ver __post_init__): abrir el gate ahi es perder dinero en
+    # cada operacion, y el aprendizaje seria una donacion.
+    learn_mode: Optional[bool] = True
     # % de capital por trade. 0.0 = solo el signo (semantica anterior).
     min_expectancy: Optional[float] = None
     min_scientific_score: Optional[float] = None

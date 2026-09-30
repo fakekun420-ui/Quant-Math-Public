@@ -25,7 +25,14 @@ def _cfg(**kw):
     base = dict(symbols=["BTC/USDT"], timeframe="1h", lookback_days=7,
                 initial_capital=50.0, entry_pct=0.02, take_profit_pct=0.25,
                 min_paper_trades=3, hypotheses_per_cycle=3,
-                kb_path="/tmp/kb.jsonl", state_dir="/tmp/state")
+                kb_path="/tmp/kb.jsonl", state_dir="/tmp/state",
+                # Estos tests van de la seguridad de las ORDENES, no de la
+                # exploracion. Como el default global ahora es explorar
+                # (decision de Leonardo 2026-09-30), un config mainnet
+                # tiene que decir explicitamente que opera solo con
+                # expectativa positiva; si no, el guard de exploracion salta
+                # antes de que lleguemos al de mainnet.
+                learn_mode=False)
     base.update(kw)
     return OrchestratorConfig(**base)
 
