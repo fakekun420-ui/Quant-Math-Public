@@ -58,7 +58,15 @@ GATE_ENV_VARS = (LEARN_MODE_ENV, MIN_EXPECTANCY_ENV,
 #: Slippage adverso por LADO del motor de paper (VERIFICADO en
 #: DecisionEngine.__init__). El cierre lo sufre una vez y el marcado a
 #: mercado lo tiene que sufrir igual, o el flotante miente.
-SLIP = 0.0005
+#: Slippage del motor de paper = LA MITAD DEL SPREAD REAL de Bybit.
+#:
+#: Antes era 0,0005, un SUPUESTO de un barrido propio que resulto 15
+#: veces mas caro que la realidad. El 2026-09-30 se leyo el libro de
+#: XRP/USDT:USDT (8 muestras, estable): el spread es 0,0067%, o sea que
+#: cruzar paga 0,0034% por lado.
+SLIP = 0.000034
+OLD_SUPPOSED_SLIP = 0.0005
+REAL_HALF_SPREAD = 0.000034
 
 
 @pytest.fixture(autouse=True)
@@ -101,10 +109,18 @@ def _engine(tmp, hypotheses=(), candles=None, **kw):
         candles = _ohlc(149.0)
     state = os.path.join(str(tmp), "state")
     os.makedirs(state, exist_ok=True)
-    return DecisionEngine(
-        symbols=[SYMBOL], kb_path=kb, state_dir=state,
-        min_paper_trades=3, use_postgres=False,
-        data_provider=lambda symbol: candles, **kw)
+    prev = os.environ.get("QUANTMATH_SLIPPAGE_PCT")
+    os.environ["QUANTMATH_SLIPPAGE_PCT"] = str(REAL_HALF_SPREAD)
+    try:
+        return DecisionEngine(
+            symbols=[SYMBOL], kb_path=kb, state_dir=state,
+            min_paper_trades=3, use_postgres=False,
+            data_provider=lambda symbol: candles, **kw)
+    finally:
+        if prev is None:
+            os.environ.pop("QUANTMATH_SLIPPAGE_PCT", None)
+        else:
+            os.environ["QUANTMATH_SLIPPAGE_PCT"] = prev
 
 
 class _SinRed:
@@ -484,15 +500,15 @@ def test_coste_de_ejecucion_es_diagnostico_y_no_umbral(tmp_path, monkeypatch):
     Antes solo se contaba el slippage (0,10%), y eso inflaba la ventaja
     un 2,2x.
     """
-    assert round_trip_cost_pct(SLIP, taker=True) == pytest.approx(0.22)
-    assert round_trip_cost_pct(SLIP, taker=False) == pytest.approx(0.12)
-    assert round_trip_cost_pct(0.0003, taker=True) == pytest.approx(0.18)
-    assert break_even_expectancy_pct(taker=True) == pytest.approx(0.22)
+    assert round_trip_cost_pct(SLIP, taker=True) == pytest.approx(0.1268)
+    assert round_trip_cost_pct(SLIP, taker=False) == pytest.approx(0.0268)
+    assert break_even_expectancy_pct(taker=True) == pytest.approx(0.1268)
     assert _engine(tmp_path, [_hyp("h", 0.05)]
-                   ).cost_floor_pct == pytest.approx(0.22)
-    monkeypatch.setenv("QUANTMATH_BURST_SLIPPAGE_PCT", "0.0003")
+                   ).cost_floor_pct == pytest.approx(0.1268)
+    # Burst con un slippage MAS CARO puesto a proposito: el coste sube.
+    monkeypatch.setenv("QUANTMATH_BURST_SLIPPAGE_PCT", "0.0005")
     assert _engine(tmp_path, [_hyp("h", 0.05)], mode="burst"
-                   ).cost_floor_pct == pytest.approx(0.18)
+                   ).cost_floor_pct == pytest.approx(0.22)
 
 
 # ======================================================================
@@ -638,7 +654,7 @@ def test_el_tope_diario_bloquea_aunque_la_hipotesis_guste(
     assert o.config.max_daily_loss_usd == pytest.approx(1.0)
     reason = o.stats["risk_halt"]
     assert reason and "daily loss" in reason
-    assert "-2.41" in reason          # el flotante se ve en el motivo
+    assert "-2.40" in reason          # el flotante se ve en el motivo
     assert o.stats["signals"] == 0    # no se abrio nada
     assert o.stats["paper_trades_taken"] == 0
     assert len(o.engine.open_positions) == 3
@@ -732,7 +748,7 @@ def test_el_marcado_reutiliza_el_precio_del_mismo_ciclo(tmp_path):
     assert row["mark_price"] == pytest.approx(92.0 * (1 - SLIP))
     assert row["pnl_usd"] == pytest.approx(
         0.1 * (92.0 * (1 - SLIP) - 100.0))
-    assert mark["pnl_usd"] == pytest.approx(-0.8046, abs=5e-4)
+    assert mark["pnl_usd"] == pytest.approx(-0.8003, abs=5e-4)
     assert mark["unpriced"] == []
     assert mark["open"] == 1
 
@@ -893,7 +909,7 @@ def test_la_entrada_de_exploracion_queda_marcada_en_el_libro(
     assert entrada["learn_entry"] is True
     assert entrada["gate_open"] is True
     assert entrada["gate_min_expectancy"] == 0.0
-    assert entrada["cost_floor_pct"] == pytest.approx(0.22)
+    assert entrada["cost_floor_pct"] == pytest.approx(0.1268)
     # Y el rastro del gate, aparte, con el PID que lo decidio.
     audit = gate_audit_records(o.config.state_dir)
     assert audit and audit[0]["source"] == "explicit"
@@ -1064,9 +1080,9 @@ def test_la_comision_real_estaba_inflando_la_ventaja():
     assert TAKER_FEE == 0.0006
     assert MAKER_FEE == 0.0001
     # Y el coste tiene que incluir slippage + comision, no solo slippage.
-    assert round_trip_cost_pct(0.0005, taker=True) == pytest.approx(0.22)
-    assert round_trip_cost_pct(0.0005, taker=True) > round_trip_cost_pct(
-        0.0005, taker=True) - MAKER_FEE * 200
+    assert round_trip_cost_pct(SLIP, taker=True) == pytest.approx(0.1268)
+    assert round_trip_cost_pct(SLIP, taker=True) > round_trip_cost_pct(
+        SLIP, taker=True) - MAKER_FEE * 200
 
 
 def test_el_suelo_de_coste_es_un_parametro_apagado_por_defecto():
@@ -1080,7 +1096,7 @@ def test_el_suelo_de_coste_es_un_parametro_apagado_por_defecto():
                                              DEFAULT_COST_FLOOR_GATE,
                                              break_even_expectancy_pct)
     assert DEFAULT_COST_FLOOR_GATE == 0.0, "explorar no debe filtrar por coste"
-    assert break_even_expectancy_pct(taker=True) == pytest.approx(0.22)
+    assert break_even_expectancy_pct(taker=True) == pytest.approx(0.1268)
     # Y se puede encender por entorno.
     _os.environ[COST_FLOOR_GATE_ENV] = "1"
     try:

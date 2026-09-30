@@ -161,33 +161,56 @@ class DecisionEngine:
         # positiva, LEARN_MODE se desactiva solo y el gate expectancy>0
         # vuelve; la decision queda registrada y sobrevive reinicios.
         # O2: slippage adverso en fills paper (entrada Y salida)
+        #
+        # El 0,0005 que habia aqui era un SUPUESTO de un barrido propio, y
+        # era 15 VECES mas caro que el spread real. El 2026-09-30 se leyo
+        # el libro de Bybit: XRP/USDT:USDT tiene un spread de 0,0067%
+        # estable, o sea que cruzar paga ~0,0034% por lado. Con el supuesto
+        # el paper decia que operar costaba 0,10% cuando entrar A MERCADO
+        # de verdad cuesta 0,127%: era OPTIMISTA para quien opera a mercado,
+        # que es el fallo en la direccion contraria a la que protege.
+        #
+        # `order_type` distingue COMO se ejecuta, porque el coste depende de
+        # eso y no del timeframe:
+        #   market -> paga spread (mitad) y comision TAKER
+        #   maker  -> no paga spread, paga comision MAKER
+        try:
+            self.order_type = str(os.environ.get(
+                "QUANTMATH_ORDER_TYPE", "market")).strip().lower()
+            if self.order_type not in ("market", "maker", "maker_only"):
+                self.order_type = "market"
+        except Exception:
+            self.order_type = "market"
+        self.taker = self.order_type == "market"
+
+        # Default = mitad del spread REAL medido, no el supuesto.
         try:
             self.slippage_pct = abs(float(os.environ.get(
-                "QUANTMATH_SLIPPAGE_PCT", "0.0005")))
+                "QUANTMATH_SLIPPAGE_PCT", "0.000034")))
         except ValueError:
-            self.slippage_pct = 0.0005
+            self.slippage_pct = 0.000034
         if self.slippage_pct:
-            logger.info("[slippage] modelo activo: %.3f%% por lado "
-                        "(QUANTMATH_SLIPPAGE_PCT)", self.slippage_pct * 100)
+            logger.info("[slippage] %.4f%% por lado | ejecucion=%s | "
+                        "spread MEDIDO en Bybit 2026-09-30 "
+                        "(QUANTMATH_SLIPPAGE_PCT para override)",
+                        self.slippage_pct * 100, self.order_type)
 
         # V2 B4: burst-specific slippage (tighter for faster trades)
         if self.mode == "burst":
             try:
                 self.burst_slippage_pct = abs(float(os.environ.get(
-                    "QUANTMATH_BURST_SLIPPAGE_PCT", "0.0003")))
+                    "QUANTMATH_BURST_SLIPPAGE_PCT", "0.000034")))
             except ValueError:
-                self.burst_slippage_pct = 0.0003
+                self.burst_slippage_pct = 0.000034
         else:
             self.burst_slippage_pct = self.slippage_pct
 
-        # Suelo de coste del motor de paper (correccion no3): 2 x slippage
-        # por lado, en % del NOCIONAL. Es DIAGNOSTICO, no umbral: el
-        # umbral del gate (min_expectancy) vive en % de capital por
-        # trade, que es otra unidad. Sirve para poder afirmar si un edge
-        # del backtest sobrevive a lo que cuesta ejecutarlo en paper.
-        self.cost_floor_pct = round_trip_cost_pct(
-            self.burst_slippage_pct if self.mode == "burst"
-            else self.slippage_pct)
+        # Suelo de coste del motor de paper: ahora incluye la COMISION segun
+        # como se ejecuta, que es lo que faltaba. El gate creia que operar
+        # costaba 0,10% cuando a mercado son 0,127%.
+        _slip = (self.burst_slippage_pct if self.mode == "burst"
+                 else self.slippage_pct)
+        self.cost_floor_pct = round_trip_cost_pct(_slip, taker=self.taker)
 
         # O6: sizing vol-targetado solo con gate activo (post-graduacion)
         self.vol_target_enabled = (
@@ -811,7 +834,15 @@ class DecisionEngine:
     def _slip(self, price: float, side: str, entering: bool) -> float:
         """O2: precio adverso por slippage. Comprar entra caro y sale barato
         (al cerrar vendo); vender es el espejo. Siempre en contra del que
-        ejecuta -> estimacion conservadora."""
+        ejecuta -> estimacion conservadora.
+
+        En MAKER no se aplica: una orden que COLOCA en el libro no cruza y
+        por tanto no es adverse; lo que paga es la comision maker, que va
+        aparte en `cost_floor_pct`. Aplicar aqui el slippage en maker seria
+        cobrar dos veces por lo mismo.
+        """
+        if not getattr(self, "taker", True):
+            return price
         s = self.burst_slippage_pct if self.mode == "burst" else self.slippage_pct
         if not s or price <= 0:
             return price

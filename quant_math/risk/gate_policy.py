@@ -100,9 +100,18 @@ DEFAULT_MIN_SCIENTIFIC_SCORE: float = 0.0
 TAKER_FEE: float = 0.0006
 MAKER_FEE: float = 0.0001
 
-#: Slippage del motor de paper (VERIFICADO en el codigo):
-#: `DecisionEngine.slippage_pct` = 0.0005 por LADO, aplicado con `_slip()`.
-DEFAULT_SLIPPAGE_PCT: float = 0.0005
+#: Slippage del motor de paper = LA MITAD DEL SPREAD REAL de Bybit.
+#:
+#: MEDIDO el 2026-09-30 leyendo el libro de XRP/USDT:USDT (8 muestras,
+#: estable): el spread entre mejor bid y mejor ask es 0,0067%, o sea que
+#: cruzar paga ~0,0034% por LADO.
+#:
+#: Antes valia 0,0005, que era un SUPUESTO de un barrido propio y salio
+#: 15 veces mas caro que la realidad. Con el, el gate creia que operar
+#: costaba 0,10% cuando entrar A MERCADO cuesta 0,127%: el motor era
+#: optimista para quien opera a mercado, que es el fallo en la direccion
+#: contraria a la que protege.
+DEFAULT_SLIPPAGE_PCT: float = 0.000034
 
 COST_MODEL_NOTE = (
     "round trip = 2 x (slippage + comision). Con taker: "

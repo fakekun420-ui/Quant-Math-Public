@@ -87,15 +87,25 @@ def test_o1_full_criterion_graduates():
 
 # ---------------- O2 ----------------
 def test_o2_slippage_adverse_both_sides():
+    """El slippage es el spread MEDIDO, no el supuesto de 0,0005.
+
+    Se fija explicitamente por entorno para que el test compruebe la
+    MECANICA (adverso en los dos lados) y no un numero que puede cambiar.
+    """
+    slip = 0.000034   # mitad del spread real de Bybit (0,0067%), medido
     with tempfile.TemporaryDirectory() as tmp:
-        eng, _ = make(tmp, ROWS[:1])
-        p = eng._slip(100.0, "buy", entering=True)
-        assert abs(p - 100.05) < 1e-9         # compro caro (+0.0005)
-        p2 = eng._slip(p, "buy", entering=False)
-        assert abs(p2 - 99.999975) < 1e-6     # vender barato
-        s_ = eng._slip(100.0, "sell", entering=True)
-        assert s_ < 100.0                     # vender entra barato
-    print("PASS O2: slippage adverso entrada y salida")
+        os.environ["QUANTMATH_SLIPPAGE_PCT"] = str(slip)
+        try:
+            eng, _ = make(tmp, ROWS[:1])
+            p = eng._slip(100.0, "buy", entering=True)
+            assert abs(p - 100.0 * (1 + slip)) < 1e-9   # compro caro
+            p2 = eng._slip(p, "buy", entering=False)
+            assert abs(p2 - 100.0 * (1 + slip) * (1 - slip)) < 1e-6  # vender barato
+            s_ = eng._slip(100.0, "sell", entering=True)
+            assert s_ < 100.0                            # vender entra barato
+        finally:
+            os.environ.pop("QUANTMATH_SLIPPAGE_PCT", None)
+    print("PASS O2: slippage adverso entrada y salida (spread medido)")
 
 
 # ---------------- O6 ----------------

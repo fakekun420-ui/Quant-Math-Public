@@ -4,6 +4,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from quant_math.decision_engine import DecisionEngine
@@ -24,29 +26,48 @@ def make_engine(tmp, rows, symbols=None, **kw):
 
 
 def test_burst_slippage_tighter():
+    """El slippage por defecto ya NO es un supuesto: es el spread medido.
+
+    Antes burst valia 0,0003 y classic 0,0005, ambos inventados. El
+    2026-09-30 se leyo el libro de Bybit y el spread real de XRP es
+    0,0067%, o sea que cruzar paga 0,0034% por lado. Por defecto los dos
+    modos usan ese valor real.
+
+    La diferencia burst/classic se conserva como capacidad: si el operador
+    la quiere, se fija por entorno, y eso es lo que comprueba este test.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         rows = [{"hypothesis_id": "h1", "symbol": "BTC/USDT",
                  "status": "backtested", "strategy_type": "scalp_burst",
                  "expectancy": 0.01}]
         eng = make_engine(tmp, rows, mode="burst")
-        # Burst slippage should be 0.03% (0.0003) vs classic 0.05%
-        assert eng.burst_slippage_pct == 0.0003
-        price = 100.0
-        slipped_buy = eng._slip(price, "buy", True)
-        # Classic would be 100 * 1.0005 = 100.05
-        # Burst should be 100 * 1.0003 = 100.03
-        assert abs(slipped_buy - 100.03) < 0.001
+        # Por defecto: la mitad del spread MEDIDO (0,0034%).
+        assert eng.burst_slippage_pct == pytest.approx(0.000034)
+        precio = 100.0
+        assert abs(eng._slip(precio, "buy", True) - 100.0034) < 0.001
+
+        # Y se puede apretar mas para burst por entorno (eso si es decision
+        # del operador, no un numero inventado en el codigo).
+        os.environ["QUANTMATH_BURST_SLIPPAGE_PCT"] = "0.00002"
+        try:
+            eng2 = make_engine(tmp, rows, mode="burst")
+            assert eng2.burst_slippage_pct == pytest.approx(0.00002)
+            assert abs(eng2._slip(precio, "buy", True) - 100.002) < 0.001
+        finally:
+            os.environ.pop("QUANTMATH_BURST_SLIPPAGE_PCT", None)
 
 
-def test_classic_slippage_unchanged():
+def test_classic_slippage_es_el_spread_medido():
     with tempfile.TemporaryDirectory() as tmp:
         rows = [{"hypothesis_id": "h1", "symbol": "BTC/USDT",
                  "status": "backtested", "strategy_type": "momentum",
                  "expectancy": 0.01}]
         eng = make_engine(tmp, rows, mode="classic")
-        price = 100.0
-        slipped = eng._slip(price, "buy", True)
-        assert abs(slipped - 100.05) < 0.001
+        # 0,05% era un supuesto. El real medido es la mitad del spread:
+        # 0,0034% por lado.
+        assert eng.slippage_pct == pytest.approx(0.000034)
+        precio = 100.0
+        assert abs(eng._slip(precio, "buy", True) - 100.0034) < 0.001
 
 
 def test_exposure_cap_blocks_entry():
