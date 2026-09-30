@@ -1,8 +1,8 @@
 # QUANT-MATH Architecture — v1.5.0
 
-> Fuente de verdad del pipeline en ejecución. El detalle histórico por
-> módulo vive en `ARCHITECTURE_GUIDE.md`; el estado de implementación en
-> `IMPLEMENTATION_STATUS.md`.
+> Fuente de verdad del pipeline en ejecución. El estado medido del sistema
+> —qué funciona, qué no y las correcciones ordenadas por riesgo de dinero—
+> está en `ops/AUDITORIA-CONTEXTO-2026-09-29.md`.
 
 ## Pipeline en ejecución
 
@@ -70,5 +70,5 @@ Feedback
 ## Ver más
 
 - `README.md` — quickstart, flags de entorno, estructura real
-- `IMPLEMENTATION_STATUS.md` — qué existe y qué está propuesto
-- `ARCHITECTURE_GUIDE.md` — guía histórica profunda por módulo (v0.x)
+- `ops/AUDITORIA-CONTEXTO-2026-09-29.md` — auditoría de contexto: qué
+  funciona, qué no, y las 12 correcciones ordenadas por riesgo de dinero

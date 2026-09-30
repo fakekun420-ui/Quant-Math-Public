@@ -197,13 +197,20 @@ resamples already-real trade PnLs (statistical bootstrap).
 └── graphify-out/               # Code knowledge graph (Graphify index)
 ```
 
-Legacy planning documents (`ARCHITECTURE.md`, `IMPLEMENTATION_STATUS.md`,
-`ARCHITECTURE_REUSE_REPORT.md`, `SYSTEM_DEPENDENCY_MAP.md`) describe earlier
-visions and module checklists; `ARCHITECTURE_GUIDE.md` is partially updated.
+`ARCHITECTURE.md` is the current architecture. The pre-1.5 planning
+documents (`ARCHITECTURE_GUIDE.md`, `SYSTEM_DEPENDENCY_MAP.md`,
+`GRAPH_AUDIT_REPORT.md`, `data/*.csv`) were removed on 2026-09-30: they
+described a tree that never existed, carried stale numbers, and were
+referenced by nothing that resolves. They are in
+`/sdcard/projects/_quarantine/qmp-depuracion-2026-09-30/`.
+
+The authoritative record of the current state — what works, what does not,
+and the corrections ordered by money risk — is
+`ops/AUDITORIA-CONTEXTO-2026-09-29.md`.
 
 ## Testing
 
-137 tests, zero warnings: integration workflow, decision-engine gate
+282 tests, zero failures: integration workflow, decision-engine gate
 behavior + skip-fallback (P1), live-expectancy shrinkage (PA),
 hardened auto-graduation IC90+families (O1/PB), adverse-slippage fills
 (O2), generative-novelty metric (O4), vol-targeted sizing (O6),
@@ -224,7 +231,21 @@ MIT
 
 Research/paper-trading system. Not financial advice. Trading involves risk.
 
-## v1.5.1 Update (Refactoring)
-- **Technical Debt:** Obsolete legacy folder and redundant documents (`ARCHITECTURE_REUSE_REPORT.md`, `IMPLEMENTATION_STATUS.md`) removed to clean up the workspace and graph.
+## v1.6.0 Update (2026-09-30)
+- **Auditoría de contexto y 12 correcciones** — `ops/AUDITORIA-CONTEXTO-2026-09-29.md`.
+  Lo esencial: el `expectancy` salía mal calculado (`backtester.py` no sumaba el PnL de
+  las posiciones vivas al capital), la puerta `expectancy>0` estaba apagada por el launcher,
+  y los datos venían del **testnet** en vez del mercado real. Corregido y verificado.
+- **TP/SL por ROE** con validación de alcanzabilidad contra la liquidación, usando el MMR
+  **real** de Bybit (0,0033, primer tramo; el MMR es escalonado por nocional).
+- **Ruta de cierre real en live** (orden `reduceOnly`): antes la posición se quitaba del
+  estado local y quedaba **abierta en el exchange**.
+- **Aprendizaje SIS conectado** de verdad a la generación: el prior se emitía con claves
+  hoja (`vwap`) y el consumidor buscaba familias canónicas (`mean_reversion`), así que el
+  `.get()` daba `None` y el aprendizaje no influía en nada.
+- **Deuda técnica pagada:** 12.938 ficheros de `node_modules/` salen de git
+  (13.158 → **220** rastreables; en disco siguen), 25 CSV muertos (18 MB), 8 logs (5,9 MB),
+  3 documentos de arquitectura caducados y 2 ficheros de test que **nunca se ejecutaban**
+  (uno roto por `ModuleNotFoundError: legacy`). Todo a cuarentena, nada borrado (§5.3).
 - **Garbage Collection (JSONL):** `JSONLKnowledgeBase` now automatically archives dead/failed hypotheses into `*_archive.jsonl` to prevent O(N) linear slowdown over time.
 - **Event Bus Decoupling:** `DecisionEngine` now implements a Pub/Sub `EventBus` (`event_bus.py`). It emits `trade_opened` and `trade_closed` events, decoupling the engine to safely pipe live metrics to external handlers without modifying the core.

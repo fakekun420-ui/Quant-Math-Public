@@ -42,6 +42,43 @@ except ImportError as e:
     print(f"[QuantMathAdapter] Warning: Could not import quant-math modules: {e}")
 
 
+# REGISTRO DE ESTRATEGIAS IMPLEMENTADAS — fuente unica de verdad.
+# MEDIDO 2026-09-28: el dispatcher terminaba en un `else` que sustituia cualquier estrategia
+# desconocida por un ema_crossover desnudo, sin parametros y sin aviso. Eso hacia que
+# `hybrid_trend_reversion` (emitida por mutacion cruzada en aqde_runner.py:400) se
+# backtesteara como otra cosa y su PnL FALSO alimentara el aprendizaje.
+# Dos reglas, y las dos importan:
+#   - Si anades una estrategia aqui, anadela tambien a la cadena `elif stype ==` de make_strategy.
+#   - Si no esta aqui, NO se puede emitir. El generador filtra contra este conjunto.
+IMPLEMENTED_STRATEGIES = frozenset({
+    "ema_crossover",
+    "rsi_reversion",
+    "bb_reversion",
+    "breakout",
+    "macd",
+    "stochastic_reversion",
+    "vwap_reversion",
+    "dual_ema",
+    "donchian_breakout",
+    "ati_trend",
+    "energy_burst",
+    "range_pressure",
+    "scalp_burst",
+})
+
+
+class UnknownStrategyError(NotImplementedError):
+    """La hipotesis pide una estrategia que este adapter no sabe ejecutar.
+
+    Se propaga a proposito. Antes se tragaba el error y devolvia los numeros de otra
+    estrategia, que es peor que fallar: un backtest que no se hizo parece un backtest.
+    """
+
+
+def is_implemented(strategy_type) -> bool:
+    return strategy_type in IMPLEMENTED_STRATEGIES
+
+
 class QuantMathAdapter:
     """
     Adapter for integrating AQDE with existing quant-math modules.
@@ -511,8 +548,12 @@ class QuantMathAdapter:
                         buy_sig = close_prices[i] > upper_band and ema_s[i] > ema_l[i]
                         sell_sig = close_prices[i] < lower_band and ema_s[i] < ema_l[i]
                     elif stype == 'energy_burst':
-                        w = 20
-                        zthr = 1.5
+                        # MEDIDO 2026-09-28: estos dos estaban fijos aqui, asi que la
+                        # optimizacion del generador sobre ellos era codigo MUERTO en esta
+                        # ruta. Se leen de la hipotesis, con los mismos valores por defecto
+                        # que tenian, para no cambiar el comportamiento de lo ya medido.
+                        w = params.get('burst_window', 20)
+                        zthr = params.get('burst_z', 1.5)
                         if i >= w and i >= 1:
                             rets = np.diff(np.array(close_prices[:i+1], dtype=float))
                             win = rets[i - w:i]
@@ -524,8 +565,10 @@ class QuantMathAdapter:
                         else:
                             buy_sig = sell_sig = False
                     elif stype == 'range_pressure':
-                        w = 20
-                        hi, lo = 0.85, 0.15
+                        # MEDIDO 2026-09-28: hardcodeados -> optimizacion muerta (ver energy_burst).
+                        w = params.get('range_window', 20)
+                        hi = params.get('range_hi', 0.85)
+                        lo = params.get('range_lo', 0.15)
                         if i >= w:
                             win = np.array(close_prices[i - w + 1:i + 1], dtype=float)
                             rng = win.max() - win.min()
@@ -535,8 +578,12 @@ class QuantMathAdapter:
                         else:
                             buy_sig = sell_sig = False
                     elif stype == 'scalp_burst':
-                        ema_f_w, ema_s_w = 8, 21
-                        mom_w, mom_thr, pb = 5, 0.002, 0.003
+                        # MEDIDO 2026-09-28: hardcodeados -> optimizacion muerta (ver energy_burst).
+                        ema_f_w = params.get('scalp_ema_fast', 8)
+                        ema_s_w = params.get('scalp_ema_slow', 21)
+                        mom_w = params.get('scalp_mom_window', 5)
+                        mom_thr = params.get('scalp_mom_thr', 0.002)
+                        pb = params.get('scalp_pb', 0.003)
                         if i >= ema_s_w + mom_w and i >= 2:
                             arr = np.array(close_prices[:i+1], dtype=float)
                             af = 2.0 / (ema_f_w + 1)
@@ -564,9 +611,19 @@ class QuantMathAdapter:
                                 buy_sig = sell_sig = False
                         else:
                             buy_sig = sell_sig = False
-                    else:
+                    elif stype == 'ema_crossover':
+                        # Explicitado: el `else` final era una sustitucion silenciosa por un
+                        # EMA crossover desnudo. Ver IMPLEMENTED_STRATEGIES mas arriba.
                         buy_sig = ema_s[i] > ema_l[i]
                         sell_sig = ema_s[i] < ema_l[i]
+                    else:
+                        # Estrategia desconocida: se aborta el backtest en vez de devolver
+                        # numeros de otra estrategia. El fallo viaja hasta el ResearchManager,
+                        # que marca la hipotesis como rechazada y sigue el ciclo.
+                        raise UnknownStrategyError(
+                            f"estrategia no implementada: {stype!r}. "
+                            f"Implementadas: {sorted(IMPLEMENTED_STRATEGIES)}"
+                        )
 
                     if not in_position and buy_sig:
                         orders.append({'symbol': symbol, 'side': 'buy', 'quantity': 1})
