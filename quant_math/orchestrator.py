@@ -735,8 +735,7 @@ class Orchestrator:
         orden se rechaza en vez de abrir otra cosa.
         """
         from data_acquisition.data_sources.exchanges import ExchangeAPI
-        api = ExchangeAPI(self.config.exchange_id,
-                          sandbox=self.config.testnet)
+        api = self._exchange()
         try:
             # Al cerrar se compra para tapar una larga y se vende para tapar
             # una corta: el lado es el contrario al de la entrada.
@@ -827,8 +826,7 @@ class Orchestrator:
             })
 
         try:
-            api = ExchangeAPI(self.config.exchange_id,
-                              sandbox=self.config.testnet)
+            api = self._exchange()
         except Exception as exc:
             report["status"] = "error"
             report["motivo"] = f"no se pudo abrir el exchange: {exc}"
@@ -1505,6 +1503,60 @@ class Orchestrator:
             self._log_shadow_order(trade, signal, price)
         return trade
 
+    def _exchange(self):
+        """Cliente de exchange con el DOMINIO DE DATOS bien puesto.
+
+        Es un metodo y no cuatro `ExchangeAPI(...)` sueltos porque la regla
+        tiene DOS ramas opuestas y basta con que una se olvide para que el
+        sistema aprenda sobre el mercado equivocado:
+
+        - PAPER: feed SIEMPRE de mainnet. No se manda ninguna orden, luego
+          no hay venue de ejecucion al que atenerse, y aprender contra los
+          precios de testnet seria aprender sobre datos FALSOS.
+        - LIVE: los datos siguen al venue donde se ejecuta. Medido el
+          2026-09-30: XRP cotiza a 1,501 en mainnet y a 1,5735 en testnet
+          (4,83%), y con el feed equivocado Bybit rechaza el TP porque le
+          queda por debajo del precio de ejecucion.
+        """
+        from data_acquisition.data_sources.exchanges import ExchangeAPI
+        return ExchangeAPI(self.config.exchange_id,
+                           sandbox=self.config.testnet,
+                           data_venue="mainnet" if self.config.dry_run
+                           else None)
+
+    def _cerrar_si_no_verifica(self, api, symbol: str, side: str,
+                               qty: float, motivo: str) -> Dict:
+        """Cierra en el exchange una entrada que no se pudo verificar.
+
+        Se usa cuando la posicion abre pero sus parametros no son los
+        pedidos: apalancamiento que no cuadra, o ilegible. Es un caminho
+        que deberia ser RARO, y por eso se registra como incidente y no como
+        una operacion mas: si aparece, significa que el exchange cambio de
+        reglas o que la cuenta tiene algo puesto a mano.
+
+        `reduceOnly` es obligatorio: sin el, un cierre sobre una posicion
+        que ya no existe abriria una INVERSA, que es peor que no hacer nada.
+        """
+        exit_side = "sell" if side == "buy" else "buy"
+        try:
+            swap = symbol if ":" in symbol else (
+                symbol + ":USDT" if symbol.endswith("/USDT") else symbol)
+            out = api.create_order(swap, exit_side, abs(qty),
+                                   order_type="market",
+                                   params={"reduceOnly": True})
+            logger.error("[live] AUTO-CERRADA entrada no verificada (%s): "
+                         "id=%s", motivo, out.get("id"))
+            return {"ok": True, "order_id": out.get("id"), "motivo": motivo}
+        except Exception as exc:
+            # No se pudo cerrar. Esto es lo PEOR que puede pasar, asi que se
+            # dice con todas las letras: la posicion sigue viva, sin
+            # verificar, y el operador tiene que saberlo.
+            logger.error("[live] NO SE PUDO CERRAR la entrada no verificada "
+                         "(%s): %s. HAY UNA POSICION VIVA SIN VERIFICAR.",
+                         motivo, exc)
+            return {"ok": False, "error": str(exc), "motivo": motivo,
+                    "posicion_sin_cerrar": True}
+
     def _execute_live_order(self, signal: Dict, price: float, side: str,
                             notional: float, lev_used: int,
                             margin: Optional[float]) -> Dict:
@@ -1516,16 +1568,64 @@ class Orchestrator:
         from data_acquisition.data_sources.exchanges import ExchangeAPI
         trade: Dict = {"action": "live_failed", "symbol": signal.get("symbol")}
         try:
-            api = ExchangeAPI(self.config.exchange_id,
-                              sandbox=self.config.testnet)
+            api = self._exchange()
+            # --- APALANCAMIENTO: se EXIGE, no se supone ---------------
+            #
+            # Antes: `set_leverage` fallaba, se escribia un warning y la
+            # orden se mandaba igual. Medido el 2026-09-30: se pidio 50x y
+            # la posicion se abrio a 10x. Un apalancamiento que no es el
+            # pedido cambia por completo el riesgo: la liquidacion cae 4x
+            # mas lejos, el SL puede quedar IRREACHABLE y la posicion real
+            # es 5x mas grande de la que se cree. Es la misma cosa que
+            # operar con datos falsos, y por eso aqui FALLA CERRADO.
             try:
                 api.set_margin_mode(signal["symbol"], "isolated")
             except Exception as exc:
-                logger.warning("[live] set_margin_mode fallo (%s); continúo", exc)
+                # El modo de margen tambien importa: en cross una perdida
+                # de una posicion se paga con TODA la cuenta. Se avisa pero
+                # no se bloquea, porque el exchange puede rechazar el
+                # cambio si ya hay posicion y aun asi el isolated estar
+                # puesto de antes.
+                logger.warning("[live] set_margin_mode fallo (%s); reviso "
+                               "que la posicion quede aislada", exc)
             try:
                 api.set_leverage(signal["symbol"], lev_used)
             except Exception as exc:
-                logger.warning("[live] set_leverage fallo (%s); continúo", exc)
+                logger.error("[live] set_leverage(%sx) fallo (%s): NO se "
+                             "abre la posicion", lev_used, exc)
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed", "symbol": signal["symbol"],
+                        "error": f"set_leverage {lev_used}x fallo: {exc}",
+                        "leverage_requested": lev_used,
+                        "leverage_actual": None,
+                        "reason": "apalancamiento pedido no aplicable"}
+
+            # Margen suficiente ANTES de mandar la orden: mejor un rechazo
+            # propio y explicito que una orden que el exchange toca a medias.
+            try:
+                disp = api.available_margin()
+            except Exception as exc:
+                logger.warning("[live] no se pudo leer el margen: %s", exc)
+                disp = None
+            if disp is not None and margin is not None:
+                if margin > disp * 1.001:
+                    logger.error("[live] margen insuficiente: necesito %.2f y "
+                                 "hay %.2f disponibles", margin, disp)
+                    try:
+                        api.close()
+                    except Exception:
+                        pass
+                    return {"action": "live_failed",
+                            "symbol": signal["symbol"],
+                            "error": (f"margen insuficiente: necesito "
+                                      f"{margin:.2f}, hay {disp:.2f}"),
+                            "margin_needed": margin,
+                            "margin_available": disp,
+                            "reason": "margen insuficiente"}
+
             qty = notional / price
             # Los precios de salida se calculan ANTES de mandar la orden
             # (correccion 6): antes se mandaba la entrada desnuda y el TP/SL
@@ -1548,6 +1648,59 @@ class Orchestrator:
             }
             order = api.create_order(signal["symbol"], side, qty,
                                      order_type="market", params=order_params)
+
+            # --- COMPROBACION POST-ENTRADA ---------------------------
+            # Que `set_leverage` no fallara NO demuestra que la posicion se
+            # abriera al apalancamiento pedido: Bybit puede aceptar la
+            # llamada y usar otro (medido: 50 pedido, 10 real). Se lee del
+            # exchange y, si no coincide, se CIERRA. Preferimos perder el
+            # spread de una entrada equivocada a quedarnos con una posicion
+            # cuyo riesgo nadie ha medido.
+            try:
+                real = api.read_back_leverage(signal["symbol"])
+            except Exception as exc:
+                logger.warning("[live] no se pudo leer el apalancamiento "
+                               "real: %s", exc)
+                real = None
+            if real is None:
+                logger.error("[live] el exchange NO dice que apalancamiento "
+                             "tiene la posicion; no se fia, se cierra")
+                _cerrado = self._cerrar_si_no_verifica(
+                    api, signal["symbol"], side, qty,
+                    f"apalancamiento real ilegible (pedido {lev_used}x)")
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed",
+                        "symbol": signal["symbol"],
+                        "error": "apalancamiento real ilegible",
+                        "leverage_requested": lev_used,
+                        "leverage_actual": None,
+                        "auto_closed": _cerrado,
+                        "reason": "apalancamiento real no verificable"}
+            if abs(real - lev_used) > 0.01:
+                logger.error("[live] APALANCAMIENTO INCORRECTO: pedi %sx y la "
+                             "posicion esta a %sx; se cierra",
+                             lev_used, real)
+                _cerrado = self._cerrar_si_no_verifica(
+                    api, signal["symbol"], side, qty,
+                    f"apalancamiento {real}x != pedido {lev_used}x")
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed",
+                        "symbol": signal["symbol"],
+                        "error": (f"apalancamiento incorrecto: pedido "
+                                  f"{lev_used}x, real {real}x"),
+                        "leverage_requested": lev_used,
+                        "leverage_actual": real,
+                        "auto_closed": _cerrado,
+                        "reason": "apalancamiento distinto del pedido"}
+            logger.info("[live] apalancamiento VERIFICADO en el exchange: "
+                        "%sx (era lo pedido)", real)
+
             try:
                 api.close()
             except Exception:
@@ -1653,8 +1806,7 @@ class Orchestrator:
                 logger.warning("[live] sin API keys en .env — shadow sin validar; "
                                "paper trading continúa")
                 return False
-            api = ExchangeAPI(self.config.exchange_id,
-                              sandbox=self.config.testnet)
+            api = self._exchange()
             bal = api.fetch_balance()
             total = (bal.get("total") or {}).get("USDT", "?")
             logger.info("[live] keys OK (testnet=%s) balance USDT=%s",

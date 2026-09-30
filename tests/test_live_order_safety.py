@@ -25,8 +25,22 @@ class FakeAPI:
 
     instances = []
 
+    # Palancas del doble, a nivel de CLASE y NO en __init__. Motivo: el
+    # motor crea su propia instancia dentro de _execute_live_order, asi que
+    # un test solo puede fijar la palanca ANTES de que exista esa
+    # instancia. Si estuvieran en __init__, el atributo de instancia
+    # taparia al de clase y el test creeria haber configurado algo que en
+    # realidad no/configuro. (Medido: por eso los 4 tests fallaban con
+    # "10 == 5".)
+    #: si es str, set_leverage() lanza ese error
+    leverage_error = None
+    #: apalancamiento que el exchange DEVUELVE al releer la posicion
+    leverage_real = 10
+    #: margen disponible que declara la cuenta (None = no se sabe)
+    margin_available = 100000.0
+
     def __init__(self, exchange_id="bybit", sandbox=False, api_key=None,
-                 api_secret=None):
+                 api_secret=None, data_venue=None):
         self.exchange_id = exchange_id
         self.sandbox = sandbox
         self.orders = []
@@ -38,7 +52,15 @@ class FakeAPI:
         self.margin_mode = (symbol, mode)
 
     def set_leverage(self, symbol, leverage, params=None):
+        if self.leverage_error:
+            raise RuntimeError(self.leverage_error)
         self.leverage = (symbol, leverage)
+
+    def read_back_leverage(self, symbol):
+        return self.leverage_real
+
+    def available_margin(self):
+        return self.margin_available
 
     def create_order(self, symbol, side, amount, price=None,
                      order_type="market", params=None):
@@ -56,6 +78,11 @@ class FakeAPI:
 @pytest.fixture(autouse=True)
 def fake_api(monkeypatch):
     FakeAPI.instances = []
+    # Las palancas son de clase: hay que devolverlas a su valor bueno entre
+    # tests o cada uno hereda lo que dejo el anterior.
+    FakeAPI.leverage_error = None
+    FakeAPI.leverage_real = 10
+    FakeAPI.margin_available = 100000.0
     import data_acquisition.data_sources.exchanges as ex
     monkeypatch.setattr(ex, "ExchangeAPI", FakeAPI)
     # Claves FICTICIAS solo para poder construir una config live: el bloqueo
@@ -256,3 +283,157 @@ def test_reconcile_tambien_parte_por_el_primer_dos_puntos():
         QuantMathAdapter)
     key = "hyp_x:BTC/USDT:USDT"
     assert key.split(":", 1)[-1] == "BTC/USDT:USDT"
+
+
+# ---------------------------------------------------------------------------
+# APALANCAMIENTO (2026-09-30)
+#
+# Un apalancamiento que no es el pedido cambia el riesgo por completo: la
+# liquidacion cae mas lejos, el SL puede quedar inalcanzable y la posicion
+# real es mas grande de la que se cree. Es la misma cosa que operar con
+# datos falsos, y por eso NO se deja pasar en silencio.
+#
+# Que `set_leverage` no lance NO demuestra nada: Bybit puede aceptar la
+# llamada y abrir la posicion a otro. La garantia es releer la posicion.
+# ---------------------------------------------------------------------------
+
+#: Clase REAL de ExchangeAPI, capturada aqui en la IMPORTACION del modulo.
+#: El fixture `fake_api` la sustituye por el doble, asi que pedirla dentro
+#: de un test devolveria el doble y no lo que se quiere comprobar. Es la
+#: misma clase que el motor importa en vivo, por eso el test es valido.
+REAL_EXCHANGE_API = None
+try:
+    from data_acquisition.data_sources.exchanges import (
+        ExchangeAPI as REAL_EXCHANGE_API)
+except Exception:                       # pragma: no cover
+    REAL_EXCHANGE_API = None
+
+
+def _orch_lev(fake_api, leverage_real, lev_pedido=10, **cfg_over):
+    from quant_math.orchestrator import Orchestrator
+    o = _orch(leverage=lev_pedido, **cfg_over)
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.config = o
+    orch.cycle_count = 1
+    # se prepara el doble ANTES de que _execute_live_order lo cree: el
+    # constructor de ExchangeAPI se monkeypatchea a FakeAPI y el motor crea
+    # su propia instancia dentro, asi que se parchea la clase.
+    FakeAPI.leverage_real = leverage_real
+    signal = {"symbol": "BTC/USDT:USDT", "side": "buy", "price": 100.0,
+              "hypothesis_id": "h1", "expectancy": 0.01,
+              "timestamp": 1790000000000}
+    return orch, signal
+
+
+def test_si_el_apalancamiento_no_coincide_no_se_acepta_la_operacion(fake_api):
+    """El exchange devuelve 5x cuando se pidieron 50x: se CIERRA."""
+    orch, signal = _orch_lev(fake_api, leverage_real=5, lev_pedido=50)
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 50, 1.0)
+
+    assert trade["action"] == "live_failed", "no debio aceptar la operacion"
+    assert trade["leverage_requested"] == 50
+    assert trade["leverage_actual"] == 5
+    assert "apalancamiento" in trade["reason"].lower()
+
+    api = fake_api.instances[-1]
+    # primera orden = la entrada, segunda = el cierre con reduceOnly
+    assert len(api.orders) == 2, "deberia haber abierto y cerrado"
+    assert api.orders[1]["params"].get("reduceOnly") is True, \
+        "el cierreAutomatico tiene que ser reduceOnly, si no abre una INVERSA"
+    assert api.orders[1]["side"] == "sell", "cerrar una larga es vender"
+
+
+def test_un_apalancamiento_ilegible_tambien_cierra(fake_api):
+    """Si el exchange NO dice cual es el apalancamiento, no se fia.
+
+    None no es "todo bien": es no saber, y con dinero real no saber como
+    estas apalancado no es una situacion aceptable.
+    """
+    orch, signal = _orch_lev(fake_api, leverage_real=None, lev_pedido=50)
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 50, 1.0)
+
+    assert trade["action"] == "live_failed"
+    assert trade["leverage_actual"] is None
+    assert trade["auto_closed"]["ok"] is True
+    assert "ilegible" in trade["error"]
+
+
+def test_si_el_apalancamiento_coincide_la_operacion_pasa(fake_api):
+    """El camino bueno: 10 pedido, 10 real, se opera con normalidad."""
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade.get("action") != "live_failed", trade.get("error")
+    assert trade["leverage"] == 10
+    assert trade["margin_usd"] == pytest.approx(1.0)
+    api = fake_api.instances[-1]
+    assert len(api.orders) == 1, "con el apalancamiento correcto no se cierra"
+    assert "stopLoss" in api.orders[0]["params"], "y sigue yendo protejida"
+
+
+def test_margen_insuficiente_no_llega_a_la_orden(fake_api):
+    """Mejor rechazar por nuestra cuenta que tocar la orden a medias."""
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.margin_available = 0.5      # hace falta 10 de margen
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 10.0)
+
+    assert trade["action"] == "live_failed"
+    assert trade["margin_needed"] == pytest.approx(10.0)
+    assert trade["margin_available"] == pytest.approx(0.5)
+    assert fake_api.instances[-1].orders == [], "no debio mandarse ninguna orden"
+
+
+def test_un_margen_desconocido_no_impide_operar(fake_api):
+    """Si no se sabe el margen, se opera: el exchange es el que rechaza.
+
+    Esto es al reves que el apalancamiento y a proposito. Con el
+    apalancamiento, no saber significa que la posicion puede ser 5x mas
+    grande de lo que se cree, y eso no se descubre cuando ya esta abierta.
+    Con el margen, el exchange no deja abrir sin fondos, y ser conservador
+    sin saber dejaria el bot parado sin motivo.
+    """
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.margin_available = None
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 10.0)
+
+    assert trade.get("action") != "live_failed", trade.get("error")
+    assert len(fake_api.instances[-1].orders) == 1
+
+
+def test_set_leverage_trata_el_ya_puesto_como_correcto(fake_api):
+    """Bybit NO es idempotente: con el apalancamiento ya puesto devuelve
+    110043 "leverage not modified" y ccxt lo lanza como BadRequest.
+
+    Semanticamente dice lo contrario de un fallo: CONFIRMA que ya es el
+    pedido. Si se tratara como error, la segunda entrada en adelante se
+    rechazaria siempre y el bot dejaria de operar.
+    """
+    from data_acquisition.data_sources.exchanges import ExchangeAPI
+    assert ExchangeAPI is not REAL_EXCHANGE_API, \
+        "el fixture deberia haber sustituido la clase por el doble"
+    assert REAL_EXCHANGE_API is not None, "no se pudo capturar la clase real"
+
+    class _Client:
+        def __init__(self, err):
+            self.err = err
+            self.calls = 0
+
+        def set_leverage(self, lev, sym, params=None):
+            self.calls += 1
+            raise self.err
+
+    api = object.__new__(REAL_EXCHANGE_API)
+    api._require_auth = lambda: None
+    api._to_swap_symbol = lambda s: s
+
+    # 110043: se trata como exito
+    api.exchange = _Client(Exception(
+        'bybit {"retCode":110043,"retMsg":"leverage not modified"}'))
+    r = api.set_leverage("XRP/USDT:USDT", 50)
+    assert r.get("already_set") is True, "110043 debe contar como 'ya estaba'"
+    assert api.exchange.calls == 1
+
+    # cualquier otro error: se propaga
+    api.exchange = _Client(Exception('retCode 110001 order does not exist'))
+    with pytest.raises(Exception):
+        api.set_leverage("XRP/USDT:USDT", 50)

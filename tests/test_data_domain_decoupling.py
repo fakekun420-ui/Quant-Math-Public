@@ -71,10 +71,21 @@ def clean_env(monkeypatch):
 
 
 def test_bybit_testnet_no_arrastra_las_velas_al_testnet(fake_ccxt, clean_env, monkeypatch):
-    """EL BUG: BYBIT_TESTNET decidia tambien de donde salian los velas.
+    """LA REGLA CAMBIO el 2026-09-30, y hay que entender por que.
 
-    Con el codigo viejo, sandbox=True acaparaba el unico cliente y las velas
-    iban a testnet. Ahora solo mueve el venue de ordenes.
+    Antes: testnet en ordenes, mainnet en datos, siempre. Con eso un
+    TP/SL calculado sobre el feed quedaba en el sitio equivocado. Medido:
+    XRP cotiza a 1,501 en mainnet y a 1,5735 en testnet (4,83%), y Bybit
+    rechaza el TP si le queda por debajo del precio de ejecucion
+    ("TakeProfit 1,5180 should be higher than base_price 1,5756").
+
+    Ahora, en LIVE los datos SIGUEN al venue de ejecucion. En PAPER no: ahi
+    no se manda ninguna orden y lo que se quiere es el mercado de verdad,
+    y eso lo dice el motor con data_venue="mainnet" (ver el test de paper
+    de mas abajo).
+
+    Lo que NO cambia en ningun caso: las ordenes siguen yendo a testnet por
+    defecto, que es lo que evita operar en real por error.
     """
     monkeypatch.setenv("BYBIT_TESTNET", "true")
 
@@ -82,9 +93,26 @@ def test_bybit_testnet_no_arrastra_las_velas_al_testnet(fake_ccxt, clean_env, mo
     api = ExchangeAPI("bybit")
 
     assert api.exchange.sandbox is True, "las ordenes deben seguir yendo a testnet"
-    assert api.data_client.sandbox is False, (
-        "las velas deben ir al mercado real aunque las ordenes vayan a testnet"
-    )
+    assert api.data_venue == "testnet", (
+        "en live los datos siguen al venue donde se ejecuta")
+    assert api.data_client.sandbox is True
+
+
+def test_en_paper_los_datos_son_de_mainnet(fake_ccxt, clean_env, monkeypatch):
+    """PAPER: el feed es SIEMPRE el mercado real.
+
+    En paper no se manda ninguna orden, luego no hay venue de ejecucion al
+    que atenerse. Y aprender el SIS contra los precios de testnet seria
+    aprender sobre datos FALSOS, que es justo lo que no se quiere.
+    """
+    from data_acquisition.data_sources.exchanges import ExchangeAPI
+    # testnet en ordenes (lo normal) pero el motor dice "esto es paper":
+    api = ExchangeAPI("bybit", sandbox=True, data_venue="mainnet")
+
+    assert api.exchange.sandbox is True, "las ordenes siguen yendo a sandbox"
+    assert api.data_venue == "mainnet", "pero el feed es del mercado real"
+    assert api.data_client.sandbox is False
+    assert api.data_client.apiKey is None, "y sin claves"
 
 
 def test_datos_mainnet_por_defecto(fake_ccxt, clean_env):

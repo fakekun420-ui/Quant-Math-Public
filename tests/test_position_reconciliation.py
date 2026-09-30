@@ -23,7 +23,7 @@ class FakeAPI:
     instances = []
 
     def __init__(self, exchange_id="bybit", sandbox=False, api_key=None,
-                 api_secret=None):
+                 api_secret=None, data_venue=None):
         self.exchange_id = exchange_id
         self.sandbox = sandbox
         self.orders = []

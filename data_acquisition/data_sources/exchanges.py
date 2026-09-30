@@ -52,10 +52,18 @@ def is_testnet() -> bool:
 
 
 def data_sandbox() -> bool:
-    """DOMINIO DE DATOS: False (mercado real) salvo que se pida sandbox.
+    """DOMINIO DE DATOS: si las VELAS salen del sandbox (testnet).
 
-    Por defecto mainnet. Solo se activa con BYBIT_DATA_SANDBOX=1, y entonces
-    hay que decirlo a proposito: el research se mide contra el mercado real.
+    OJO: esto es un override MANUAL. El valor normal lo decide el venue de
+    ordenes, dentro de `ExchangeAPI.__init__` (testnet -> testnet, mainnet
+    -> mainnet), porque un TP/SL calculado sobre el precio de un mercado no
+    vale en otro: medido el 2026-09-30, XRP cotiza a 1,501 en mainnet y a
+    1,5735 en testnet, y Bybit rechaza el TP si queda por debajo del precio
+    de ejecucion.
+
+    Este override existe para el caso raro de querer datos de testnet con
+    ordenes en mainnet, o al reves. Ponerlo a mano es raro: por defecto los
+    datos siguen a donde se ejecuta.
     """
     return os.getenv("BYBIT_DATA_SANDBOX", "").lower() in ("1", "true", "yes")
 
@@ -70,7 +78,8 @@ class ExchangeAPI:
         exchange_id: str,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
-        sandbox: bool = False
+        sandbox: bool = False,
+        data_venue: Optional[str] = None
     ):
         """
         Initialize exchange connection
@@ -81,6 +90,11 @@ class ExchangeAPI:
             api_key: API key (optional)
             api_secret: API secret (optional)
             sandbox: Use testnet/sandbox environment
+            data_venue: de donde salen los DATOS ("mainnet"|"testnet"|None).
+                None = siguen al venue de ordenes. "mainnet" es lo que
+                tiene que pasar el motor en PAPER: alli no se manda ninguna
+                orden, luego no hay venue de ejecucion al que atenerse, y lo
+                que se quiere es el mercado de verdad.
         """
         self.exchange = None
         self.exchange_id = exchange_id
@@ -123,15 +137,51 @@ class ExchangeAPI:
             order_config['secret'] = api_secret
         if sandbox:
             order_config['sandbox'] = True
+        # 2) DOMINIO DE DATOS: los datos SIGUEN al lugar donde se ejecuta,
+        #    porque un TP/SL calculado sobre el precio de un mercado no
+        #    vale en otro.
+        #
+        #    Medido el 2026-09-30: XRP cotiza a 1,501 en mainnet y a 1,5735
+        #    en testnet, un 4,83% de diferencia. Con los datos en mainnet y
+        #    las ordenes en testnet, el TP/SL calculado sobre el feed quedaba
+        #    POR DEBAJO del precio de ejecucion y Bybit rechazaba la orden:
+        #    "TakeProfit 1,5180 should be higher than base_price 1,5756".
+        #
+        #    Precedencia (gana la primera que aplique):
+        #      1) BYBIT_DATA_VENUE        — override manual del operador
+        #      2) data_venue (argumento)  — lo dice quien llama (el motor
+        #                                      pone "mainnet" en paper)
+        #      3) el venue de ORDENES     — testnet con testnet, mainnet
+        #                                      con mainnet
+        #
+        #    El caso 3 es el que obliga a distinguir PAPER de LIVE. En
+        #    paper no hay venue de ejecucion porque no se manda nada, y
+        #    aprender contra precios de testnet seria aprender sobre datos
+        #    falsos. Por eso el motor pasa data_venue="mainnet" en paper.
+        _env_venue = str(os.getenv("BYBIT_DATA_VENUE", "")).strip().lower()
+        _arg_venue = str(data_venue or "").strip().lower()
+        if _env_venue:
+            self.data_venue = _env_venue
+        elif data_sandbox():
+            # BYBIT_DATA_SANDBOX=1 sigue siendo un override valido: es la
+            # forma corta de pedir datos de testnet y, de hecho, la que ya
+            # se usaba. Se mantiene para no romper a quien la use.
+            self.data_venue = "testnet"
+        elif _arg_venue:
+            self.data_venue = _arg_venue
+        else:
+            self.data_venue = "testnet" if sandbox else "mainnet"
+        if self.data_venue not in ("testnet", "mainnet"):
+            self.data_venue = "mainnet"
         self.exchange = exchange_class(order_config)
 
-        # 2) Cliente de DATOS: publico, mainnet por defecto. Sin claves y
-        #    sin sandbox salvo que se pida explicitamente con
-        #    BYBIT_DATA_SANDBOX=1. Son dos clientes y no uno porque en ccxt
-        #    `sandbox` afecta a velas Y a ordenes a la vez: con un solo
-        #    objeto no se puede leer el mercado real y mandar a testnet.
+        # 3) Cliente de DATOS: publico, SIN claves. Sigue al venue de
+        #    ordenes salvo que se fuerce con BYBIT_DATA_VENUE. Son dos
+        #    clientes y no uno porque en ccxt `sandbox` afecta a velas Y a
+        #    ordenes a la vez: con un solo objeto no se puede leer el
+        #    mercado real y mandar a testnet.
         self._data_exchange = None
-        self._data_sandbox = data_sandbox()
+        self._data_sandbox = (self.data_venue == "testnet")
         # El sandbox REAL del venue de ordenes, ya con el env aplicado. Se
         # guarda aparte porque `is_testnet()` y este valor no siempre
         # coinciden (el primero asume True por defecto), y comparar contra
@@ -151,21 +201,25 @@ class ExchangeAPI:
         """Cliente de mercado (velas, libro, ticker). NUNCA lleva ordenes.
 
         Se construye laxo para no abrir una segunda conexion si nadie pide
-        datos. Si falla, cae al cliente de ordenes: peor medida que caerse,
-        y deja rastro en el log.
+        datos.
+
+        NUNCA se reutiliza el cliente de ordenes, ni siquiera cuando los dos
+       estan en el mismo venue. Antes si se hacia, cuando `_data_sandbox`
+        coincidia con el del exchange, y era inocuo porque el de datos
+        siempre iba a mainnet y el de ordenes a testnet. Desde el
+        2026-09-30 los dos pueden ser testnet a la vez, y el atajo devolvia
+        el cliente CON CLAVES: el feed de mercado, que deberia ser publico,
+        pasaba a llevar credenciales. Ahorrar una conexion no compra nada
+        frente a romper esa garantia.
         """
         if self._data_exchange is None:
-            if self._data_sandbox == self._order_sandbox:
-                # Coinciden: no hace falta un segundo cliente.
-                self._data_exchange = self.exchange
-            else:
-                cfg = {
-                    'enableRateLimit': True,
-                    'options': {'defaultType': 'swap'},
-                }
-                if self._data_sandbox:
-                    cfg['sandbox'] = True
-                self._data_exchange = getattr(ccxt, self.exchange_id)(cfg)
+            cfg = {
+                'enableRateLimit': True,
+                'options': {'defaultType': 'swap'},
+            }
+            if self._data_sandbox:
+                cfg['sandbox'] = True
+            self._data_exchange = getattr(ccxt, self.exchange_id)(cfg)
         return self._data_exchange
 
     def fetch_ohlcv(
@@ -372,12 +426,117 @@ class ExchangeAPI:
 
     def set_leverage(self, symbol: str, leverage: int,
                      params: Optional[Dict] = None) -> Any:
-        """Set leverage for a perpetual symbol."""
+        """Set leverage for a perpetual symbol.
+
+        IDEMPOTENTE A PROPOSITO, y hace falta. Medido el 2026-09-30:
+        `set_leverage(50)` con la cuenta ya en 50 devuelve
+        `retCode 110043 "leverage not modified"` y ccxt lo lanza como
+        `BadRequest`. Semanticamente ese error dice lo CONTRARIO de un
+        fallo: confirma que el apalancamiento ya es el pedido. Si se
+        tratara como fallo, la segunda entrada en adelante se rechazaria
+        siempre y el bot no operaria nunca mas.
+
+        La garantia real de que el apalancamiento es el pedido la da
+        `read_back_leverage()` DESPUES de abrir, no esta llamada: poner el
+        valor y que el exchange lo acepte no prueba que la posicion se
+        abriera con el.
+        """
         self._require_auth()
         swap = self._to_swap_symbol(symbol)
-        result = self.exchange.set_leverage(int(leverage), swap, params or {})
+        try:
+            result = self.exchange.set_leverage(int(leverage), swap,
+                                                 params or {})
+        except Exception as exc:
+            texto = str(exc)
+            if "110043" in texto or "leverage not modified" in texto.lower():
+                logger.info("set leverage %sx en %s: ya estaba asi "
+                            "(Bybit 110043), se da por correcto",
+                            leverage, swap)
+                return {"retCode": 0, "retMsg": "leverage not modified "
+                                                "(ya era el pedido)",
+                        "already_set": True}
+            raise
         logger.info("set leverage %sx on %s", leverage, swap)
         return result
+
+    def fetch_positions(self, symbols: Optional[List[str]] = None
+                        ) -> List[Dict[str, Any]]:
+        """Posiciones del VENUE DE ORDENES (testnet si `sandbox`).
+
+        Se leen del cliente de ordenes y NO del de datos a proposito: en
+        testnet son mercados distintos (medido: XRP 1,501 en mainnet y
+        1,5735 en testnet), y lo que importa para una posicion viva es el
+        precio y la liquidacion del sitio donde se ejecuta.
+        """
+        self._require_auth()
+        swaps = [self._to_swap_symbol(s) for s in symbols] if symbols else None
+        return list(self.exchange.fetch_positions(swaps) or [])
+
+    def read_back_leverage(self, symbol: str) -> Optional[float]:
+        """Apalancamiento REAL de la posicion abierta, leido del exchange.
+
+        Devuelve None si no hay posicion, si el exchange no lo expone, o si
+        no se puede leer. None NO es "todo bien": quien llama tiene que
+        tratar un None como desconfianza, no como ausencia de problema.
+        """
+        self._require_auth()
+        swap = self._to_swap_symbol(symbol)
+        for pos in self.fetch_positions([swap]):
+            if not pos.get("contracts"):
+                continue
+            for campo in ("leverage", "info"):
+                val = pos.get(campo)
+                if campo == "info" and isinstance(val, dict):
+                    val = val.get("leverage")
+                try:
+                    if val is not None:
+                        return float(val)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def available_margin(self) -> Optional[float]:
+        """MARGEN DISPONIBLE de la cuenta, en la moneda de margen.
+
+        None si el exchange no lo expone. Permite rechazar la entrada por
+        falta de fondos ANTES de mandar la orden, en vez de que el exchange
+        la rechace (o peor, que la ejecute parcialmente).
+        """
+        self._require_auth()
+        try:
+            raw = self.exchange.fetch_balance()
+        except Exception as exc:
+            logger.warning("[margin] fetch_balance fallo: %s", exc)
+            return None
+        lista = (raw.get("info") or {}).get("result", {}).get("list", [])
+        if not isinstance(lista, list) or not lista:
+            return None
+
+        def _num(item: Dict[str, Any], clave: str) -> Optional[float]:
+            try:
+                if item.get(clave) is not None:
+                    return float(item[clave])
+            except (TypeError, ValueError):
+                return None
+            return None
+
+        # Camino corto: si el exchange publica el disponible, se usa tal cual.
+        for item in lista:
+            v = _num(item, "totalAvailableBalance")
+            if v is not None:
+                return v
+        # Camino largo: disponible = equity - margen usado - margen de
+        # ordenes. OJO: `totalOrderMargin` NO es el disponible, es lo
+        # inmovilizado por ordenes vivas; sumarlo sin restarlo seria
+        # justo el error que hace creerse que hay dinero que no hay.
+        for item in lista:
+            equity = _num(item, "totalEquity")
+            if equity is None:
+                continue
+            usado = _num(item, "totalUsedMargin") or 0.0
+            en_ordenes = _num(item, "totalOrderMargin") or 0.0
+            return equity - usado - en_ordenes
+        return None
 
     def set_margin_mode(self, symbol: str, mode: str = "isolated",
                         params: Optional[Dict] = None) -> Any:
