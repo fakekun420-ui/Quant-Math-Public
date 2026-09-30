@@ -1548,14 +1548,53 @@ class Orchestrator:
                          "id=%s", motivo, out.get("id"))
             return {"ok": True, "order_id": out.get("id"), "motivo": motivo}
         except Exception as exc:
-            # No se pudo cerrar. Esto es lo PEOR que puede pasar, asi que se
-            # dice con todas las letras: la posicion sigue viva, sin
-            # verificar, y el operador tiene que saberlo.
-            logger.error("[live] NO SE PUDO CERRAR la entrada no verificada "
-                         "(%s): %s. HAY UNA POSICION VIVA SIN VERIFICAR.",
-                         motivo, exc)
-            return {"ok": False, "error": str(exc), "motivo": motivo,
-                    "posicion_sin_cerrar": True}
+            # FALLO al cerrar. Antes de decir "vive una posicion sin
+            # verificar" hay que PREGUNTARLE al exchange, porque el motivo
+            # mas probable NO es ese: es que la posicion ya estaba cerrada
+            # (medido el 2026-09-30: al intentar cerrar por segunda vez,
+            # Bybit responde 110017 "current position is zero" y el log
+            # gritaba que quedaba una posicion viva sin verificar, cuando
+            # no quedaba ninguna).
+            #
+            # Una alarma falsa es tan dana como no dar ninguna: entrena a
+            # ignorar el log, que es justo lo que haria falta creerse el
+            # dia que SÍ hubiera una posicion sin cerrar.
+            sigue = self._queda_posicion_viva(api, symbol)
+            if sigue is None:
+                logger.error("[live] el auto-cierre fallo (%s: %s) y ADEMAS "
+                             "no se pudo comprobar si queda posicion: "
+                             "COMPRUEBA LA CUENTA A MANO", motivo, exc)
+                return {"ok": False, "error": str(exc), "motivo": motivo,
+                        "posicion_sin_cerrar": None,
+                        "aviso": "no se pudo verificar el estado"}
+            if sigue:
+                logger.error("[live] NO SE PUDO CERRAR la entrada no "
+                             "verificada (%s): %s. HAY UNA POSICION VIVA "
+                             "SIN VERIFICAR.", motivo, exc)
+                return {"ok": False, "error": str(exc), "motivo": motivo,
+                        "posicion_sin_cerrar": True}
+            logger.warning("[live] el auto-cierre no pudo mandar la orden "
+                           "(%s: %s), pero NO queda posicion abierta: ya "
+                           "estaba cerrada. Motivo del cierre: %s",
+                           motivo, str(exc)[:120], motivo)
+            return {"ok": True, "already_closed": True, "error": str(exc),
+                    "motivo": motivo, "posicion_sin_cerrar": False}
+
+    def _queda_posicion_viva(self, api, symbol: str) -> Optional[bool]:
+        """True si queda posicion, False si no, None si no se pudo saber."""
+        try:
+            swap = symbol if ":" in symbol else (
+                symbol + ":USDT" if symbol.endswith("/USDT") else symbol)
+            posiciones = api.fetch_positions([swap])
+        except Exception as exc:
+            logger.error("[live] no se pudo leer la posicion: %s", exc)
+            return None
+        try:
+            return any(float(p.get("contracts") or 0) != 0
+                       for p in posiciones)
+        except (TypeError, ValueError) as exc:
+            logger.error("[live] respuesta de posicion ilegible: %s", exc)
+            return None
 
     def _execute_live_order(self, signal: Dict, price: float, side: str,
                             notional: float, lev_used: int,

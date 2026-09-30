@@ -92,7 +92,23 @@ DEFAULT_MIN_SCIENTIFIC_SCORE: float = 0.0
 #:     ex.load_markets()['BTC/USDT:USDT']['taker'] = 0.0006   (0,06% por lado)
 #:     ex.load_markets()['BTC/USDT:USDT']['maker'] = 0.0001   (0,01% por lado)
 #:
-#: Antes este modulo accounted SOLO del slippage y decia explicitamente que
+#: MEDIDO ADEMAS en las ejecuciones, que es el dato que manda: el 2026-09-30
+#: se abrieron y cerraron 4 posiciones reales en TESTNET y las 4 cobraron
+#: exactamente 0,0550% por lado, no 0,06%:
+#:
+#:     fee 0,00272305 / (1,5003 x 3,3 = 4,95099) = 0,0550%
+#:     fee 0,00272359 / (1,5006 x 3,3 = 4,95198) = 0,0550%
+#:     fee 0,00272741 / (1,5027 x 3,3 = 4,95891) = 0,0550%
+#:     fee 0,00272704 / (1,5025 x 3,3 = 4,95825) = 0,0550%
+#:
+#: O sea que lo que anuncia el mercado se pasa por 9,1%. Se deja 0,0006 a
+#: proposito, por dos razones: es CONSERVADOR (cargar de mas no abre puertas
+#: que deberian estar cerradas) y, sobre todo, es un dato de TESTNET. En
+#: MAINNET no se ha medido ninguna ejecucion, y cambiar el numero por otro
+#: de testnet seria explicar un coste de mainnet con una medida de testnet.
+#: Cuando se mida en mainnet, se cambia aqui y se dice.
+#:
+#: Antes este modulo accountable SOLO del slippage y decia explicitamente que
 #: la comision no se modelaba. Eso hacia que el gate creyera que operar
 #: cuesta 0,10% cuando en realidad cuesta **0,22% con taker**: se
 #: inflaba la ventaja un 2,2x. Y el edge medido es de 0,01-0,10% por
@@ -102,9 +118,25 @@ MAKER_FEE: float = 0.0001
 
 #: Slippage del motor de paper = LA MITAD DEL SPREAD REAL de Bybit.
 #:
-#: MEDIDO el 2026-09-30 leyendo el libro de XRP/USDT:USDT (8 muestras,
-#: estable): el spread entre mejor bid y mejor ask es 0,0067%, o sea que
-#: cruzar paga ~0,0034% por LADO.
+#: MEDIDO el 2026-09-30, 40 muestras por simbolo en el libro:
+#:
+#:     XRP/USDT:USDT  min 0,0067%  mediana 0,0100%  max 0,0200%
+#:     BTC/USDT:USDT  min 0,0001%  mediana 0,0002%  max 0,0006%
+#:     ETH/USDT:USDT  min 0,0004%  mediana 0,0006%  max 0,0019%
+#:
+#: DOS COSAS QUE ESTO DICE Y QUE NO DEBEN OLVIDARSE:
+#:
+#: 1) EL SPREAD VARIA MUCHO CON EL SIMBOLO: el de XRP es 50x mas ancho que
+#:    el de BTC. Una sola constante para todos es incorrecta por
+#: construccion. Aqui se deja la de XRP porque es el simbolo del plan, y
+#: porque entre las tres es la MAS CARA: asi el modelo no es optimista
+#:    para nadie.
+#:
+#: 2) 0,0034% es el MINIMO de XRP, no su mediana. Con la mediana real
+#:    (0,0100%, o sea 0,0050% por lado) el coste a mercado de XRP es
+#:    0,1300% y no el 0,1268% que declara este modulo. La diferencia es
+#:    pequena, pero el numero de este comentario es el mejor caso, no el
+#:    tipico.
 #:
 #: Antes valia 0,0005, que era un SUPUESTO de un barrido propio y salio
 #: 15 veces mas caro que la realidad. Con el, el gate creia que operar

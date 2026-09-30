@@ -437,3 +437,77 @@ def test_set_leverage_trata_el_ya_puesto_como_correcto(fake_api):
     api.exchange = _Client(Exception('retCode 110001 order does not exist'))
     with pytest.raises(Exception):
         api.set_leverage("XRP/USDT:USDT", 50)
+
+
+def test_un_auto_cierre_que_no_puede_mandar_no_grita_alarma_falsa(fake_api):
+    """EL FALLO QUE SALIO MEDIDO el 2026-09-30 contra testnet.
+
+    Al intentar cerrar por segunda vez, Bybit responde `110017 current
+    position is zero, cannot fix reduce-only order qty`. El codigo lo
+    traducía por "HAY UNA POSICION VIVA SIN VERIFICAR", cuando en realidad
+    NO quedaba ninguna: ya estaba cerrada.
+
+    Una alarma falsa es tan dana como no dar ninguna, porque entrena a
+    ignorar el log, que es justo lo que haria falta creerse el dia que SI
+    hubiera una posicion sin cerrar.
+    """
+    from quant_math.orchestrator import Orchestrator
+    orch = Orchestrator.__new__(Orchestrator)
+
+    class _SinPosicion:
+        """reduceOnly sobre una posicion que no existe: 110017."""
+        def create_order(self, *a, **k):
+            raise Exception('bybit {"retCode":110017,"retMsg":"current '
+                            'position is zero, cannot fix reduce-only '
+                            'order qty"}')
+
+        def fetch_positions(self, symbols=None):
+            return [{"contracts": 0.0}]
+
+    r = orch._cerrar_si_no_verifica(_SinPosicion(), "BTC/USDT:USDT", "buy",
+                                    1.0, "prueba")
+    assert r["ok"] is True, "no hay posicion viva: no es un fallo"
+    assert r.get("already_closed") is True
+    assert r["posicion_sin_cerrar"] is False, \
+        "gritar que queda viva una posicion que no existe"
+
+
+def test_un_auto_cierre_que_falla_con_posicion_viva_sigue_gritando(fake_api):
+    """La alarma VERDADERA se conserva: si queda posicion, se dice."""
+    from quant_math.orchestrator import Orchestrator
+    orch = Orchestrator.__new__(Orchestrator)
+
+    class _NoCierra:
+        def create_order(self, *a, **k):
+            raise Exception('retCode 110001 order does not exist')
+
+        def fetch_positions(self, symbols=None):
+            return [{"contracts": 3.3, "side": "buy"}]
+
+    r = orch._cerrar_si_no_verifica(_NoCierra(), "BTC/USDT:USDT", "buy",
+                                    3.3, "prueba")
+    assert r["ok"] is False
+    assert r["posicion_sin_cerrar"] is True, "aqui SI queda posicion viva"
+
+
+def test_si_no_se_puede_comprobar_no_se_inventa_la_veredicto(fake_api):
+    """Sin poder preguntar al exchange: se dice que NO SE SABE.
+
+    `None` es "desconocido", y se distingue de False a proposito. Ante la
+    duda no se elige el veredicto que deja al operador tranquilo.
+    """
+    from quant_math.orchestrator import Orchestrator
+    orch = Orchestrator.__new__(Orchestrator)
+
+    class _NoSePuedeLeer:
+        def create_order(self, *a, **k):
+            raise Exception("fallo de red")
+
+        def fetch_positions(self, symbols=None):
+            raise Exception("fallo de red")
+
+    r = orch._cerrar_si_no_verifica(_NoSePuedeLeer(), "BTC/USDT:USDT",
+                                    "buy", 1.0, "prueba")
+    assert r["posicion_sin_cerrar"] is None, "desconocido != cerrado"
+    assert r["ok"] is False
+    assert "aviso" in r
