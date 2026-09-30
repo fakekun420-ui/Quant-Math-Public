@@ -1911,6 +1911,80 @@ class Orchestrator:
                             "margin_available": disp,
                             "reason": "margen insuficiente"}
 
+            # --- PRECIO FRESCO antes de calcular TP/SL ----------------
+            #
+            # MEDIDO el 2026-09-30 con XRP en velas de 5 min: el precio se
+            # mueve 0,217% de mediana por vela y 1,28% en el p90. El SL a
+            # 100x esta a 0,25% de precio, o sea MAS PEQUEÑO que el
+            # movimiento tipico de una vela. Con el precio del SIGNAL
+            # (que es el de inicio de ciclo, antes de generar hipotesis y
+            # hacer backtests) el SL llegaba del lado equivocado y Bybit
+            # rechazaba la orden entera:
+            #
+            #   StopLoss:157620000 set for Buy position should lower than
+            #   base_price:154560000
+            #
+            # Es decir, un 2,2% de retraso. Con un SL mas holgado tampoco
+            # ayuda: mientras el precio se mueva mas que la distancia del
+            # SL, la orden se cae.
+            #
+            # Se relee del VENUE DE EJECUCION (no del feed de datos).
+            #
+            # Y la referencia es el ULTIMO PRECIO, no el libro. MEDIDO el
+            # 2026-09-30: el mejor ask de XRP estaba en 1,591 y el ultimo
+            # precio en 1,5248, un 4,3% de diferencia, y Bybit rechazaba la
+            # orden con
+            #
+            #     StopLoss:158300000 set for Buy position should lower than
+            #     base_price:152480000??LastPrice
+            #
+            # O sea que Bybit valida el TP/SL contra `LastPrice`, no contra
+            # el libro. Calcularlo sobre el ask manda el SL por ENCIMA de lo
+            # que el exchange usa de referencia, y la orden entera se cae.
+            # Por eso los niveles se calculan sobre el ultimo precio.
+            precio_fresco = None
+            try:
+                # Con el simbolo SWAP, no con el que viene en la senal.
+                # MEDIDO el 2026-09-30: `fetch_ticker("XRP/USDT")` devolvia
+                # `last=1,579469` con `bid=1,5842` (el ultimo precio POR DEBAJO
+                # del bid, imposible) y el perp `XRP/USDT:USDT` daba
+                # 1,5697: son mercados distintos. Leer el ticker de SPOT
+                # para decidir una posicion de PERPETUO es leer otro
+                # mercado, y con el el SL se coloca donde no toca.
+                _sym = signal["symbol"]
+                _swap = _sym if ":" in _sym else (
+                    _sym + ":USDT" if _sym.endswith("/USDT") else _sym)
+                _tk = api.exchange.fetch_ticker(_swap)
+                precio_fresco = float(_tk.get("last") or 0.0)
+            except Exception as exc:
+                logger.error("[live] no se pudo leer el ultimo precio de %s "
+                             "(%s); NO se manda la orden con un precio rancio, "
+                             "porque el SL caeria del lado equivocado",
+                             signal.get("symbol"), exc)
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed",
+                        "symbol": signal.get("symbol"),
+                        "error": f"no se pudo leer el ultimo precio: {exc}",
+                        "reason": "precio fresco ilegible",
+                        "price_senal": price}
+            if precio_fresco <= 0:
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed",
+                        "symbol": signal.get("symbol"),
+                        "error": f"ultimo precio invalido: {precio_fresco}",
+                        "reason": "precio fresco invalido"}
+            if abs(precio_fresco - price) / price > 0.002:
+                logger.warning("[live] precio RANCIO: la senal llevaba %.4f y "
+                               "el ultimo precio es %.4f (%+.2f%%); se usa el "
+                               "fresco", price, precio_fresco,
+                               (precio_fresco - price) / price * 100)
+            price = precio_fresco
             qty = notional / price
             # Los precios de salida se calculan ANTES de mandar la orden
             # (correccion 6): antes se mandaba la entrada desnuda y el TP/SL

@@ -46,6 +46,12 @@ class FakeAPI:
     margin_mode_real = "isolated"
     #: si es str, set_margin_mode() lanza ese error (con su motivo dentro)
     margin_mode_error = None
+    #: precio del libro del venue de EJECUCION. `_live_order` lo relee antes
+    #: de calcular el TP/SL: con el precio rancio de la senal el SL caia del
+    #: lado equivocado y Bybit rechazaba la orden entera.
+    book_price = 100.0
+    #: si es str, fetch_order_book() lanza ese error
+    book_error = None
 
     def __init__(self, exchange_id="bybit", sandbox=False, api_key=None,
                  api_secret=None, data_venue=None):
@@ -66,8 +72,27 @@ class FakeAPI:
             raise RuntimeError(self.leverage_error)
         self.leverage = (symbol, leverage)
 
+    def fetch_ticker(self, symbol, params=None):
+        if FakeAPI.book_error:
+            raise RuntimeError(FakeAPI.book_error)
+        return {"last": FakeAPI.book_price, "bid": FakeAPI.book_price * 0.9999,
+                "ask": FakeAPI.book_price * 1.0001}
+
     def read_back_leverage(self, symbol):
         return self.leverage_real
+
+    def fetch_order_book(self, symbol, limit=5):
+        """Libro del venue de EJECUCION (lo usa la comprobacion de rango)."""
+        if FakeAPI.book_error:
+            raise RuntimeError(FakeAPI.book_error)
+        mid = FakeAPI.book_price
+        return {"asks": [[mid * 1.0001, 10.0]], "bids": [[mid * 0.9999, 10.0]]}
+
+    @property
+    def exchange(self):
+        """El motor relee el ULTIMO PRECIO del venue de ejecucion: Bybit
+        valida el TP/SL contra `LastPrice`, no contra el libro."""
+        return self
 
     def read_back_margin_mode(self, symbol):
         return self.margin_mode_real
@@ -81,8 +106,10 @@ class FakeAPI:
             "symbol": symbol, "side": side, "amount": amount,
             "order_type": order_type, "params": params or {},
         })
+        # El relleno de un marketable sale en el libro, no en el medio.
+        _fill = FakeAPI.book_price
         return {"id": f"ORD-{len(self.orders)}", "amount": amount,
-                "average": 100.0, "price": 100.0}
+                "average": _fill, "price": _fill}
 
     def close(self):
         pass
@@ -97,6 +124,9 @@ def fake_api(monkeypatch):
     FakeAPI.leverage_real = 10
     FakeAPI.margin_available = 100000.0
     FakeAPI.margin_mode_real = "isolated"
+    FakeAPI.margin_mode_error = None
+    FakeAPI.book_price = 100.0
+    FakeAPI.book_error = None
     import data_acquisition.data_sources.exchanges as ex
     monkeypatch.setattr(ex, "ExchangeAPI", FakeAPI)
     # Claves FICTICIAS solo para poder construir una config live: el bloqueo
@@ -146,8 +176,18 @@ def test_la_entrada_lleva_sl_y_tp_al_exchange(fake_api):
     params = api.orders[0]["params"]
     assert "stopLoss" in params, f"la entrada salio SIN stop: {params}"
     assert "takeProfit" in params, f"la entrada salio SIN TP: {params}"
-    assert params["stopLoss"]["triggerPrice"] == pytest.approx(95.0)
-    assert params["takeProfit"]["triggerPrice"] == pytest.approx(105.0)
+    # El TP/SL se calcula desde el ASK (100 x 1,0001 = 100,01), no desde el
+    # medio ni desde el precio rancio de la senal: en una compra se paga el
+    # ask, y Bybit valida `base_price` contra el mismo lado. Con el medio,
+    # el SL quedaria por ENCIMA del precio de ejecucion y el exchange
+    # rechazaria la orden (medido el 2026-09-30: 10001).
+    entrada = api.book_price
+    assert params["stopLoss"]["triggerPrice"] == pytest.approx(entrada * 0.95)
+    assert params["takeProfit"]["triggerPrice"] == pytest.approx(entrada * 1.05)
+    # Y lo que Bybit exige: el SL por DEBAJO y el TP por ARRIBA de la
+    # entrada. Si esto se rompe, la orden no llega a mandarse nunca.
+    assert params["stopLoss"]["triggerPrice"] < entrada
+    assert params["takeProfit"]["triggerPrice"] > entrada
 
 
 def test_el_ledger_guarda_los_mismos_precios_que_mandó(fake_api):
@@ -552,6 +592,55 @@ def test_con_require_isolated_false_se_opera_a_conciencia(fake_api):
     assert len(fake_api.instances[-1].orders) == 1, "se abre, no se cierra"
     assert "stopLoss" in fake_api.instances[-1].orders[0]["params"], (
         "y sigue yendo protejida aunque se acepte el cruce")
+
+
+def test_el_sl_se_calcula_con_el_precio_FRESCO_del_exchange(fake_api):
+    """EL BUG MEDIDO el 2026-09-30 con XRP en velas de 5 min.
+
+    El TP/SL se calculaba con `signal["price"]`, que es el precio de
+    INICIO DE CICLO: antes de generar hipotesis, hacer backtests y pasar
+    el MLP por delante. Medido: XRP se mueve 0,217% de mediana por vela de
+    5 min, y el SL a 100x esta a 0,25%. Con 2,2% de retraso el SL llegaba
+    POR ENCIMA del precio de ejecucion y Bybit rechazaba la orden entera:
+
+        StopLoss:157620000 set for Buy position should lower than
+        base_price:154560000
+
+    Aqui el precio de la senal es 100 y el del exchange 105: si se usara el
+    viejo, el SL (95) estaria por debajo y la orden pasaria por casualidad.
+    Con el fresco, el SL se recalcula sobre 105 y sigue siendo coherente.
+    """
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.book_price = 105.0
+    signal = dict(signal, price=100.0)          # el precio RANCI de la senal
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade.get("action") != "live_failed", trade.get("error")
+    api = fake_api.instances[-1]
+    params = api.orders[0]["params"]
+    entrada_real = 105.0
+    assert params["stopLoss"]["triggerPrice"] == pytest.approx(
+        entrada_real * 0.95), "el SL se calculo con el precio rancio"
+    assert params["stopLoss"]["triggerPrice"] < entrada_real, (
+        "el SL tiene que quedar por DEBAJO del precio al que se compra")
+    assert trade["entry_price"] == pytest.approx(entrada_real)
+
+
+def test_sin_precio_fresco_no_se_manda_la_orden(fake_api):
+    """Si no se puede leer el precio actual, NO se opera.
+
+    Mandarla con el precio viejo es peor que no mandarla: el SL caeria del
+    lado equivocado, Bybit rechazaria la orden, y en el mejor de los casos
+    (que la aceptara) la proteccion estaria donde no toca.
+    """
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.book_error = "libro caido"
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade["action"] == "live_failed"
+    assert "precio" in trade["reason"]
+    assert trade["price_senal"] == 100.0, "se deja constancia del que se iba a usar"
+    assert fake_api.instances[-1].orders == [], "no debio mandarse ninguna orden"
 
 
 def test_por_defecto_se_opera_en_cruce_pero_se_avisa(fake_api, caplog):
