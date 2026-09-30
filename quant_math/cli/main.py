@@ -652,6 +652,42 @@ def _roe_plan_panel(plan) -> str:
 from quant_math.risk.roe_targets import DEFAULT_MAX_RISK_PER_TRADE_PCT
 
 
+def _ask_isolated(initial_capital: float, roe_plan) -> bool:
+    """Pregunta si exigir margen AISLADO, y enseña lo que cuesta cruzarse.
+
+    MEDIDO el 2026-09-30: la cuenta de testnet es una UNIFIED ACCOUNT y
+    Bybit responde `100028 unified account is forbidden` al pedir aislado.
+    En esa cuenta el modo aislado no existe, luego exigirlo deja el sistema
+    sin operar nunca. No se puede detectar solo (el exchange contesta OK al
+    llamar), asi que se pregunta y se explica el tradeoff con SUS numeros.
+    """
+    sl = float(getattr(roe_plan, "sl_price_distance", 0.0) or 0.0)
+    liq = float(getattr(roe_plan, "liquidation_price_distance", 0.0) or 0.0)
+    noc = float(initial_capital)
+    console.print()
+    console.print("[yellow]Modo de margen:[/yellow]")
+    console.print(
+        "  [red]Bybit NO permite margen aislado en una cuenta unificada[/red] "
+        f"(retCode 100028). Si la tuya lo es, el aislado no existe.")
+    console.print(
+        f"  En CRUCE la perdida la paga toda la cuenta. Con tu nocional de "
+        f"{noc:.2f} USDT el riesgo esta acotado igualmente:")
+    if sl:
+        console.print(f"    en el SL          {noc} x {sl:.2%} = "
+                      f"{noc*sl:.3f} USDT")
+    if liq:
+        console.print(f"    hasta liquidar    {noc} x {liq:.2%} = "
+                      f"{noc*liq:.3f} USDT")
+    console.print(f"    peor caso         {noc:.2f} USDT (si el activo cae a cero)")
+    console.print(
+        "[dim]Con nocional pequeno el cruce no da; con uno grande, "
+        "una sola posicion puede vaciarte la cuenta.[/dim]")
+    return not bool(questionary.confirm(
+        "¿Exigir margen aislado? (SÍ = no se opera si la cuenta no lo admite; "
+        "NO = se opera en cruce, con la pérdida acotada por tu nocional)",
+        default=False).unsafe_ask())
+
+
 def _ask_notional_cap(initial_capital: float, leverage: int,
                      sl_distance: float) -> Optional[float]:
     """Pregunta el techo de NOCIONAL y ensena lo que haria el riesgo solo.
@@ -871,6 +907,8 @@ def wizard() -> Optional[Dict]:
             # manda: por eso NO es opcional aqui.
             "max_notional_per_entry_pct": _ask_notional_cap(
                 initial_capital, leverage, roe_plan.sl_price_distance),
+            "require_isolated_margin": _ask_isolated(initial_capital,
+                                                     roe_plan),
         }
     except (AttributeError):
         # ESC / pregunta cancelada -> volver al menú.

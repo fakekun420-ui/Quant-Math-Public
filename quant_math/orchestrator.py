@@ -142,15 +142,26 @@ class OrchestratorConfig:
     #
     # MEDIDO el 2026-09-30: la cuenta de testnet es una UNIFIED ACCOUNT y
     # Bybit responde `100028 unified account is forbidden` al pedir aislado.
-    # O sea que en ESA cuenta el modo aislado no existe: esta en cruce y no
-    # se puede cambiar.
+    # El modo aislado NO EXISTE en esa cuenta y no se va a conseguir
+    # reintentando. Con esto en True el motor se niega a abrir SIEMPRE, o
+    # sea que el sistema no operaria nunca.
     #
-    # Con True (por defecto) el motor se NIEGA a abrir si la posicion no
-    # esta aislada, porque en cruce la perdida la paga toda la cuenta. En
-    # una unified account eso dejaria el sistema sin operar nunca, y por eso
-    # es una decision del operador y no un default silencioso: ponerlo a
-    # False es decir "se que estoy en cruce y acepto el riesgo de cuenta".
-    require_isolated_margin: bool = True
+    # Por eso el defecto es False y no True, y no es relajar la garantia sin
+    # mas: con nocional PEQUEÑO el riesgo de cuenta esta acotado por el
+    # propio nocional, no por el modo de margen. Medido con el plan de
+    # Leonardo (5 USDT de nocional, 50x, SL al 0,5%):
+    #
+    #     perdida en el SL        5 x 0,5%  = 0,025 USDT
+    #     hasta la liquidacion    5 x 1,67% = 0,083 USDT   (margen 0,10)
+    #     peor caso absoluto      5 USDT     (si el activo cae a cero)
+    #
+    # O sea: en cruce, como muy tarde, se pierden los 5 USDT de nocional.
+    # Con un nocional grande, en cambio, una sola posicion puede vaciar la
+    # cuenta entera, y ahi el aislado si es imprescindible.
+    #
+    # El log sigue avisando en mayusculas cuando opera en cruce, y el
+    # informe de la operacion lleva `margin_mode` para que se pueda ver.
+    require_isolated_margin: bool = False
     # Cada cuantos ciclos se reconcilian las posiciones contra el exchange.
     # Por defecto TODAS LAS HORAS (24 ciclos a intervalo 1h = una vez por
     # hora), no 0. Con 0 no se comparaba nunca y una posicion huerfana con

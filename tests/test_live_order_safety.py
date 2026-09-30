@@ -17,6 +17,7 @@ construyen las llamadas, que es justo donde estaba el fallo.
 
 import json
 import os
+import tempfile
 
 import pytest
 
@@ -464,8 +465,15 @@ def test_set_leverage_trata_el_ya_puesto_como_correcto(fake_api):
 
 
 def test_en_margen_cruce_se_cierra_la_operacion(fake_api):
-    """Se pidio isolated y la posicion esta en CRUCE: se cierra."""
-    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    """Se pidio isolated y la posicion esta en CRUCE: se cierra.
+
+    El interruptor se pone a True A PROPOSITO aqui: desde el 2026-09-30 el
+    defecto es False porque la cuenta de testnet es unificada y el aislado
+    no existe. Este test comprueba que el FRENO FUNCIONA cuando se exige,
+    no que se exija siempre.
+    """
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10,
+                             require_isolated_margin=True)
     FakeAPI.margin_mode_real = "cross"
     trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
 
@@ -486,7 +494,8 @@ def test_un_margen_ilegible_tambien_cierra(fake_api):
     None no es "todo bien": es no saber, y en cruce unknowingly es perder
     mas de lo que dice el plan.
     """
-    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10,
+                             require_isolated_margin=True)
     FakeAPI.margin_mode_real = None
     trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
 
@@ -516,7 +525,8 @@ def test_si_el_islaado_es_imposible_el_motivo_llega_al_informe(fake_api):
     guarda y se devuelve: un "operacion rechazada" sin causa es
     inaccionable, y el operador no puede arreglar lo que no se le explica.
     """
-    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10,
+                             require_isolated_margin=True)
     FakeAPI.margin_mode_real = "cross"
     FakeAPI.margin_mode_error = (
         'bybit {"retCode":100028,"retMsg":"unified account is forbidden"}')
@@ -542,6 +552,45 @@ def test_con_require_isolated_false_se_opera_a_conciencia(fake_api):
     assert len(fake_api.instances[-1].orders) == 1, "se abre, no se cierra"
     assert "stopLoss" in fake_api.instances[-1].orders[0]["params"], (
         "y sigue yendo protejida aunque se acepte el cruce")
+
+
+def test_por_defecto_se_opera_en_cruce_pero_se_avisa(fake_api, caplog):
+    """DECISION DE LEONARDO, 2026-09-30: el defecto pasa a False.
+
+    Motivo medido: la cuenta de testnet es una UNIFIED ACCOUNT y Bybit
+    responde `100028 unified account is forbidden` al pedir aislado. El
+    aislado NO EXISTE ahi, luego exigirlo por defecto dejaba el sistema sin
+    operar nunca.
+
+    Y no es relajar la garantia a la ligera: con nocional pequeno el riesgo
+    esta acotado por el nocional, no por el modo de margen. Con 5 USDT y un
+    SL al 0,5% se pierden 0,025 USDT; hasta la liquidacion, 0,083; y el
+    peor caso absoluto son 5 USDT si el activo cae a cero.
+
+    Lo que NO se negocia: se avisa. Si se opera en cruce, el log lo dice.
+    """
+    import logging
+    from quant_math.orchestrator import OrchestratorConfig
+    # el defecto de la config, sin pasar nada a mano
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = OrchestratorConfig(
+            symbols=["BTC/USDT:USDT"], timeframe="1h", lookback_days=30,
+            min_paper_trades=1, hypotheses_per_cycle=1,
+            kb_path=f"{tmp}/kb.jsonl", state_dir=tmp, initial_capital=1000.0,
+            entry_pct=0.05, take_profit_pct=0.05, leverage=10, mode="classic",
+            dry_run=False, testnet=True)
+        assert cfg.require_isolated_margin is False, (
+            "el defecto debe permitir operar en una cuenta unificada")
+
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.margin_mode_real = "cross"
+    with caplog.at_level(logging.ERROR):
+        trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade.get("action") != "live_failed", trade.get("error")
+    texto = caplog.text
+    assert "CRUCE" in texto, "operar en cruce tiene que quedar en el log"
+    assert "TODA la cuenta" in texto, "y decir exactamente que significa"
 
 
 def test_una_entrada_que_el_exchange_rechaza_no_deja_posicion(fake_api):
