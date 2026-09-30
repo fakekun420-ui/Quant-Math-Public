@@ -27,7 +27,20 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from quant_math.decision_engine import DecisionEngine
-from quant_math.risk.circuit_breaker import DailyGuard, utc_day_start_ts
+from quant_math.risk.circuit_breaker import (
+    DEFAULT_MAX_DAILY_LOSS_PCT,
+    DailyGuard,
+    daily_loss_usd,
+    utc_day_start_ts,
+)
+from quant_math.risk.roe_targets import (
+    DEFAULT_MAINTENANCE_MARGIN_RATE,
+    DEFAULT_MAX_RISK_PER_TRADE_PCT,
+    DEFAULT_SL_LIQUIDATION_SAFETY_FRAC,
+    build_roe_plan,
+    tp_sl_prices,
+    validate_roe_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +80,63 @@ class OrchestratorConfig:
     # Classic-mode leverage (1 = no leverage)
     leverage: int = 1                       # leverage multiplier for classic mode
 
-    # Circuit breaker (Fase 1b) — enforced in run_cycle before new entries
-    max_daily_loss_usd: float = 2.5         # block entries rest of UTC day
+    # --- TP/SL por ROE (correccion no2, 2026-09-29) ----------------------
+    # Fuente unica de verdad: quant_math/risk/roe_targets.py
+    # Si se pasa take_profit_roe y/o stop_loss_roe, el plan se deriva SOLO del
+    # apalancamiento (distancia_precio = roe / L) y take_profit_pct pasa a ser
+    # un valor DERIVADO, reescrito en __post_init__. El SL se clampa para que
+    # caiga siempre ANTES de la liquidacion, y si el plan no es operable el
+    # arranque se RECHAZA (__post_init__ lanza). Si ambos son None se conserva
+    # el modo legado por fraccion de precio (deprecated).
+    take_profit_roe: Optional[float] = None   # ej. 0.50 = 50% del MARGEN
+    stop_loss_roe: Optional[float] = None     # ej. 0.25 = 25% del MARGEN
+    # SUPUESTO, no lectura de la API de Bybit (ver roe_targets). El operador
+    # debe confirmarlo contra la documentacion vigente del exchange.
+    maintenance_margin_rate: float = DEFAULT_MAINTENANCE_MARGIN_RATE
+    # El SL en precio <= esta fraccion de la distancia a liquidacion.
+    sl_liquidation_safety_frac: float = DEFAULT_SL_LIQUIDATION_SAFETY_FRAC
+    # Tope de APALANCAMIENTO EFECTIVO por encima del cual el TP en ROE exigiria
+    # mas recorrido de precio del admisible. None = segun mercado.
+    max_tp_price_distance: Optional[float] = None
+    # Tope de RIESGO por operacion, en USD. None -> initial_capital * pct.
+    max_risk_per_trade_usd: Optional[float] = None
+    max_risk_per_trade_pct: float = DEFAULT_MAX_RISK_PER_TRADE_PCT
+
+    # Derivados por __post_init__ (no lospongas al construir)
+    stop_loss_pct: Optional[float] = None
+    effective_leverage: int = 1
+    roe_mode: bool = False
+
+    # --- Circuit breaker (Fase 1b) — enforced in run_cycle ------------
+    # OJO CON EL NOMBRE (correccion no3, 2026-09-29): esto limita el DANO
+    # POR DIA, no el numero de operaciones. El paper es ilimitado en
+    # tiempo (decision de Leonardo): se opera toda la noche, pero si el
+    # dia se vuelve negativo se DEJA DE ABRIR. `max_daily_loss_pct` es la
+    # forma honesta de expresarlo (5% del capital); en USD se traduce
+    # con el capital inicial. Si se pasan los dos, manda el USD.
+    max_daily_loss_pct: Optional[float] = DEFAULT_MAX_DAILY_LOSS_PCT
+    max_daily_loss_usd: Optional[float] = None
     max_open_positions: int = 5             # block entries at/above this count
     drawdown_limit: float = 0.2             # block entries past this drawdown
     max_position_pct: float = 0.2           # max margin per entry vs account
+    # Cada cuantociclar se reconcilian las posiciones contra el exchange.
+    # 0 = desactivado (por defecto). Razon: cada reconciliacion abre conexion
+    # y consulta posiciones; con interval_seconds=3600, cada ciclo daria
+    # 86.400 llamadas al dia para mirar lo mismo. Poner un numero alto (p.ej.
+    # 24 con ciclo horario) antes que 1.
+    reconcile_every_n_cycles: int = 0
+    # Posiciones vivas que pueden quedar SIN marcar (sin precio o sin
+    # tamano en el libro) antes de bloquear entradas. 0 = falla cerrado.
+    max_unpriced_positions: int = 0
+
+    # --- Gate de decision (correccion no3) -----------------------------
+    # None = lo que diga QUANTMATH_LEARN_MODE. El DEFAULT es gate CERRADO
+    # (solo expectancy > min_expectancy). True abre la exploracion de
+    # forma EXPLICITA y queda registrada en learn_mode_audit.jsonl.
+    learn_mode: Optional[bool] = None
+    # % de capital por trade. 0.0 = solo el signo (semantica anterior).
+    min_expectancy: Optional[float] = None
+    min_scientific_score: Optional[float] = None
 
     # Live-trading path (Fase 2-4)
     shadow_live: bool = False               # log shadow_orders.jsonl intent
@@ -94,8 +159,22 @@ class OrchestratorConfig:
         if self.market not in ("crypto", "forex"):
             raise ValueError(f"market debe ser 'crypto' o 'forex', recibido '{self.market}'")
         # Circuit-breaker sanity
+        if self.max_daily_loss_usd is None:
+            pct = (DEFAULT_MAX_DAILY_LOSS_PCT
+                   if self.max_daily_loss_pct is None
+                   else float(self.max_daily_loss_pct))
+            if not 0 < pct <= 1:
+                raise ValueError(
+                    f"max_daily_loss_pct debe estar en (0, 1], recibido {pct}")
+            self.max_daily_loss_usd = daily_loss_usd(
+                float(self.initial_capital), pct)
+            self.max_daily_loss_pct = pct
+        else:
+            self.max_daily_loss_usd = float(self.max_daily_loss_usd)
         if self.max_daily_loss_usd < 0:
             raise ValueError("max_daily_loss_usd debe ser >= 0")
+        if self.max_unpriced_positions < 0:
+            raise ValueError("max_unpriced_positions debe ser >= 0")
         if self.max_open_positions < 1:
             raise ValueError("max_open_positions debe ser >= 1")
         if not 0 < self.drawdown_limit <= 1:
@@ -128,8 +207,78 @@ class OrchestratorConfig:
             self.interval_seconds = min(self.interval_seconds, 15)
             self.burst_margin = max(1.0, self.burst_margin)
             self.burst_leverage = max(1, min(500, int(self.burst_leverage)))
-            self.take_profit_pct = max(0.02, min(0.50, self.take_profit_pct))
+            # SIN suelo artificial: el max(0.02, ...) que habia aqui era la
+            # causa directa de que el SL fuera inalcanzable (medido en la
+            # auditoria 2026-09-29). El tope superior se mantiene.
+            self.take_profit_pct = min(0.50, self.take_profit_pct)
         self.leverage = max(1, min(500, int(self.leverage)))
+
+        # --- TP/SL en ROE + validacion de alcanzabilidad ---------------
+        # Ocurre AQUI, al arrancar, no en la ejecucion: es preferible
+        # negarse a arrancar a arrancar con un SL inalcanzable.
+        self.effective_leverage = (self.burst_leverage if self.mode == "burst"
+                                    else self.leverage)
+        self.roe_mode = (self.take_profit_roe is not None
+                         or self.stop_loss_roe is not None)
+        self.roe_plan = None
+        if self.roe_mode:
+            plan = build_roe_plan(
+                mode=self.mode,
+                leverage=self.effective_leverage,
+                take_profit_roe=self.take_profit_roe,
+                stop_loss_roe=self.stop_loss_roe,
+                maintenance_margin_rate=self.maintenance_margin_rate,
+                sl_liquidation_safety_frac=self.sl_liquidation_safety_frac,
+                market=self.market,
+                max_tp_price_distance=self.max_tp_price_distance,
+            )
+            for warn in plan.warnings:
+                logger.warning("[roe] %s", warn)
+            # Lanza si el plan no es operable -> el arranque se rechaza.
+            validate_roe_plan(plan)
+            self.roe_plan = plan
+            self.take_profit_roe = plan.tp_roe
+            self.stop_loss_roe = plan.sl_roe_requested
+            self.take_profit_pct = plan.tp_price_distance
+            self.stop_loss_pct = plan.sl_price_distance
+            logger.info("[roe] %s", plan.describe())
+        else:
+            # Modo legado: TP/SL en fraccion de precio. Se conserva por
+            # compatibilidad con llamantes que no pasan ROE (scripts de
+            # research). El wizard SIEMPRE pasa ROE.
+            self.stop_loss_pct = self.take_profit_pct / 2.0
+            logger.warning(
+                "[roe] modo LEGADO: take_profit_pct=%.4f es fraccion de "
+                "PRECIO, no de ROE; el ROE sale por multiplicar por el "
+                "apalancamiento. Pasa take_profit_roe/stop_loss_roe para "
+                "razonar en ROE y tener SL validado contra la liquidacion.",
+                self.take_profit_pct)
+        if self.max_risk_per_trade_usd is None:
+            self.max_risk_per_trade_usd = (
+                float(self.initial_capital) * float(self.max_risk_per_trade_pct))
+        # Coherencia de topes (correccion no3): el peor dia posible con
+        # los topes abiertos es risk/trade x posiciones simultaneas. El
+        # tope de dano diario tiene que estar por debajo de ese techo o
+        # no esta limitando nada. Se avisa con numeros, no se falla.
+        worst_day = (float(self.max_risk_per_trade_usd)
+                     * float(self.max_open_positions))
+        if worst_day > 0 and self.max_daily_loss_usd > worst_day:
+            logger.warning(
+                "[risk] tope diario $%.2f > peor dia posible $%.2f "
+                "(riesgo/trade $%.2f x %d posiciones): el tope diario no "
+                "limita nada mientras las %d posiciones esten abiertas",
+                self.max_daily_loss_usd, worst_day,
+                self.max_risk_per_trade_usd, self.max_open_positions,
+                self.max_open_positions)
+        logger.info(
+            "[risk] topes: dano/dia $%.2f (%.1f%% de $%.2f), posiciones "
+            "simultaneas <= %d, drawdown <= %.0f%%, riesgo/trade $%.2f",
+            self.max_daily_loss_usd,
+            100.0 * self.max_daily_loss_usd / max(1e-9, float(
+                self.initial_capital)),
+            float(self.initial_capital), self.max_open_positions,
+            100.0 * self.drawdown_limit,
+            float(self.max_risk_per_trade_usd))
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +398,17 @@ class Orchestrator:
             max_open_positions=config.max_open_positions,
             drawdown_limit=config.drawdown_limit,
         )
+        # Falla cerrado: sin precio no se puede medir el riesgo.
+        self.guard.max_unpriced_positions = int(config.max_unpriced_positions)
         self._risk_manager = None  # lazy RiskManager (margin checks)
         self._last_realized_total = 0.0
+        # Equity MARCADO (realizado + flotante). Es lo que ven el RiskManager
+        # y el tope de riesgo por operacion; antes solo el realizado, asi
+        # que con 5 posiciones en contra el sizing/account crecia solo.
+        self._last_equity = float(config.initial_capital)
+        self._last_unrealized = 0.0
+        self._last_unrealized_today = 0.0
+        self._last_unpriced = []
         # Runtime stats consumed by external monitors (CLI)
         self.stats = {
             "state": "RUNNING",
@@ -267,6 +425,15 @@ class Orchestrator:
             "risk_halt": None,
             "realized_today": 0.0,
             "realized_total": 0.0,
+            "unrealized_today": 0.0,
+            "unrealized_total": 0.0,
+            "equity": float(config.initial_capital),
+            "peak_equity": float(config.initial_capital),
+            "drawdown_pct": 0.0,
+            "day_pnl": 0.0,
+            "open_positions": 0,
+            "unpriced_positions": 0,
+            "gate_open": bool(getattr(self.engine, "learn_mode", False)),
         }
         self.stats_path = os.path.join(self.config.state_dir, "runtime_stats.json")
         self._write_stats()
@@ -289,7 +456,31 @@ class Orchestrator:
                                "entry_pct": self.config.entry_pct,
                                "timeframe": self.config.timeframe,
                                "take_profit_pct": self.config.take_profit_pct,
-                               "stop_loss_pct": self.config.take_profit_pct / 2,
+                               "stop_loss_pct": self.config.stop_loss_pct,
+                               "take_profit_roe": self.config.take_profit_roe,
+                               "stop_loss_roe": self.config.stop_loss_roe,
+                               "roe_mode": self.config.roe_mode,
+                               "effective_leverage": self.config.effective_leverage,
+                               "maintenance_margin_rate": self.config.maintenance_margin_rate,
+                               "max_risk_per_trade_usd": self.config.max_risk_per_trade_usd,
+                               # correccion no3: topes y puerta de decision
+                               "max_daily_loss_usd": self.config.max_daily_loss_usd,
+                               "max_daily_loss_pct": self.config.max_daily_loss_pct,
+                               "max_open_positions": self.config.max_open_positions,
+                               "drawdown_limit": self.config.drawdown_limit,
+                               "max_unpriced_positions": self.config.max_unpriced_positions,
+                               "learn_mode": bool(getattr(self.engine,
+                                                          "learn_mode", False)),
+                               "learn_mode_source": getattr(
+                                   self.engine, "learn_mode_source", None),
+                               "min_expectancy": getattr(
+                                   self.engine, "min_expectancy", None),
+                               "min_scientific_score": getattr(
+                                   self.engine, "min_scientific_score", None),
+                               "cost_floor_pct": getattr(
+                                   self.engine, "cost_floor_pct", None),
+                               "roe_plan": (self.config.roe_plan.to_dict()
+                                            if self.config.roe_plan else None),
                                "lookback_days": self.config.lookback_days,
                                "min_paper_trades": self.config.min_paper_trades,
                                "hypotheses_per_cycle": self.config.hypotheses_per_cycle,
@@ -320,57 +511,148 @@ class Orchestrator:
             hypothesis_ranker=self._rank_hypotheses,
         )
 
-    def _rank_hypotheses(self, templates: List[Dict], symbol: str) -> List[Dict]:
-        """Advisory ML reordering of candidate hypotheses (gate untouched)."""
-        try:
-            from quant_math.ml.hypothesis_prior import build_prior_from_kb
-            top_n = self.config.hypotheses_per_cycle
-            prior = build_prior_from_kb(self.config.kb_path)
-            ordered, info = prior.rank_templates(templates, symbol, top_n)
-            print(f"  [ml-prior] modo={info['mode']} registros={info['total']} "
-                  f"rate_global={info['global_rate']} "
-                  f"reordenado={info['reordered']}")
-        except Exception as exc:
-            logger.warning("[ml-prior] fallo (%s); orden original", exc)
-            ordered = templates
+    @staticmethod
+    def _family_sequence(templates: List[Dict]) -> List[str]:
+        """Secuencia de familias de una lista de plantillas (para el rastro)."""
+        from quant_math.ml.hypothesis_prior import family_of
+        return [family_of(t.get("strategy_type")) for t in templates]
 
-        # SIS no supervisado: refuerza familias con exito historico en el
-        # regimen actual; nunca altera el gate.
+    def _current_regime(self, symbol: str,
+                        templates: Optional[List[Dict]] = None) -> Optional[Dict]:
+        """Regimen vigente de `symbol`, en orden de fiabilidad.
+
+        1. el que trae una plantilla (el model-gen lo mide AHORA mismo);
+        2. el `_regime` mas reciente del KB para ESE simbolo — la ultima
+           ventana medida, con datos de ciclos anteriores (sin look-ahead);
+        3. None: la clave de ventana pasa a ser `simbolo|?|?`, que casaria
+           con TODAS las ventanas. Se degrada a "sin segmentacion" y el
+           prior devuelve el agregado, sin forzar ninguna ventana.
+
+        Antes solo existia (1), y como las plantillas base NO llevan
+        `_regime` (solo las del model-gen), con el model-gen ausente el
+        objetivo era siempre `simbolo|?|?` y el condicionamiento por ventana
+        no se aplicaba nunca (correccion 4).
+        """
+        for t in templates or []:
+            r = (t.get("parameters") or {}).get("_regime")
+            if r:
+                return r
+        try:
+            from quant_math.autonomous_research.adapters.postgres_kb import (
+                JSONLKnowledgeBase)
+            recs = JSONLKnowledgeBase(
+                jsonl_path=self.config.kb_path).load_records()
+        except Exception as exc:
+            logger.debug("[sis] sin regimen del KB (%s)",
+                         exc.__class__.__name__)
+            return None
+        best_ts, best = -1.0, None
+        for rec in recs.values():
+            if symbol and rec.get("symbol") != symbol:
+                continue
+            reg = (rec.get("parameters") or {}).get("_regime")
+            if not reg:
+                continue
+            try:
+                ts = float(rec.get("created_at") or rec.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts >= best_ts:
+                best_ts, best = ts, reg
+        return best
+
+    def _rank_hypotheses(self, templates: List[Dict], symbol: str) -> List[Dict]:
+        """Advisory ML reordering of candidate hypotheses (gate untouched).
+
+        Dos fuentes y un orden explicito (correccion 4):
+
+          1. el SIS se consulta PRIMERO, porque su salida (prior de familia
+             ponderado por el regimen vigente) alimenta al prior del KB;
+          2. `HypothesisPrior.rank_templates` reordena con esa mezcla;
+          3. `rank_families` reordena despues las FAMILIAS por el regimen.
+
+        El orden temporal se mantiene sin look-ahead: aqui solo se LEE el
+        libro de cierres de ciclos anteriores; `check_exits_all` escribe al
+        final del ciclo (F3 2026-09-29, verificado).
+        """
+        # 0) regimen vigente: plantilla (model-gen) -> KB del simbolo -> None.
+        regime = self._current_regime(symbol, templates)
+
+        # 1) SIS
+        loop = None
+        fam_prior: Dict[str, tuple] = {}
+        fams: List[str] = []
         try:
             from quant_math.ml.regime_learning import load_loop
             loop = load_loop(self.config.kb_path, self.config.state_dir)
-            s = loop.summary()
-            regime = None
-            for t in ordered:
-                r = (t.get("parameters") or {}).get("_regime")
-                if r:
-                    regime = r
-                    break
-            fams = loop.rank_families(symbol, regime)
-            if fams and loop.mode == "active":
-                def prio(t):
-                    st = str(getattr(t.get("strategy_type"), "value",
-                                     t.get("strategy_type", "")))
-                    for i, f in enumerate(fams):
-                        if f in st:
-                            return i
-                    return len(fams)
-                boosted = sorted(enumerate(ordered),
-                                 key=lambda kv: (prio(kv[1]), kv[0]))
-                ordered = [t for _, t in boosted]
-                print(f"[sis] modo={s['mode']} ops={s['rows']} familias="
-                      f"{fams[:3]} reordenado_advisory=True")
-            else:
-                print(f"[sis] modo={s['mode']} ops={s['rows']} (recolectando)")
+            if loop.mode == "active":
+                fam_prior = loop.family_prior(symbol, regime)
+                fams = loop.rank_families(symbol, regime)
             self._explore_burst = (
                 loop.should_explore() if loop.mode == "active" else False)
         except Exception as exc:
             logger.warning("[sis] fallo (%s); sin boost", exc)
             self._explore_burst = False
+
+        before = self._family_sequence(templates)
+
+        # 2) prior del KB, ya ponderado con el aprendizaje del SIS
+        try:
+            from quant_math.ml.hypothesis_prior import build_prior_from_kb
+            top_n = self.config.hypotheses_per_cycle
+            prior = build_prior_from_kb(self.config.kb_path,
+                                        family_prior=fam_prior)
+            ordered, info = prior.rank_templates(templates, symbol, top_n)
+            print(f"  [ml-prior] modo={info['mode']} registros={info['total']} "
+                  f"rate_global={info['global_rate']} "
+                  f"reordenado={info['reordered']} "
+                  f"sis_w={info.get('family_prior_max_w', 0.0)}")
+        except Exception as exc:
+            logger.warning("[ml-prior] fallo (%s); orden original", exc)
+            ordered = templates
+
+        # 3) regimen hostil: BAJA al final, nunca se excluye.
+        #
+        # Antes aqui se reordenaba por rank_families entero, y eso anulaba
+        # la mezcla del paso 2: cuando solo una familia tenia evidencia en
+        # la ventana, salia primera con o sin aprendizaje y el orden final
+        # era IDENTICO al de antes del SIS (medido en
+        # runtime/f3/d2/demo_lazo.py). El orden POSITIVO lo decide el
+        # paso 2 (prior del KB ponderado con el win-rate de la ventana);
+        # lo que el SIS puede vetar aqui es lo que esta en regimen hostil.
+        hostiles: List[str] = []
+        if loop is not None and loop.mode == "active":
+            hostiles = loop.hostile_families(symbol, regime)
+        if hostiles:
+            hs = set(hostiles)
+            def _fam(t):
+                from quant_math.ml.hypothesis_prior import family_of
+                return family_of(t.get("strategy_type"))
+            ordered = ([t for t in ordered if _fam(t) not in hs]
+                       + [t for t in ordered if _fam(t) in hs])
+
+        after = self._family_sequence(ordered)
+        if loop is None:
+            print(f"[sis] modo=error ops=0 (recolectando)")
+        elif loop.mode == "active":
+            s = loop.summary()
+            print(f"[sis] modo={s['mode']} ops={s['rows']} "
+                  f"clusters={'si' if s['cluster_ready'] else 'no'} "
+                  f"hostiles={loop.hostile_families(symbol, regime)} "
+                  f"familias={fams[:3]} "
+                  f"reordenado_advisory={before != after}")
+            if before != after:
+                print(f"[sis] orden_familias ANTES={before} "
+                      f"DESPUES={after}")
+        else:
+            s = loop.summary()
+            print(f"[sis] modo={s['mode']} ops={s['rows']} "
+                  f"(recolectando; faltan "
+                  f"{max(0, s['min_rows_active'] - s['rows'])} cierres)")
         return ordered
 
     def _build_engine(self) -> DecisionEngine:
-        return DecisionEngine(
+        engine = DecisionEngine(
             symbols=self.config.symbols,
             kb_path=self.config.kb_path,
             state_dir=self.config.state_dir,
@@ -380,10 +662,220 @@ class Orchestrator:
             min_paper_trades=self.config.min_paper_trades,
             use_postgres=self.config.use_postgres,
             take_profit_pct=self.config.take_profit_pct,
+            stop_loss_pct=self.config.stop_loss_pct,
+            take_profit_roe=self.config.take_profit_roe,
+            stop_loss_roe=self.config.stop_loss_roe,
+            leverage=self.config.effective_leverage,
             mode=self.config.mode,
             burst_margin=self.config.burst_margin,
             burst_leverage=self.config.burst_leverage,
+            # Gate: cerrado por defecto, y con umbral explicito.
+            learn_mode=self.config.learn_mode,
+            min_expectancy=self.config.min_expectancy,
+            min_scientific_score=self.config.min_scientific_score,
         )
+        # Solo en live se manda la orden de cierre al exchange. En paper el
+        # hook queda a None y close_position no toca la red (correccion 6).
+        if not self.config.dry_run:
+            engine.live_close_hook = self._live_close_order
+        return engine
+
+    def _live_close_order(self, symbol: str, side: str, qty: float) -> Dict:
+        """Cierra en el exchange la posicion que se cierra en local.
+
+        `reduceOnly` es lo que impide que un cierre abra una posicion
+        INVERSA por error: si la posicion ya no existe en el exchange, la
+        orden se rechaza en vez de abrir otra cosa.
+        """
+        from data_acquisition.data_sources.exchanges import ExchangeAPI
+        api = ExchangeAPI(self.config.exchange_id,
+                          sandbox=self.config.testnet)
+        try:
+            # Al cerrar se compra para tapar una larga y se vende para tapar
+            # una corta: el lado es el contrario al de la entrada.
+            exit_side = "sell" if side == "buy" else "buy"
+            swap = symbol if ":" in symbol else (
+                symbol + ":USDT" if symbol.endswith("/USDT") else symbol)
+            order = api.create_order(swap, exit_side, abs(qty),
+                                     order_type="market",
+                                     params={"reduceOnly": True})
+            return {"ok": True, "order_id": order.get("id"),
+                    "exchange_order_id": order.get("id"),
+                    "reduce_only": True, "side": exit_side}
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def reconcile_positions(self, dry: bool = True) -> Dict:
+        """Compara el estado LOCAL de posiciones contra el EXCHANGE.
+
+        Son dos verdades y nadie las comparaba. Con apalancamiento, una
+        posicion que solo existe en el exchange es dinero en riesgo que
+        nadie vigila: el bot no la ve, y su equity, su drawdown y su tope
+        diario dan un numero que no es el real.
+
+        Clasifica cada discrepancia:
+          - `orphan_exchange`: esta en el exchange y no en local. LA GRAVE.
+          - `phantom_local`: esta en local y no en el exchange. El ledger
+            miente sobre lo que se esta arriesgando.
+
+        `dry=True` (por defecto) SOLO informa. Cerrar posiciones es una
+        decision, no una consecuencia de medir: un reconciliador que manda
+        ordenes por su cuenta seria un peligro. Con `dry=False` cierra solo
+        las huerfanas y registra cada cierre; las `phantom_local` se corrigen
+        unicamente en local y con rastro, porque mandar una orden para
+        "cerrar" algo que no existe seria inventar posicion.
+
+        Idempotente: correrla dos veces no cambia nada la segunda vez.
+        """
+        report: Dict[str, Any] = {
+            "status": "ok", "dry": dry, "checked": [],
+            "orphan_exchange": [], "phantom_local": [], "closed": [],
+            "errors": [],
+        }
+
+        # Sin claves o en paper no se puede comparar: se dice, no se finge.
+        if self.config.dry_run:
+            report["status"] = "skipped"
+            report["motivo"] = ("dry_run=True: no hay exchange contra el que "
+                                "comparar (en paper la posicion vive solo en "
+                                "local, y eso no es una discrepancia)")
+            return report
+        try:
+            from data_acquisition.data_sources.exchanges import (
+                ExchangeAPI, api_keys_present)
+            if not api_keys_present():
+                report["status"] = "skipped"
+                report["motivo"] = ("sin BYBIT_API_KEY/BYBIT_API_SECRET: no se "
+                                    "puede leer el exchange. Esto NO significa "
+                                    "que no haya posiciones abiertas")
+                return report
+        except Exception as exc:
+            report["status"] = "skipped"
+            report["motivo"] = f"no se pudo comprobar las credenciales: {exc}"
+            return report
+
+        engine = getattr(self, "engine", None)
+        local = dict(getattr(engine, "open_positions", {}) or {})
+
+        # El simbolo no se guarda en la posicion: sale de la clave
+        # "hipotesis_id:s simbolo". La cantidad sale del ledger de entradas.
+        local_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for key, pos in local.items():
+            symbol = pos.get("symbol") or key.rsplit(":", 1)[-1]
+            qty = 0.0
+            try:
+                qty, _notional = engine._last_entry_sizing(key)
+            except Exception:
+                qty = 0.0
+            local_by_symbol.setdefault(symbol, []).append({
+                "key": key, "symbol": symbol, "side": pos.get("side", "buy"),
+                "quantity": float(qty or 0.0),
+                "entry_price": pos.get("entry_price"),
+            })
+
+        try:
+            api = ExchangeAPI(self.config.exchange_id,
+                              sandbox=self.config.testnet)
+        except Exception as exc:
+            report["status"] = "error"
+            report["motivo"] = f"no se pudo abrir el exchange: {exc}"
+            return report
+
+        try:
+            symbols = sorted(set(local_by_symbol) | set(self.config.symbols))
+            for symbol in symbols:
+                report["checked"].append(symbol)
+                try:
+                    pos = api.fetch_position(symbol)
+                except Exception as exc:
+                    report["errors"].append({"symbol": symbol,
+                                             "error": str(exc)})
+                    continue
+                amount = 0.0
+                try:
+                    amount = abs(float(pos.get("contracts") or 0.0))
+                except (TypeError, ValueError):
+                    amount = 0.0
+                local_rows = local_by_symbol.get(symbol, [])
+                local_qty = sum(r["quantity"] for r in local_rows)
+
+                if amount > 0 and local_qty <= 0:
+                    # La grave: hay dinero en el exchange que nadie vigila.
+                    orphan = {
+                        "symbol": symbol,
+                        "exchange_quantity": amount,
+                        "exchange_side": pos.get("side"),
+                        "entry_price": pos.get("entryPrice"),
+                        "leverage": pos.get("leverage"),
+                        "liquidation_price": pos.get("liquidationPrice"),
+                        "unrealised_pnl": pos.get("unrealisedPnl"),
+                        "gravedad": "ALTA",
+                        "detalle": ("posicion en el exchange que el estado "
+                                    "local no ve: su equity y su drawdown "
+                                    "estan calculandose mal"),
+                    }
+                    report["orphan_exchange"].append(orphan)
+                    if not dry and amount > 0:
+                        side = str(pos.get("side") or "long").lower()
+                        close_side = "sell" if side in ("long", "buy") else "buy"
+                        try:
+                            res = self._live_close_order(symbol, close_side,
+                                                         amount)
+                            orphan["closed"] = res
+                            report["closed"].append(
+                                {"symbol": symbol, "quantity": amount,
+                                 "side": close_side, "result": res})
+                            logger.warning(
+                                "[reconcile] huerfana CERRADA %s qty=%.6f",
+                                symbol, amount)
+                        except Exception as exc:
+                            orphan["close_error"] = str(exc)
+                            report["errors"].append(
+                                {"symbol": symbol, "close_error": str(exc)})
+                            logger.error(
+                                "[reconcile] no se pudo cerrar la huerfana "
+                                "%s: %s", symbol, exc)
+                elif local_qty > 0 and amount <= 0:
+                    phantom = {
+                        "symbol": symbol,
+                        "local_quantity": local_qty,
+                        "local_keys": [r["key"] for r in local_rows],
+                        "gravedad": "MEDIA",
+                        "detalle": ("el estado local da por abierta una "
+                                    "posicion que no esta en el exchange: el "
+                                    "riesgo real es otro"),
+                    }
+                    report["phantom_local"].append(phantom)
+                    if not dry and engine is not None:
+                        # Solo local, y con rastro. NO se manda orden al
+                        # exchange: no hay nada que cerrar ahi.
+                        for row in local_rows:
+                            engine.open_positions.pop(row["key"], None)
+                        try:
+                            engine._persist_positions()
+                        except Exception as exc:
+                            phantom["persist_error"] = str(exc)
+                        phantom["corregida_en_local"] = True
+                        logger.warning(
+                            "[reconcile] phantom_local corregida en local %s",
+                            symbol)
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+        report["resumen"] = (
+            f"{len(report['orphan_exchange'])} huerfana(s) en el exchange, "
+            f"{len(report['phantom_local'])} phantom local(es), "
+            f"{len(report['closed'])} cerrada(s), "
+            f"{len(report['errors'])} error(es)")
+        # El log deja rastro aunque nadie pida el informe.
+        logger.info("[reconcile] dry=%s -> %s", dry, report["resumen"])
+        return report
 
     # ------------------------------------------------------------------
     # Stage 1: hypothesis generation + backtest on REAL data
@@ -640,12 +1132,93 @@ class Orchestrator:
                     key = rec.get("key", "")
                     if "motivo_cierre" in rec:
                         open_keys.discard(key)
-                    elif rec.get("margin_usd"):
+                    elif rec.get("entry_price") is not None:
+                        # FALLA ABIERTA que se cierra aqui (correccion
+                        # no3): antes la fila solo contaba si traia
+                        # `margin_usd`. Las entradas anteriores a la
+                        # correccion no2 no lo traian, asi que el tope de
+                        # exposicion burst no las contaba y se abria
+                        # con el tope excedido sin que nada lo notara.
+                        # Ahora toda entrada viva cuenta; si no hay
+                        # margen, cuenta 0 y se avisa, que es lo honesto.
                         entries.append(rec)
                         open_keys.add(key)
         except OSError:
             pass
         return [e for e in entries if e.get("key") in open_keys]
+
+    def _ledger_open_keys(self) -> set:
+        """Claves de entrada VIVAS segun el libro permanente.
+
+        Recorre el libro una vez mas (es pequeño) para poder distinguir
+        "hay 3 posiciones abiertas" de "el motor dice que hay 0". La
+        divergencia entre ambos es un agujero de riesgo y por eso existe
+        esta funcion y no solo `_open_burst_entries`.
+        """
+        open_keys = set()
+        path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    key = rec.get("key") or (f"{rec.get('hypothesis_id')}:"
+                                            f"{rec.get('symbol')}")
+                    if "motivo_cierre" in rec:
+                        open_keys.discard(key)
+                    elif rec.get("entry_price") is not None:
+                        open_keys.add(key)
+        except OSError:
+            return set()
+        return open_keys
+
+    def _unrealized_snapshot(self) -> Dict:
+        """Marca a mercado las posiciones vivas y reparte el flotante.
+
+        Reparto (correccion no3, 2026-09-29):
+          - `total` -> TODO el flotante; entra en el equity y por tanto en
+            el drawdown. Es la red que agarra las posiciones viejas que
+            llevan dias sangrando y que el corte de medianoche no ve.
+          - `today` -> solo las abiertas DESDE las 00:00 UTC. Es el dano
+            de HOY, y lo que se compara con el tope diario.
+        `unpriced` son las que NO se han podido marcar: se declaran, no
+        se estiman a cero. El guard decide con ellas (falla cerrado).
+        """
+        day_start = utc_day_start_ts()
+        engine_positions = getattr(self.engine, "open_positions", None) or {}
+        mark = (self.engine.mark_to_market()
+                if hasattr(self.engine, "mark_to_market") else {})
+        rows = mark.get("rows") or []
+        today = 0.0
+        for row in rows:
+            try:
+                opened = float(row.get("opened_at") or 0.0)
+            except (TypeError, ValueError):
+                opened = 0.0
+            if opened >= day_start:
+                today += float(row.get("pnl_usd") or 0.0)
+        unpriced = list(mark.get("unpriced") or [])
+        # Reconciliacion libro <-> motor: una entrada viva que el motor
+        # no gestiona no se puede marcar y no la cierra nadie.
+        unmanaged = sorted(self._ledger_open_keys() - set(engine_positions))
+        if unmanaged:
+            logger.error(
+                "[risk] %d entrada(s) viva(s) en el libro que el motor no "
+                "gestiona: %s — se cuentan como riesgo NO medido",
+                len(unmanaged), ", ".join(unmanaged))
+            unpriced.extend(unmanaged)
+        return {
+            "total": float(mark.get("pnl_usd") or 0.0),
+            "today": today,
+            "rows": rows,
+            "unpriced": unpriced,
+            "open": len(engine_positions),
+        }
 
     def _publish_to_kb(self, records: List[Dict]):
         for record in records:
@@ -687,11 +1260,30 @@ class Orchestrator:
         return today, total
 
     def _apply_margin_cap(self, notional: float, lev_used: int,
-                          hypothesis_id: str) -> float:
-        """Fase 1b: enforce RiskManager max margin per entry.
+                          hypothesis_id: str,
+                          sl_distance: Optional[float] = None) -> float:
+        """Fase 1b: tope de MARGEN por entrada + tope de RIESGO por operacion.
 
-        Returns possibly-capped notional. Never raises (fail-open with log).
+        FALLA CERRADO. Antes, ante cualquier excepcion, devolvia el nocional
+        SIN capar (`logger.warning("sin cap")`): si la comprobacion de riesgo
+        fallaba, se operaba sin limite. Ahora una excepcion devuelve 0.0 y
+        `_execute_paper_trade` aborta sin escribir nada en el libro.
+
+        El tope de margen se recalcula aqui a partir de `max_position` (la
+        misma regla que usa RiskManager: account * max_position_pct) y NO a
+        partir de `approved_size`, que vale 0.0 cuando el check NO aprueba —
+        eso producia operaciones de nocional 0 en el libro en vez de una
+        operacion recortada.
+
+        `sl_distance` (distancia de precio del SL, ya clampada contra la
+        liquidacion) activa el tope de riesgo en USD. Se calcula con
+        `PositionSizer.calculate`, que es la formula canonica de sizing y hasta
+        ahora tenia 0 referencias desde la ruta de dinero.
         """
+        notional = float(notional)
+        lev_used = max(1, int(lev_used))
+        if notional <= 0:
+            return 0.0
         try:
             from quant_math.risk.risk_manager import RiskManager
             if self._risk_manager is None:
@@ -699,18 +1291,61 @@ class Orchestrator:
                     max_position_size_pct=self.config.max_position_pct,
                     drawdown_limit=self.config.drawdown_limit,
                 )
-            margin_used = notional / max(1, lev_used)
-            account = self.config.initial_capital + self._last_realized_total
+            margin_used = notional / lev_used
+            # Equity MARCADO (realizado + flotante). Antes solo el
+            # realizado: con posiciones abiertas en contra, el "account"
+            # parecia mas grande justo cuando mas falta era no añadir.
+            account = float(getattr(self, "_last_equity", 0.0) or 0.0)
+            if account <= 0:
+                account = (float(self.config.initial_capital)
+                           + float(self._last_realized_total))
+            if not (account > 0):
+                raise ValueError(f"cuenta no positiva ({account}); no se opera")
             chk = self._risk_manager.check_position_size(
                 hypothesis_id, margin_used, account)
-            if not chk["approved"]:
-                capped = float(chk["approved_size"]) * max(1, lev_used)
-                print(f"  [risk] margin cap: notional ${notional:.2f} -> "
-                      f"${capped:.2f} ({'; '.join(chk['reasons'])})")
-                return capped
+            reasons = list(chk.get("reasons") or [])
+            if not chk.get("approved"):
+                # `max_position` es la MISMA regla que aplica RiskManager.
+                max_margin = float(chk.get("max_position") or 0.0)
+                only_size = bool(reasons) and all(
+                    "exceeds max" in r for r in reasons)
+                if not (only_size and max_margin > 0):
+                    # Rechazo por otra causa (limite global de perdida,
+                    # Kelly...). Fallar CERRADO: no se opera.
+                    logger.error(
+                        "[risk] entrada RECHAZADA para %s: %s",
+                        hypothesis_id, "; ".join(reasons) or "sin detalle")
+                    print(f"  [risk] RECHAZADA (cierre): {'; '.join(reasons)}")
+                    return 0.0
+                capped_margin = min(margin_used, max_margin)
+                notional = capped_margin * lev_used
+                print(f"  [risk] margin cap: notional ${notional + (capped_margin - margin_used) * lev_used:.2f} -> "
+                      f"${notional:.2f} (margen ${margin_used:.2f} -> "
+                      f"${capped_margin:.2f} <= ${max_margin:.2f})")
+            # --- tope de RIESGO por operacion, en USD -------------------
+            cap_usd = float(self.config.max_risk_per_trade_usd or 0.0)
+            if sl_distance and sl_distance > 0 and cap_usd > 0:
+                from quant_math.risk.sizing import PositionSizer
+                max_notional = PositionSizer.calculate(
+                    portfolio_value=account,
+                    risk_per_trade=cap_usd / account,
+                    stop_loss_distance=float(sl_distance),
+                )
+                if notional > max_notional:
+                    risk_usd = notional * float(sl_distance)
+                    notional = max_notional
+                    print(f"  [risk] riesgo/trade: ${risk_usd:.2f} -> "
+                          f"${cap_usd:.2f} tope ({self.config.max_risk_per_trade_pct:.1%} "
+                          f"de ${account:.2f}); nocional ${max_notional:.2f}")
+            return notional
         except Exception as exc:
-            logger.warning("[risk] margin check fallo (%s); sin cap", exc)
-        return notional
+            # CIERRE, no apertura. Si no se puede comprobar el riesgo,
+            # no se opera: un tope que se desactiva solo no es un tope.
+            logger.error("[risk] comprobacion de riesgo fallo (%s); CIERRE: "
+                         "no se opera", exc)
+            print(f"  [risk] CIERRE: comprobacion de riesgo fallo ({exc}); "
+                  f"no se opera")
+            return 0.0
 
     def _execute_paper_trade(self, signal: Dict) -> Dict:
         """Fill a paper trade at the signal price with configured sizing/TP."""
@@ -737,11 +1372,22 @@ class Orchestrator:
                              * float(signal.get("sizing_mult", 1.0)))
             notional = base_notional * self.config.leverage
             lev_used = max(1, self.config.leverage)
-        # Fase 1b: RiskManager margin cap (never raises)
+        # Distancia de precio del SL YA VALIDADA contra la liquidacion
+        # (clampeada en __post_init__). Es la que materializa el tope de
+        # riesgo en USD y la que se registra en el libro.
+        sl_distance = self.config.stop_loss_pct
+        # Fase 1b: tope de margen + tope de riesgo por operacion.
+        # FALLA CERRADO: puede devolver 0.0 y entonces no se opera.
         notional = self._apply_margin_cap(
-            notional, lev_used, str(signal.get("hypothesis_id", "")))
-        if self.config.mode == "burst":
-            margin = notional / max(1, lev_used)
+            notional, lev_used, str(signal.get("hypothesis_id", "")),
+            sl_distance=sl_distance)
+        if notional <= 0:
+            return {"action": "risk_rejected",
+                    "symbol": signal.get("symbol"),
+                    "hypothesis_id": signal.get("hypothesis_id")}
+        # Margen real DESPUES del cap, en AMBOS modos: sin esto el ROE
+        # realizado no es medible y el aprendizaje no se puede evaluar.
+        margin = notional / max(1, lev_used)
         # Fase 3: live path (config guard guarantees testnet + keys,
         # or mainnet with QUANTMATH_ALLOW_MAINNET=1 — see __post_init__).
         if not self.config.dry_run:
@@ -749,9 +1395,17 @@ class Orchestrator:
                 signal, price, side, notional, lev_used,
                 margin if self.config.mode == "burst" else None)
         quantity = notional / price
-        tp_price = price * (1 + self.config.take_profit_pct) if side == "buy" \
-            else price * (1 - self.config.take_profit_pct)
+        plan = self.config.roe_plan
+        if plan is not None:
+            tp_price, sl_price = tp_sl_prices(price, side, plan)
+        else:
+            d = self.config.take_profit_pct
+            tp_price = price * (1 + d) if side == "buy" else price * (1 - d)
+            sl_price = price * (1 - d) if side == "buy" else price * (1 + d)
 
+        # Ledger paper_executions.jsonl. Campos NUEVOS se AÑADEN; ninguno
+        # antiguo se cambia ni se borra, para que las filas viejas sigan
+        # leyendose igual.
         trade = {
             "mode": "paper",
             "key": f"{signal['hypothesis_id']}:{signal['symbol']}",
@@ -765,20 +1419,36 @@ class Orchestrator:
             "expectancy": signal["expectancy"],
             "timestamp": signal["timestamp"],
             "cycle": self.cycle_count,
+            # --- desde la correccion no2: ROE y riesgo medibles ---
+            "stop_loss_price": sl_price,
+            "take_profit_pct": self.config.take_profit_pct,
+            "stop_loss_pct": sl_distance,
+            "take_profit_roe": self.config.take_profit_roe,
+            "stop_loss_roe": (plan.sl_roe_requested if plan is not None
+                              else None),
+            "margin_usd": margin,          # ambos modos, no solo burst
+            "leverage": lev_used,          # ambos modos, no solo burst
+            "risk_usd_at_stop": (notional * sl_distance) if sl_distance else None,
+            "liquidation_price_distance": (plan.liquidation_price_distance
+                                           if plan is not None else None),
+            "sl_clamped": bool(plan.sl_clamped) if plan is not None else False,
+            # --- correccion no3: rastro del gate en el libro -----------
+            # Sin esto no se puede afirmar despues si una operacion se
+            # hizo con el gate cerrado o en exploracion.
+            "learn_entry": bool(signal.get("learn_entry")),
+            "gate_open": bool(signal.get("gate_open")),
+            "gate_min_expectancy": signal.get("gate_min_expectancy"),
+            "cost_floor_pct": signal.get("cost_floor_pct"),
         }
-        if self.config.mode == "burst":
-            trade["margin_usd"] = margin
-            trade["leverage"] = leverage
-        elif self.config.leverage > 1:
-            trade["leverage"] = self.config.leverage
         trades_path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
         os.makedirs(self.config.state_dir, exist_ok=True)
         with open(trades_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(trade, ensure_ascii=False) + "\n")
 
-        logger.info("[paper_trade] %s %s qty=%.6f @ %.2f TP=%.2f (hyp=%s)",
+        logger.info("[paper_trade] %s %s qty=%.6f @ %.2f TP=%.2f SL=%.2f "
+                    "margen=%.2f lev=%dx (hyp=%s)",
                     side.upper(), trade["symbol"], quantity, price, tp_price,
-                    trade["hypothesis_id"])
+                    sl_price, margin, lev_used, trade["hypothesis_id"])
         # Fase 2: shadow live intent — what WOULD be sent to the exchange.
         # No API call; paper trading continues untouched.
         if self.config.shadow_live:
@@ -807,8 +1477,27 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("[live] set_leverage fallo (%s); continúo", exc)
             qty = notional / price
+            # Los precios de salida se calculan ANTES de mandar la orden
+            # (correccion 6): antes se mandaba la entrada desnuda y el TP/SL
+            # se calculaba despues, solo para guardarlo en el ledger. La
+            # proteccion vivia unicamente en un fichero local: si el proceso
+            # muriese, la posicion quedaba sin SL en el exchange.
+            plan = self.config.roe_plan
+            if plan is not None:
+                tp_px, sl_px = tp_sl_prices(price, side, plan)
+            else:
+                d = self.config.take_profit_pct
+                tp_px = price * (1 + d) if side == "buy" else price * (1 - d)
+                sl_px = price * (1 - d) if side == "buy" else price * (1 + d)
+            # El exchange guarda la orden de proteccion: aunque el bot se
+            # caiga, el SL sigue puesta. Es lo que hace esto operable con
+            # dinero real y no solo un papel con buena intencion.
+            order_params: Dict[str, Any] = {
+                "stopLoss": {"triggerPrice": float(sl_px)},
+                "takeProfit": {"triggerPrice": float(tp_px)},
+            }
             order = api.create_order(signal["symbol"], side, qty,
-                                     order_type="market")
+                                     order_type="market", params=order_params)
             try:
                 api.close()
             except Exception:
@@ -823,10 +1512,7 @@ class Orchestrator:
                 "entry_price": float(order.get("average")
                                      or order.get("price") or price),
                 "notional_usd": notional,
-                "take_profit_price": (
-                    price * (1 + self.config.take_profit_pct)
-                    if side == "buy"
-                    else price * (1 - self.config.take_profit_pct)),
+                "take_profit_price": price,  # reescrito justo despues con el plan
                 "hypothesis_id": signal["hypothesis_id"],
                 "expectancy": signal["expectancy"],
                 "timestamp": signal["timestamp"],
@@ -834,9 +1520,27 @@ class Orchestrator:
                 "leverage": lev_used,
                 "exchange_order_id": order.get("id"),
                 "testnet": self.config.testnet,
+                # correccion no3: mismo rastro del gate que en paper
+                "learn_entry": bool(signal.get("learn_entry")),
+                "gate_open": bool(signal.get("gate_open")),
+                "gate_min_expectancy": signal.get("gate_min_expectancy"),
+                "cost_floor_pct": signal.get("cost_floor_pct"),
             }
-            if margin is not None:
-                trade["margin_usd"] = margin
+            # tp_px / sl_px ya estan calculados arriba, antes de la orden
+            # (correccion 6). Se reusan tal cual: una sola verdad.
+            trade["take_profit_price"] = tp_px
+            trade["stop_loss_price"] = sl_px
+            trade["take_profit_pct"] = self.config.take_profit_pct
+            trade["stop_loss_pct"] = self.config.stop_loss_pct
+            trade["take_profit_roe"] = self.config.take_profit_roe
+            trade["stop_loss_roe"] = (plan.sl_roe_requested
+                                       if plan is not None else None)
+            trade["liquidation_price_distance"] = (
+                plan.liquidation_price_distance if plan is not None else None)
+            # Margen SIEMPRE, tambien en classic: sin el no hay ROE
+            # realizado medible.
+            trade["margin_usd"] = (notional / max(1, lev_used)
+                                    if margin is None else margin)
             trades_path = os.path.join(self.config.state_dir,
                                        "paper_executions.jsonl")
             os.makedirs(self.config.state_dir, exist_ok=True)
@@ -875,7 +1579,7 @@ class Orchestrator:
                 "paper_notional_usd": trade.get("notional_usd"),
                 "hypothesis_id": trade.get("hypothesis_id"),
                 "expectancy": trade.get("expectancy"),
-                "                timestamp": trade.get("timestamp"),
+                "timestamp": trade.get("timestamp"),
                 "cycle": self.cycle_count,
                 "validated": bool(getattr(self, "_live_validated", False)),
             }
@@ -1004,13 +1708,45 @@ class Orchestrator:
         # Exits already ran above; monitoring continues regardless.
         realized_today, realized_total = self._ledger_pnl()
         self._last_realized_total = realized_total
-        equity = self.config.initial_capital + realized_total
+        # Flotante: lo que YA se ha perdido aunque no se haya cerrado
+        # nada. Sin esto, con 5 posiciones abiertas en el SL el guard ve
+        # 0,00% de drawdown y dice PERMITE (medido, F3 2026-09-29).
+        mark = self._unrealized_snapshot()
+        self._last_unrealized = mark["total"]
+        self._last_unrealized_today = mark["today"]
+        self._last_unpriced = mark["unpriced"]
+        equity = (self.config.initial_capital + realized_total
+                  + mark["total"])
+        self._last_equity = equity
         open_count = len(getattr(self.engine, "open_positions", {}) or {})
         risk_ok, risk_reason = self.guard.check(
-            realized_today, equity, open_count)
+            realized_today, equity, open_count,
+            unrealized_today=mark["today"],
+            unrealized_total=mark["total"],
+            unpriced_positions=len(mark["unpriced"]))
+        peak = float(self.guard.last.get("peak_equity") or equity)
+        drawdown = ((peak - equity) / peak) if peak > 0 else 0.0
+        day_pnl = realized_today + min(0.0, mark["today"])
         self.stats["risk_halt"] = risk_reason
         self.stats["realized_today"] = round(realized_today, 4)
         self.stats["realized_total"] = round(realized_total, 4)
+        self.stats["unrealized_today"] = round(mark["today"], 4)
+        self.stats["unrealized_total"] = round(mark["total"], 4)
+        self.stats["equity"] = round(equity, 4)
+        self.stats["peak_equity"] = round(peak, 4)
+        self.stats["drawdown_pct"] = round(drawdown, 6)
+        self.stats["day_pnl"] = round(day_pnl, 4)
+        self.stats["open_positions"] = open_count
+        self.stats["unpriced_positions"] = len(mark["unpriced"])
+        self.stats["gate_open"] = bool(
+            getattr(self.engine, "learn_mode", False))
+        print(f"  [riesgo] equity ${equity:,.4f} = ${self.config.initial_capital:,.2f} "
+              f"+ realizado ${realized_total:+,.4f} + flotante ${mark['total']:+,.4f} | "
+              f"dia {day_pnl:+,.4f} de -${self.config.max_daily_loss_usd:,.2f} | "
+              f"dd {drawdown:.2%} de {self.config.drawdown_limit:.0%} | "
+              f"abiertas {open_count}/{self.config.max_open_positions} | "
+              f"sin marcar {len(mark['unpriced'])} | "
+              f"gate {'ABIERTO/exploracion' if self.stats['gate_open'] else 'cerrado'}")
         if not risk_ok:
             print(f"  [RISK-HALT] {risk_reason}")
 
@@ -1088,9 +1824,30 @@ class Orchestrator:
         self._write_stats()
         return summary
 
+    def _run_reconcile(self, dry: bool = True) -> Optional[Dict]:
+        """Llama a `reconcile_positions` sin dejar que tumbe el ciclo.
+
+        Una reconciliacion fallida no puede parar el bot: se registra y se
+        sigue. Un informe que no llega es mejor que un bot parado.
+        """
+        try:
+            report = self.reconcile_positions(dry=dry)
+        except Exception as exc:
+            logger.error("[reconcile] fallo (el ciclo sigue): %s", exc)
+            return None
+        if report.get("status") == "skipped":
+            logger.info("[reconcile] omitida: %s", report.get("motivo"))
+        return report
+
     def run_forever(self, max_cycles: Optional[int] = None):
         """Continuous loop (Ctrl+C to stop)."""
         cycles = 0
+        # Reconciliacion periodica (correccion 6). DESACTIVADA por defecto a
+        # proposito: cada llamada abre conexion con el exchange y consulta
+        # posiciones. Con interval_seconds=3600 serian 86.400 llamadas al dia
+        # para mirar lo mismo. Activar con reconcile_every_n_cycles>0.
+        if self.config.reconcile_every_n_cycles > 0 and not self.config.dry_run:
+            self._run_reconcile(dry=True)
         while max_cycles is None or cycles < max_cycles:
             if self._stop_requested:
                 break
@@ -1099,6 +1856,10 @@ class Orchestrator:
             except Exception as exc:
                 logger.exception("Cycle failed: %s", exc)
             cycles += 1
+            every = self.config.reconcile_every_n_cycles
+            if (every > 0 and cycles % every == 0
+                    and not self.config.dry_run):
+                self._run_reconcile(dry=True)
             if max_cycles is None or cycles < max_cycles:
                 # Adaptive sleep: shorter intervals to allow signal processing
                 sleep_time = self.config.interval_seconds

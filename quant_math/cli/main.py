@@ -304,7 +304,14 @@ class RuntimeState:
     def start(self, config_dict: Dict, mode: str = "classic",
               session: Optional[str] = None):
         self._ensure_pg_vm()
-        os.environ.setdefault("QUANTMATH_LEARN_MODE", "1")
+        # correccion no3: NO se enciende la exploracion aqui. Antes este
+        # `setdefault("QUANTMATH_LEARN_MODE", "1")` ganaba siempre que la
+        # variable no existiera y el proceso hijo heredaba el gate
+        # ABIERTO. Ahora se propaga la decision EXPLICITA del wizard
+        # (default: False = gate cerrado).
+        if "learn_mode" in config_dict:
+            os.environ["QUANTMATH_LEARN_MODE"] = (
+                "1" if config_dict["learn_mode"] else "0")
 
         session = _sanitize_session(
             session or config_dict.get("session") or mode)
@@ -624,6 +631,65 @@ def _session_mode(runtime: "RuntimeState", session: str) -> str:
     return "classic"
 
 
+def _roe_plan_panel(plan) -> str:
+    """Panel con el plan TP/SL derivado. Deja explicito que el MMR es un
+    SUPUESTO que el operador debe confirmar contra Bybit."""
+    tp = plan
+    line = (
+        f"{tp.mode}  L={tp.leverage}x\n"
+        f"  TP  {tp.tp_roe:+.0%} ROE  =  {tp.tp_price_distance:.3%} del precio"
+        f"   (pedir {tp.tp_price_distance:.1%} de recorrido)\n"
+        f"  SL  {tp.sl_roe:+.0%} ROE  =  {tp.sl_price_distance:.3%} del precio"
+        f"{'   [CLAMP por seguridad]' if tp.sl_clamped else ''}\n"
+        f"  Liquidacion a {tp.liquidation_price_distance:.3%} del precio"
+        f"  ->  el SL cae {tp.sl_liquidation_headroom:.1f}x ANTES\n"
+        f"  MMR {tp.maintenance_margin_rate:.2%} = SUPUESTO (no leido de la API"
+        f" de Bybit). Confirmalo antes de operar con dinero real."
+    )
+    return line
+
+
+def _ask_roe_plan(mode: str, market: str, leverage: int,
+                  ask_lev, max_attempts: int = 3):
+    """Valida el apalancamiento elegido contra el plan ROE ANTES de arrancar.
+
+    Devuelve (plan,) o None si el operador cancela / agota los intentos.
+    Re-pregunta el apalancamiento cuando el plan no es operable (caso tipico:
+    L demasiado bajo para que el TP en ROE quepa en un movimiento de precio
+    razonable). Es el aviso de Leonardo: avisar, no operar a ciegas.
+    """
+    from quant_math.risk.roe_targets import build_roe_plan, LeverageRiskError
+    for intento in range(1, max_attempts + 1):
+        try:
+            plan = build_roe_plan(mode=mode, leverage=leverage, market=market)
+        except LeverageRiskError as exc:
+            console.print(f"[red]Apalancamiento {leverage}x no utilizable: {exc}[/red]")
+            lev = ask_lev()
+            if lev is None:
+                return None
+            leverage = lev
+            continue
+        if plan.ok:
+            if plan.warnings:
+                for w in plan.warnings:
+                    console.print(f"[yellow][roe] {w}[/yellow]")
+            console.print(Panel(_roe_plan_panel(plan),
+                                title="Plan TP/SL derivado (ROE)",
+                                border_style="green", expand=False))
+            return plan
+        console.print(f"[red]Con {leverage}x este plan no se puede operar "
+                      f"(intento {intento}/{max_attempts}):[/red]")
+        for e in plan.errors:
+            console.print(f"  [red]- {e}[/red]")
+        lev = ask_lev()
+        if lev is None:
+            return None
+        leverage = lev
+    console.print("[red]No se encontro un apalancamiento operable para este "
+                  f"modo ({mode}). Wizard cancelado.[/red]")
+    return None
+
+
 def wizard() -> Optional[Dict]:
     """Interactive configuration wizard. Returns cfg dict or None if cancelled."""
     console.print(Panel("[bold cyan]Wizard de configuración[/bold cyan]\n"
@@ -646,11 +712,23 @@ def wizard() -> Optional[Dict]:
 
         # Leverage selection (per first symbol, applied to all)
         if market == "forex":
-            leverage = _ask_leverage_forex(symbols[0])
+            def _ask_lev():
+                return _ask_leverage_forex(symbols[0])
         else:
-            leverage = ask_leverage(symbols[0], "bybit", "classic")
+            def _ask_lev():
+                return ask_leverage(symbols[0], "bybit", "classic")
+
+        leverage = _ask_lev()
         if leverage is None:
             return None
+
+        # El apalancamiento se valida CONTRA el plan ROE antes de seguir: si el
+        # SL en ROE fuera inalcanzable o el TP exigiera un movimiento imposible,
+        # el wizard no devuelve config y se re-pregunta el apalancamiento.
+        roe_plan = _ask_roe_plan("classic", market, leverage, _ask_lev)
+        if roe_plan is None:
+            return None
+        leverage = roe_plan.leverage
 
         entry_pct = ask_float("% de capital por entrada (0-1]", "0.02", hi=1)
         if entry_pct is None:
@@ -660,11 +738,8 @@ def wizard() -> Optional[Dict]:
             default="1h" if market == "crypto" else "15m").unsafe_ask()
         if timeframe is None:
             return None
-        take_profit_pct = ask_float(
-            "Take-profit % (ej. 0.25 = 25%)",
-            "0.25" if market == "crypto" else "0.005")
-        if take_profit_pct is None:
-            return None
+        # NO se pregunta el take-profit: los objetivos son FIJOS por modo y se
+        # declaran en ROE (classic 50% TP / 25% SL). El precio sale del plan.
         lookback_days = ask_int("Lookback days (backtest)",
                                 "30" if market == "crypto" else "14", lo=1)
         if lookback_days is None:
@@ -676,6 +751,10 @@ def wizard() -> Optional[Dict]:
 
         exec_flags = _ask_execution_mode(initial_capital)
         if exec_flags is None:
+            return None
+
+        learn_mode = _ask_learn_mode()
+        if learn_mode is None:
             return None
 
         session = _ask_session_name("classic", symbols)
@@ -691,7 +770,11 @@ def wizard() -> Optional[Dict]:
             "lookback_days": lookback_days,
             "initial_capital": initial_capital,
             "entry_pct": entry_pct,
-            "take_profit_pct": take_profit_pct,
+            # Valores DERIVADOS del plan ROE. __post_init__ los reescribe de
+            # forma autoritativa; se pasan para no dejar campos requeridos a 0.
+            "take_profit_pct": roe_plan.tp_price_distance,
+            "take_profit_roe": roe_plan.tp_roe,
+            "stop_loss_roe": roe_plan.sl_roe,
             "min_paper_trades": 3,          # contract value; explicit on purpose
             "hypotheses_per_cycle": hypotheses_per_cycle,
             "kb_path": kb_path,
@@ -703,6 +786,9 @@ def wizard() -> Optional[Dict]:
             "testnet": exec_flags["testnet"],
             "shadow_live": exec_flags["shadow_live"],
             "leverage": leverage,
+            # correccion no3: puerta de decision, EXPLICITA. False (lo
+            # que se elige por defecto) = gate cerrado.
+            "learn_mode": bool(learn_mode),
         }
     except (AttributeError):
         # ESC / pregunta cancelada -> volver al menú.
@@ -734,11 +820,21 @@ def burst_wizard() -> Optional[Dict]:
 
         # Leverage selection (per first symbol, applied to all)
         if market == "forex":
-            leverage = _ask_leverage_forex(symbols[0])
+            def _ask_lev():
+                return _ask_leverage_forex(symbols[0])
         else:
-            leverage = ask_leverage(symbols[0], "bybit", "burst")
+            def _ask_lev():
+                return ask_leverage(symbols[0], "bybit", "burst")
+
+        leverage = _ask_lev()
         if leverage is None:
             return None
+
+        # Validacion de alcanzabilidad del SL ANTES de arrancar (burst 20%/10%)
+        roe_plan = _ask_roe_plan("burst", market, leverage, _ask_lev)
+        if roe_plan is None:
+            return None
+        leverage = roe_plan.leverage
 
         timeframe = questionary.select(
             "Timeframe:", choices=["1m", "5m", "15m", "1h"],
@@ -746,11 +842,8 @@ def burst_wizard() -> Optional[Dict]:
         if timeframe is None:
             return None
 
-        tp_pct = ask_float("Take-profit % (ej. 0.20 = 20%)",
-                           "0.20" if market == "crypto" else "0.005")
-        if tp_pct is None:
-            return None
-
+        # Sin pregunta de take-profit: objetivos FIJOS burst (20% TP / 10% SL
+        # en ROE). El precio sale del plan validado arriba.
         lookback_days = ask_int("Lookback days (backtest)", "14", lo=1)
         if lookback_days is None:
             return None
@@ -761,6 +854,10 @@ def burst_wizard() -> Optional[Dict]:
 
         exec_flags = _ask_execution_mode(50.0)
         if exec_flags is None:
+            return None
+
+        learn_mode = _ask_learn_mode()
+        if learn_mode is None:
             return None
 
         session = _ask_session_name("burst", symbols)
@@ -776,7 +873,9 @@ def burst_wizard() -> Optional[Dict]:
             "lookback_days": lookback_days,
             "initial_capital": 50.0,
             "entry_pct": 0.1,               # ignored in burst mode (margin-based)
-            "take_profit_pct": tp_pct,
+            "take_profit_pct": roe_plan.tp_price_distance,
+            "take_profit_roe": roe_plan.tp_roe,
+            "stop_loss_roe": roe_plan.sl_roe,
             "min_paper_trades": 3,
             "hypotheses_per_cycle": hyp_per_cycle,
             "kb_path": kb_path,
@@ -790,6 +889,8 @@ def burst_wizard() -> Optional[Dict]:
             "mode": "burst",
             "burst_margin": margin,
             "burst_leverage": leverage,
+            # correccion no3: puerta de decision, EXPLICITA
+            "learn_mode": bool(learn_mode),
         }
     except (AttributeError):
         return None
@@ -925,6 +1026,21 @@ def ask_leverage(symbol: str, exchange_id: str = "bybit", mode: str = "classic")
     if lev is None:
         return None
     return lev
+
+
+def _ask_learn_mode() -> Optional[bool]:
+    """Puerta de decision (correccion no3, 2026-09-29).
+
+    False = GATE CERRADO: solo se opera `expectancy > min_expectancy`.
+    True  = exploracion: se opere tambien con expectativa negativa para
+    alimentar el aprendizaje. Default False, y en ambos casos la
+    decision queda escrita en <state_dir>/learn_mode_audit.jsonl y en cada
+    fila del libro (learn_entry/gate_open).
+    """
+    return questionary.confirm(
+        "Exploracion (ABRE el gate expectancy>0: opera tambien hipotesis "
+        "con expectativa negativa)?",
+        default=False).unsafe_ask()
 
 
 def _ask_execution_mode(initial_capital: float) -> Optional[Dict]:

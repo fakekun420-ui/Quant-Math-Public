@@ -20,6 +20,12 @@ from collections import deque
 from typing import Any, Callable, Dict, List, Optional
 
 from quant_math.decision_engine.event_bus import bus
+from quant_math.risk.gate_policy import (
+    append_gate_audit,
+    resolve_gate_thresholds,
+    resolve_learn_mode,
+    round_trip_cost_pct,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +40,24 @@ DEFAULT_MIN_PAPER_TRADES = 3
 LIVE_SHRINK_E = 5.0      # peso del dato propio vs expectancy de generacion
 FAMILY_SHRINK_K = 3.0    # shrinkage de la media propia hacia la de familia
 
-# LEARN MODE: cuando esta activo, el gate expectancy>0 se desactiva TEMPORAL-
-# MENTE para que el sistema opere tambien hipotesis negativas y aprenda de
-# sus errores (solo paper: el sistema nunca implementa ejecucion real).
-# Default "0" (gate intacto); la ruta del CLI lo activa con setdefault.
-def _learn_mode_default() -> bool:
-    return os.environ.get("QUANTMATH_LEARN_MODE", "0") == "1"
+# LEARN MODE (correccion no3, 2026-09-29): con la exploracion activa el
+# gate expectancy>0 se desactiva para que el sistema opere tambien
+# hipotesis negativas y aprenda de sus errores (solo paper: el sistema
+# nunca implementa ejecucion real).
+#
+# El default es GATE CERRADO y la politica vive en UN solo sitio,
+# quant_math/risk/gate_policy.py. Antes se resolvia aqui con
+# `os.environ.get(..., "0")` y los dos launchers la encendian con
+# `setdefault(..., "1")`: por la puerta real el gate NUNCA estuvo cerrado.
+# La auto-graduacion de mas abajo (que se desactiva sola cuando los
+# ultimos cierres son netamente positivos) SE RESPETA tal cual; aqui solo
+# se registra que se ha resuelto y por que.
+def _learn_mode_default(explicit: Optional[bool] = None,
+                       state_dir: Optional[str] = None,
+                       event: str = "startup") -> bool:
+    learn, source = resolve_learn_mode(explicit, state_dir, event)
+    logger.info("[gate] LEARN_MODE=%s (origen=%s)", learn, source)
+    return learn
 
 
 class DecisionEngine:
@@ -68,9 +86,25 @@ class DecisionEngine:
         data_provider: Optional[Callable[[str], List[List]]] = None,
         use_postgres: bool = True,
         take_profit_pct: Optional[float] = None,
+        # Correccion no2 (2026-09-29): el SL ya NO se deriva de TP/2 a pelo.
+        # En modo ROE llega DERIVADO y CLAMPADO contra la liquidacion. Si se
+        # deja en None se conserva el legacy TP/2.
+        stop_loss_pct: Optional[float] = None,
+        # Objetivos declarados en ROE (fraccion del margen). Se guardan en la
+        # posicion para que el ROE realizado sea medible en el libro.
+        take_profit_roe: Optional[float] = None,
+        stop_loss_roe: Optional[float] = None,
+        leverage: int = 1,
         learn_mode: Optional[bool] = None,
         auto_graduate: Optional[bool] = None,
         graduate_window: Optional[int] = None,
+        # Umbrales del gate (correccion no3). min_expectancy esta en la
+        # MISMA unidad que el expectancy del KB: % de capital por trade.
+        # 0.0 conserva la semantica anterior (solo el signo). El suelo de
+        # score cierra, si el operador lo quiere, el agujero de que
+        # `failed` sigue siendo operable (esta en QUERYABLE_STATUSES).
+        min_expectancy: Optional[float] = None,
+        min_scientific_score: Optional[float] = None,
         mode: str = "classic",
         burst_margin: float = 10.0,
         burst_leverage: int = 10,
@@ -88,13 +122,40 @@ class DecisionEngine:
         self.burst_leverage = burst_leverage
         self.take_profit_pct = (
             float(take_profit_pct) if take_profit_pct is not None else None)
-        self.learn_mode = (_learn_mode_default() if learn_mode is None
-                           else bool(learn_mode))
+        self._stop_loss_pct_override = (
+            float(stop_loss_pct) if stop_loss_pct is not None else None)
+        self.take_profit_roe = (
+            float(take_profit_roe) if take_profit_roe is not None else None)
+        self.stop_loss_roe = (
+            float(stop_loss_roe) if stop_loss_roe is not None else None)
+        try:
+            self.leverage = max(1, int(leverage))
+        except (TypeError, ValueError):
+            self.leverage = 1
+        # Politica en un solo sitio + rastro en learn_mode_audit.jsonl.
+        # El argumento explicito gana sobre la variable de entorno; si no
+        # hay ninguno de los dos, el gate queda CERRADO.
+        self.learn_mode, self.learn_mode_source = resolve_learn_mode(
+            learn_mode, state_dir, "startup")
+        self.learn_mode_requested = (None if learn_mode is None
+                                     else bool(learn_mode))
+        self.min_expectancy, self.min_scientific_score = (
+            resolve_gate_thresholds(min_expectancy, min_scientific_score))
+        logger.info(
+            "[gate] umbral: expectancy > %.5f (%% capital/trade), "
+            "scientific_score > %.3f",
+            self.min_expectancy, self.min_scientific_score)
+        if self.min_scientific_score > 0:
+            logger.warning(
+                "[gate] suelo de scientific_score activo (%.3f): las "
+                "hipotesis `failed` por score dejan de ser operables",
+                self.min_scientific_score)
         if self.learn_mode:
             logger.warning(
-                "[LEARN MODE] gate expectancy>0 DESACTIVADO temporalmente — "
-                "el sistema operara tambien hipotesis negativas (paper) para "
-                "alimentar el aprendizaje no supervisado")
+                "[LEARN MODE] gate expectancy>0 DESACTIVADO (origen=%s) — "
+                "el sistema operara tambien hipotesis negativas (paper); "
+                "cada entrada queda marcada learn_entry=true en el libro",
+                self.learn_mode_source)
 
         # PB (auto-graduacion): cuando los ultimos N cierres tienen media
         # positiva, LEARN_MODE se desactiva solo y el gate expectancy>0
@@ -118,6 +179,15 @@ class DecisionEngine:
                 self.burst_slippage_pct = 0.0003
         else:
             self.burst_slippage_pct = self.slippage_pct
+
+        # Suelo de coste del motor de paper (correccion no3): 2 x slippage
+        # por lado, en % del NOCIONAL. Es DIAGNOSTICO, no umbral: el
+        # umbral del gate (min_expectancy) vive en % de capital por
+        # trade, que es otra unidad. Sirve para poder afirmar si un edge
+        # del backtest sobrevive a lo que cuesta ejecutarlo en paper.
+        self.cost_floor_pct = round_trip_cost_pct(
+            self.burst_slippage_pct if self.mode == "burst"
+            else self.slippage_pct)
 
         # O6: sizing vol-targetado solo con gate activo (post-graduacion)
         self.vol_target_enabled = (
@@ -193,6 +263,10 @@ class DecisionEngine:
         self.paper_trades_path = os.path.join(state_dir, "paper_trades.jsonl")
         self.ledger_path = os.path.join(state_dir, "paper_executions.jsonl")
         self.open_positions: Dict[str, Dict[str, Any]] = {}
+        # Ultimo cierre real visto por simbolo con su marca de tiempo. Lo
+        # rellena la traza de cierres y lo reutiliza el marcado a mercado,
+        # para no pagar una segunda descarga en el mismo ciclo.
+        self._close_cache: Dict[str, Any] = {}
         self.paper_trade_counts: Dict[str, int] = {}
         self.feedback_delivered: Dict[str, bool] = {}
         self._load_state()
@@ -329,7 +403,14 @@ class DecisionEngine:
 
     @property
     def stop_loss_pct(self) -> Optional[float]:
-        """SL obligatorio 2:1 — siempre take_profit_pct / 2, sin excepcion."""
+        """SL en fraccion de PRECIO.
+
+        Prioridad: el SL explicito (derivado del objetivo de ROE y CLAMPADO
+        contra la liquidacion) -> si no, el legacy take_profit_pct / 2.
+        El fallback se mantiene para no romper llamantes que no pasan ROE.
+        """
+        if self._stop_loss_pct_override is not None:
+            return self._stop_loss_pct_override
         if self.take_profit_pct is None:
             return None
         return self.take_profit_pct / 2.0
@@ -355,6 +436,22 @@ class DecisionEngine:
         exit_px = float(exit_price) if exit_price is not None else entry_price
         # O2: slippage adverso tambien al cerrar
         exit_px = self._slip(exit_px, side, entering=False)
+        # En LIVE hay que mandar la orden de cierre al exchange; sin esto la
+        # posicion se quita del estado local y se queda ABIERTA en Bybit
+        # (correccion 6). En paper no se toca la red.
+        live_result = None
+        closer = getattr(self, "live_close_hook", None)
+        if closer is not None:
+            try:
+                live_result = closer(symbol, side, qty)
+            except Exception as exc:
+                # No se borra la posicion local: si el cierre fallo, la
+                # verdad sigue siendo que sigue abierta. Se registra el fallo
+                # para que la reconciliacion lo recupere.
+                logger.error("[live] cierre fallo %s %s: %s", symbol, side, exc)
+                live_result = {"ok": False, "error": str(exc)}
+                self.open_positions[key] = pos
+                self._persist_positions()
         pnl = qty * (exit_px - entry_price) * direction
         pnl_pct = (pnl / notional * 100.0) if notional else 0.0
         closure = {
@@ -372,6 +469,10 @@ class DecisionEngine:
             "exit_time": time.time(),
             "motivo_cierre": motivo,
         }
+        if live_result is not None:
+            # Rastro de si el cierre fue de verdad al exchange o solo local
+            # (correccion 6). Sin esto no se puede afirmar que algo se cerro.
+            closure["live_close"] = live_result
         self._append_state(self.ledger_path, closure)
         
         # Publish Event (Architect Pub/Sub Enhancement)
@@ -409,8 +510,11 @@ class DecisionEngine:
         return qty, notional
 
     def _entry_stop_loss_from_ledger(self, key: str) -> Optional[float]:
-        """SL vigente EN el momento de la entrada para key, derivado del
-        take_profit_price registrado en el libro (SL obligatorio = TP/2).
+        """SL vigente EN el momento de la entrada para key.
+
+        Prioridad: el `stop_loss_pct` registrado en la fila de entrada (que es
+        el clampado contra la liquidacion); si la fila es vieja y no lo trae,
+        se deriva del take_profit_price con la regla legacy TP/2.
         Devuelve None si no hay entrada con TP en el libro."""
         sl = None
         if os.path.exists(self.ledger_path):
@@ -428,6 +532,16 @@ class DecisionEngine:
                     if rec_key != key or "motivo_cierre" in rec:
                         continue
                     entry = float(rec.get("entry_price", 0.0))
+                    # El SL vigente en la entrada, si la fila nueva lo trae:
+                    # es el unico que respeta el clamp de liquidacion (con
+                    # apalancamientos altos SL != TP/2).
+                    recorded_sl = rec.get("stop_loss_pct")
+                    if recorded_sl is not None:
+                        try:
+                            sl = abs(float(recorded_sl))
+                            continue
+                        except (TypeError, ValueError):
+                            pass
                     tp_px = rec.get("take_profit_price")
                     if entry > 0 and tp_px is not None:
                         tp_frac = abs(float(tp_px) - entry) / entry
@@ -466,6 +580,9 @@ class DecisionEngine:
             return []
         candles = self.fetch_real_data(symbol)
         cur = float(candles[-1]["close"])
+        # Misma cifra que usa el cierre -> la marca del flotante y el
+        # precio de salida no pueden discrepar.
+        self._close_cache[symbol] = (time.time(), cur)
         closed = []
         for key in keys:
             pos = self.open_positions[key]
@@ -505,6 +622,104 @@ class DecisionEngine:
                 logger.warning("[exits] fallo revisando %s: %s",
                                symbol, exc.__class__.__name__)
         return [c for c in closed if c is not None]
+
+    # ------------------------------------------------------------------
+    # Mark-to-market (correccion no3: el guard veia 0,00% de drawdown
+    # con 5 posiciones abiertas en el SL)
+    # ------------------------------------------------------------------
+
+    #: Antiguedad maxima (s) para reutilizar el precio que ya se
+    #: descargo en este ciclo. El ciclo dura 60-3600 s segun el modo;
+    #: 300 s es un termino medio: no vuelve a bajar al exchange lo que se
+    #: acaba de mirar, y a la vez una posicion de hace 10 min no se
+    #: marca con un precio rancio.
+    MTM_MAX_AGE_S = 300.0
+
+    def _last_close(self, symbol: str,
+                    max_age_s: Optional[float] = None) -> Optional[float]:
+        """Ultimo cierre real del simbolo, o None si no se puede.
+
+        Reutiliza el precio que la traza de cierres ya trajo en este
+        ciclo (`_close_cache`); si no hay o esta rancio, lo pide otra
+        vez por la MISMA fuente que usa el cierre: `fetch_real_data`.
+        NUNCA inventa un precio: sin precio, la posicion queda sin
+        marcar y el guard lo cuenta como no marcado (falla cerrado).
+        """
+        age_limit = (self.MTM_MAX_AGE_S if max_age_s is None
+                     else float(max_age_s))
+        hit = self._close_cache.get(symbol)
+        if hit and (time.time() - hit[0]) <= age_limit:
+            return float(hit[1])
+        try:
+            candles = self.fetch_real_data(symbol)
+        except Exception as exc:
+            logger.warning("[mtm] sin precio de %s: %s", symbol,
+                           exc.__class__.__name__)
+            return None
+        cur = float(candles[-1]["close"])
+        self._close_cache[symbol] = (time.time(), cur)
+        return cur
+
+    def mark_to_market(self) -> Dict[str, Any]:
+        """PnL NO REALIZADO de las posiciones VIVAS, al precio actual.
+
+        Devuelve `{"pnl_usd", "rows", "unpriced", "open"}`.
+
+        Convenciones IDENTICAS a las del cierre real (`close_position`):
+        - precio: el mismo ultimo cierre que usa la traza de SL/TP;
+        - signo: `direction = +1 buy / -1 sell`;
+        - costes: `_slip(..., entering=False)`, o sea el mismo slippage
+          adverso de salida que sufre el cierre;
+        - tamano: `_last_entry_sizing` (mismo qty/nocional que el libro).
+        Duplicar estas reglas aqui fabricaria stop-loss falsos: por eso se
+        reutilizan las funciones y no se recalcula nada a mano.
+
+        `unpriced` = posiciones vivas que NO se han podido marcar (sin
+        precio, o sin tamano en el libro). No se las inventa a cero: se
+        declaran para que el guard decida.
+        """
+        rows = []
+        unpriced = []
+        total = 0.0
+        by_symbol: Dict[str, List[str]] = {}
+        for key in self.open_positions:
+            symbol = key.rsplit(":", 1)[-1]
+            by_symbol.setdefault(symbol, []).append(key)
+        for symbol, keys in sorted(by_symbol.items()):
+            price = self._last_close(symbol)
+            for key in keys:
+                pos = self.open_positions[key]
+                side = pos.get("side", "buy")
+                entry = float(pos.get("entry_price", 0.0) or 0.0)
+                qty, notional = self._last_entry_sizing(key)
+                if price is None or notional <= 0:
+                    # Sin precio o sin nocional conocido NO hay PnL que
+                    # calcular. Se declara; no se estima.
+                    unpriced.append(key)
+                    continue
+                direction = 1 if side == "buy" else -1
+                mark = self._slip(price, side, entering=False)
+                pnl = qty * (mark - entry) * direction
+                total += pnl
+                rows.append({
+                    "key": key,
+                    "symbol": symbol,
+                    "side": side,
+                    "entry_price": entry,
+                    "mark_price": mark,
+                    "quantity": qty,
+                    "notional_usd": notional,
+                    "pnl_usd": pnl,
+                    "pnl_pct": (pnl / notional * 100.0) if notional else 0.0,
+                    "opened_at": pos.get("opened_at"),
+                })
+        if unpriced:
+            logger.warning(
+                "[mtm] %d posicion(es) SIN marcar: %s — el guard las "
+                "cuenta como riesgo no medido",
+                len(unpriced), ", ".join(unpriced))
+        return {"pnl_usd": total, "rows": rows, "unpriced": unpriced,
+                "open": len(self.open_positions)}
 
     # ------------------------------------------------------------------
     # Market data (REAL Bybit data only)
@@ -573,14 +788,16 @@ class DecisionEngine:
     # ------------------------------------------------------------------
 
     def _family_of(self, hypothesis_id: str) -> str:
+        """Familia canonica de una hipotesis (feedback agregado por familia).
+
+        Delega en `quant_math.ml.families.family_of`: aqui habia una QUINTA
+        copia del vocabulario con su propia semantica, y con un
+        `strategy_type` en hoja o en mayusculas fragmentaba el agregado en
+        un bucket que nadie consultaba (correccion 4).
+        """
+        from quant_math.ml.families import family_of
         rec = self.hypotheses.get(hypothesis_id) or {}
-        st = rec.get("strategy_type", "")
-        st = getattr(st, "value", None) or str(st)
-        for fam in ("breakout", "mean_reversion", "momentum",
-                    "trend_following"):
-            if fam in st:
-                return fam
-        return st or "unknown"
+        return family_of(rec.get("strategy_type", ""))
 
     def _slip(self, price: float, side: str, entering: bool) -> float:
         """O2: precio adverso por slippage. Comprar entra caro y sale barato
@@ -743,6 +960,17 @@ class DecisionEngine:
             return
         self.learn_mode = False
         self.graduated = True
+        append_gate_audit(os.path.dirname(self.graduation_path), {
+            "ts": time.time(),
+            "event": "auto_graduation",
+            "learn_mode": False,
+            "source": "auto_graduate",
+            "window": self.graduate_window,
+            "mean_pnl_pct": round(mean, 6),
+            "ic90_lower_bound": round(ic90_lb, 6),
+            "families": sorted(fams),
+            "pid": os.getpid(),
+        })
         payload = {
             "graduated": True,
             "at": time.time(),
@@ -883,8 +1111,20 @@ class DecisionEngine:
 
         for cand in candidates:
             exp_c = float(cand.get("expectancy", 0.0))
-            if exp_c <= 0 and not self.learn_mode:
-                break                      # el resto tambien es <= 0
+            # El ranking es por expectancy DESC: en cuanto uno cae al
+            # umbral, todos los siguientes tambien (o son <= 0).
+            if exp_c <= self.min_expectancy and not self.learn_mode:
+                break
+            # El suelo de score solo muerde si el operador lo SUBE. Con
+            # el default 0.0 no filtra nada: es la semantica anterior
+            # exacta y no introduce un cambio de comportamiento medido
+            # por la correccion no3. Medido en el KB: 0 de 495 filas
+            # tienen score 0, asi que el filtro existe pero es inerte.
+            if (self.min_scientific_score > 0
+                    and float(cand.get("scientific_score", 0.0))
+                    <= self.min_scientific_score and not self.learn_mode):
+                continue    # no pasa el suelo de score: probar la
+                             # siguiente, que puede tenerlo mas bajo
             cand_id = cand["hypothesis_id"]
             if self.has_open_position(cand_id, symbol):
                 if first_guard_hyp is None:
@@ -948,6 +1188,12 @@ class DecisionEngine:
             "hypothesis_id": hypothesis_id,
             "expectancy": exp,
             "learn_entry": bool(self.learn_mode and exp <= 0),
+            "gate_open": bool(self.learn_mode),
+            "gate_min_expectancy": self.min_expectancy,
+            "min_scientific_score": self.min_scientific_score,
+            # Diagnostico de coste (ver __init__): el edge del backtest
+            # frente a lo que cuesta entrar y salir en paper.
+            "cost_floor_pct": self.cost_floor_pct,
             "scientific_score": float(best.get("scientific_score", 0.0)),
             "sizing_mult": round(sizing_mult, 4),
             "timestamp": time.time(),
@@ -960,6 +1206,11 @@ class DecisionEngine:
         if self.take_profit_pct is not None:
             position["take_profit_pct"] = self.take_profit_pct
             position["stop_loss_pct"] = self.stop_loss_pct
+        if self.take_profit_roe is not None:
+            position["take_profit_roe"] = self.take_profit_roe
+        if self.stop_loss_roe is not None:
+            position["stop_loss_roe"] = self.stop_loss_roe
+        position["leverage"] = self.leverage
         self.open_positions[key] = position
         self._append_state(self.positions_path, position)
 
@@ -974,8 +1225,12 @@ class DecisionEngine:
         # Publish Entry Event (Architect Pub/Sub Enhancement)
         bus.publish("trade_opened", symbol=symbol, hypothesis_id=hypothesis_id, side=side)
 
-        logger.info("[entry] %s %s (hyp=%s, expectancy=%.4f)",
-                    side.upper(), symbol, hypothesis_id, signal["expectancy"])
+        logger.info(
+            "[entry] %s %s (hyp=%s, expectancy=%.4f, umbral=%.4f, "
+            "score=%.3f, learn=%s%s)",
+            side.upper(), symbol, hypothesis_id, signal["expectancy"],
+            self.min_expectancy, signal["scientific_score"],
+            bool(self.learn_mode), "/EXPLORACION" if self.learn_mode else "")
         return signal
 
     def run_cycle(self) -> Dict[str, Optional[Dict[str, Any]]]:
