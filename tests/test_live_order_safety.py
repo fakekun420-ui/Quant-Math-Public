@@ -760,6 +760,78 @@ def test_una_entrada_que_si_se_abrió_no_se_retira(fake_api):
     assert key in eng.open_positions, "una entrada abierta no se retira"
 
 
+def test_el_wizard_devuelve_aislado_TAL_COMO_se_contesta(fake_api, monkeypatch):
+    """EL BUG QUE SE LLEVO HORAS DE OPERACIONES (2026-09-30).
+
+    `_ask_isolated` tenia un `not bool(...)` delante, o sea que devolvia lo
+    CONTRARIO de lo que el operador elegia:
+
+        contesta NO  ->  confirm()=False  ->  not False = True
+        se guardaba require_isolated_margin=True  y el motor rechazaba
+        TODAS las ordenes.
+
+    Leonardo lo vio en pantalla ("No") y el sistema hizo lo contrario:
+    cero entradas en horas, con el log lleno de "margen cross, se pidio
+    isolated". Un bot que no opera parece un bot aprendiendo, y por eso el
+    sintoma no senala a nadie al culpable.
+
+    Se prueban LAS DOS respuestas. Un solo caso dejaria pasar la mitad de
+    la inversion, que es justo el otro fallo posible.
+    """
+    import quant_math.cli.main as cli
+    class _Respuesta:
+        def __init__(self, valor):
+            self.valor = valor
+
+        def unsafe_ask(self):
+            return self.valor
+
+    def _confirmar(*_a, **_k):
+        return _Respuesta(respuesta)
+
+    class _Plan:
+        sl_price_distance = 0.005
+        liquidation_price_distance = 0.0167
+
+    # --- contesto SI: quiero exigir aislado ---
+    respuesta = True
+    monkeypatch.setattr(cli.questionary, "confirm", _confirmar)
+    assert cli._ask_isolated(5.0, _Plan()) is True, (
+        "contestar SI tiene que guardar require_isolated_margin=True")
+
+    # --- contesto NO: quiero operar en cruce ---
+    respuesta = False
+    assert cli._ask_isolated(5.0, _Plan()) is False, (
+        "contestar NO tiene que guardar require_isolated_margin=False; "
+        "invertirlo fue el bug que dejo el bot sin operar")
+
+
+def test_el_wizard_de_nocional_tampoco_puede_invertir(fake_api, monkeypatch):
+    """El mismo riesgo en la otra pregunta del wizard.
+
+    `_ask_notional_cap` NO lleva confirmacion, se teclea el numero, asi que
+    la inversion ahi seria otra cosa: que un valor valido se rechace o que
+    uno invalido se acepte. Se comprueban los dos extremos.
+    """
+    import quant_math.cli.main as cli
+    respuesta = {"v": "1.0"}
+
+    class _Texto:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def unsafe_ask(self):
+            return respuesta["v"]
+
+    monkeypatch.setattr(cli.questionary, "text", _Texto)
+    monkeypatch.setattr(cli.questionary, "confirm",
+                        lambda *a, **k: type("R", (), {"unsafe_ask":
+                                                       lambda s: True})())
+    assert cli._ask_notional_cap(5.0, 50, 0.005) == pytest.approx(1.0)
+    respuesta["v"] = "0.5"
+    assert cli._ask_notional_cap(5.0, 50, 0.005) == pytest.approx(0.5)
+
+
 def test_read_back_margin_mode_traduce_el_tradeMode_de_bybit():
     """Bybit V5 devuelve 0=cruce, 1=aislado. Que se traduzca bien importa:
     invertirlo abriria justo lo que se quiere impedir."""

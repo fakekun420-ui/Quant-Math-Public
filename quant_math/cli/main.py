@@ -682,7 +682,17 @@ def _ask_isolated(initial_capital: float, roe_plan) -> bool:
     console.print(
         "[dim]Con nocional pequeno el cruce no da; con uno grande, "
         "una sola posicion puede vaciarte la cuenta.[/dim]")
-    return not bool(questionary.confirm(
+    # OJO: se devuelve TAL COMO se contesta, sin invertirlo.
+    #
+    # BUG REAL (2026-09-30): aqui habia un `not bool(...)` delante, o sea
+    # que la funcion devolvia lo CONTRARIO de lo que el operador elegia.
+    # Leonardo contesto "NO" en el wizard, se guardo
+    # `require_isolated_margin=True` y el sistema rechazo TODAS las
+    # operaciones: cero entradas en horas de ejecucion, con el log lleno de
+    # "margen cross, se pidio isolated". Un bot que no opera parece un
+    # bot learning y es un bot parado, y el sintoma (cero operaciones)
+    # no senala para nada al culpable.
+    return bool(questionary.confirm(
         "¿Exigir margen aislado? (SÍ = no se opera si la cuenta no lo admite; "
         "NO = se opera en cruce, con la pérdida acotada por tu nocional)",
         default=False).unsafe_ask())
