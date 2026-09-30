@@ -410,6 +410,36 @@ def test_el_motor_tampoco_usa_setdefault_para_el_gate():
     assert calls == []
 
 
+def test_ningun_wizard_puede_dejar_el_tope_de_nocional_sin_preguntar():
+    """El freno tiene que estar en AMBOS wizards, y no como valor fijo.
+
+    MEDIDO el 2026-09-30: el tope de nocional se implemento con defecto
+    `None` (sin tope) porque en el orquestador asi es lo correcto: impose
+    una politica y no debe activarse solo. Pero el CLI construye el
+    config, y si no lo pone el wizard devuelve `None` sin preguntar nada y
+    el operador se queda con posiciones 4x su capital sin enterarse.
+
+    Este test lee el SOURCE de los wizards, no su salida, porque un wizard
+    es interactivo y no se puede ejecutar en un test. Y mira que se
+    PREGUNTE (`_ask_notional_cap`), no que se escriba un numero fijo: un
+    1.0 hardcodeado seria mejor que nada, pero seguiria siendo una
+    decision del coder y no del operador.
+    """
+    import inspect
+    import quant_math.cli.main as cli
+    for nombre in ("wizard", "burst_wizard"):
+        fn = getattr(cli, nombre, None)
+        assert fn is not None, f"no encuentro {nombre} en el CLI"
+        src = inspect.getsource(fn)
+        assert '"max_notional_per_entry_pct"' in src, (
+            nombre + " no pasa el tope de nocional: devolveria None sin "
+            "preguntar y el operador operaria descuadrado")
+        assert "_ask_notional_cap" in src, (
+            nombre + " pasa el tope pero con un valor FIJO: tiene que "
+            "PREGUNTAR, porque depende del capital y del apalancamiento "
+            "que eligio el operador")
+
+
 def test_el_wizard_pregunta_y_por_defecto_explora():
     """El wizard PREGUNTA, y el default de la pregunta es EXPLORAR.
 

@@ -649,6 +649,70 @@ def _roe_plan_panel(plan) -> str:
     return line
 
 
+from quant_math.risk.roe_targets import DEFAULT_MAX_RISK_PER_TRADE_PCT
+
+
+def _ask_notional_cap(initial_capital: float, leverage: int,
+                     sl_distance: float) -> Optional[float]:
+    """Pregunta el techo de NOCIONAL y ensena lo que haria el riesgo solo.
+
+    No se puede dejar en silencio porque el numero que sale sin preguntar
+    (0,10 USDT de riesgo) es CORRECTO y aun asi produce una posicion 4x
+    mayor que el capital. Un tope de riesgo que se ve bien mientras la
+    posicion es descuadrada es justo el fallo que casi se cuela.
+
+    Se enseña la aritmética concreta de SU capital, no una regla generica.
+    """
+    riesgo = float(initial_capital) * DEFAULT_MAX_RISK_PER_TRADE_PCT
+    por_riesgo = (riesgo / float(sl_distance)) if sl_distance else 0.0
+    veces = por_riesgo / float(initial_capital) if initial_capital else 0.0
+    console.print()
+    console.print(
+        f"[yellow]Con {initial_capital:.2f} USDT de capital, {leverage}x y un "
+        f"SL al {sl_distance*100:.2f}% de precio:[/yellow]")
+    console.print(
+        f"  el tope de RIESGO ({DEFAULT_MAX_RISK_PER_TRADE_PCT:.0%} = "
+        f"{riesgo:.2f} USDT) autorizaría {por_riesgo:.2f} USDT de nocional"
+        if por_riesgo else "")
+    console.print(
+        f"  [red]eso es {veces:.1f}x tu capital[/red]" if veces > 1.05
+        else f"  eso es {veces:.2f}x tu capital")
+    console.print(
+        "[dim]El riesgo y el tamaño no son lo mismo con apalancamiento: un "
+        "SL corto deja abrir una posición enorme perdiendo poco.[/dim]")
+    while True:
+        raw = questionary.text(
+            "Tope de nocional por entrada, como fracción del capital "
+            "(1,0 = nunca mayor que tu capital; 0 = sin tope):",
+            default="1.0").unsafe_ask()
+        if raw is None:
+            return 1.0
+        raw = str(raw).strip().replace(",", ".")
+        if raw in ("0", "0.0", ""):
+            console.print(
+                "[red]Sin tope: la posición podrá ser varias veces tu "
+                "capital. Si es lo que quieres, escríbelo de nuevo.[/red]")
+            if questionary.confirm("¿Seguro? De verdad, ¿sin tope?",
+                                   default=False).unsafe_ask():
+                return None
+            continue
+        try:
+            val = float(raw)
+        except ValueError:
+            console.print("[red]Número inválido[/red]")
+            continue
+        if not 0 < val <= 1:
+            console.print("[red]Debe estar en (0, 1][/red]")
+            continue
+        if val * float(initial_capital) < por_riesgo:
+            console.print(
+                f"[dim]Con {val:.2f} la posición máxima será "
+                f"{val*float(initial_capital):.2f} USDT, por debajo de los "
+                f"{por_riesgo:.2f} que daría el riesgo. O sea: el tope de "
+                f"riesgo deja de ser el que manda.[/dim]")
+        return val
+
+
 def _ask_roe_plan(mode: str, market: str, leverage: int,
                   ask_lev, max_attempts: int = 3):
     """Valida el apalancamiento elegido contra el plan ROE ANTES de arrancar.
@@ -789,6 +853,24 @@ def wizard() -> Optional[Dict]:
             # correccion no3: puerta de decision, EXPLICITA. False (lo
             # que se elige por defecto) = gate cerrado.
             "learn_mode": bool(learn_mode),
+            # Techo de NOCIONAL por entrada, como fraccion del capital.
+            #
+            # MEDIDO el 2026-09-30: con 5 USDT de capital, 50x y SL al
+            # 0,5%, el tope de RIESGO daba 0,10 USDT y con un SL del 0,5%
+            # eso autoriza 0,10/0,005 = 20 USDT, o sea 4x el capital. El
+            # riesgo era el correcto, pero la POSICION era cuatro veces
+            # mas grande de la que se pedia. El riesgo y el tamano no son
+            # lo mismo con apalancamiento: un SL corto deja abrir una
+            # posicion enorme perdiendo poco, y el capital no limita nada
+            # porque el margen es una fraccion minuscula del nocional.
+            #
+            # 1,0 = "la posicion nunca puede ser mayor que mi capital".
+            # Es un tope DURO que se aplica al final de la cadena de
+            # topes, asi que ningun otro puede dejar el nocional por
+            # encima. None lo desactiva, y entonces el apalancamiento
+            # manda: por eso NO es opcional aqui.
+            "max_notional_per_entry_pct": _ask_notional_cap(
+                initial_capital, leverage, roe_plan.sl_price_distance),
         }
     except (AttributeError):
         # ESC / pregunta cancelada -> volver al menú.
@@ -891,6 +973,11 @@ def burst_wizard() -> Optional[Dict]:
             "burst_leverage": leverage,
             # correccion no3: puerta de decision, EXPLICITA
             "learn_mode": bool(learn_mode),
+            # Mismo freno que en clasico. En burst el nocional sale de
+            # `margen x apalancamiento`, luego sin este techo el
+            # apalancamiento tambien manda sobre el tamano.
+            "max_notional_per_entry_pct": _ask_notional_cap(
+                initial_capital, leverage, 0.005),
         }
     except (AttributeError):
         return None
