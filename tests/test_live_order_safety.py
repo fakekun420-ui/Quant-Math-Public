@@ -38,6 +38,12 @@ class FakeAPI:
     leverage_real = 10
     #: margen disponible que declara la cuenta (None = no se sabe)
     margin_available = 100000.0
+    #: modo de margen REAL que devuelve el exchange. Por defecto "isolated",
+    #: que es lo que el motor pide y lo unico aceptable: en CRUCE la
+    #: perdida de una posicion la paga toda la cuenta.
+    margin_mode_real = "isolated"
+    #: si es str, set_margin_mode() lanza ese error (con su motivo dentro)
+    margin_mode_error = None
 
     def __init__(self, exchange_id="bybit", sandbox=False, api_key=None,
                  api_secret=None, data_venue=None):
@@ -49,6 +55,8 @@ class FakeAPI:
         FakeAPI.instances.append(self)
 
     def set_margin_mode(self, symbol, mode, params=None):
+        if self.margin_mode_error:
+            raise RuntimeError(self.margin_mode_error)
         self.margin_mode = (symbol, mode)
 
     def set_leverage(self, symbol, leverage, params=None):
@@ -58,6 +66,9 @@ class FakeAPI:
 
     def read_back_leverage(self, symbol):
         return self.leverage_real
+
+    def read_back_margin_mode(self, symbol):
+        return self.margin_mode_real
 
     def available_margin(self):
         return self.margin_available
@@ -83,6 +94,7 @@ def fake_api(monkeypatch):
     FakeAPI.leverage_error = None
     FakeAPI.leverage_real = 10
     FakeAPI.margin_available = 100000.0
+    FakeAPI.margin_mode_real = "isolated"
     import data_acquisition.data_sources.exchanges as ex
     monkeypatch.setattr(ex, "ExchangeAPI", FakeAPI)
     # Claves FICTICIAS solo para poder construir una config live: el bloqueo
@@ -437,6 +449,131 @@ def test_set_leverage_trata_el_ya_puesto_como_correcto(fake_api):
     api.exchange = _Client(Exception('retCode 110001 order does not exist'))
     with pytest.raises(Exception):
         api.set_leverage("XRP/USDT:USDT", 50)
+
+
+# ---------------------------------------------------------------------------
+# MODO DE MARGEN (2026-09-30)
+#
+# MEDIDO: la cuenta estaba en `tradeMode=0` (CRUCE) en BTC, XRP y ETH, y
+# el motor abria igual: `set_margin_mode` fallaba, se escribia un warning
+# y se seguia. En cruce la perdida de una posicion la paga TODA la
+# cuenta, no solo el margen de esa posicion: con 5 USDT de capital, la
+# diferencia entre "perdi 0,10" y "perdi los 5" es este ajuste.
+# ---------------------------------------------------------------------------
+
+
+def test_en_margen_cruce_se_cierra_la_operacion(fake_api):
+    """Se pidio isolated y la posicion esta en CRUCE: se cierra."""
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.margin_mode_real = "cross"
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade["action"] == "live_failed", "no debio aceptar la operacion"
+    assert trade["margin_mode"] == "cross"
+    assert "isolated" in trade["error"]
+    assert "aislado" in trade["reason"]
+
+    api = fake_api.instances[-1]
+    assert len(api.orders) == 2, "debio abrir y cerrar"
+    assert api.orders[1]["params"].get("reduceOnly") is True
+    assert api.orders[1]["side"] == "sell"
+
+
+def test_un_margen_ilegible_tambien_cierra(fake_api):
+    """Si el exchange NO dice el modo de margen, no se opera.
+
+    None no es "todo bien": es no saber, y en cruce unknowingly es perder
+    mas de lo que dice el plan.
+    """
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.margin_mode_real = None
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade["action"] == "live_failed"
+    assert trade["margin_mode"] is None
+    assert trade["auto_closed"]["ok"] is True
+    assert "ilegible" in trade["error"]
+
+
+def test_en_aislado_la_operacion_pasa(fake_api):
+    """El camino bueno: isolated verificado, se opera con normalidad."""
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.margin_mode_real = "isolated"
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade.get("action") != "live_failed", trade.get("error")
+    assert len(fake_api.instances[-1].orders) == 1, "no se cierra nada"
+    assert "stopLoss" in fake_api.instances[-1].orders[0]["params"]
+
+
+def test_si_el_islaado_es_imposible_el_motivo_llega_al_informe(fake_api):
+    """MEDIDO el 2026-09-30: la cuenta testnet es una UNIFIED ACCOUNT y
+    Bybit responde `100028 unified account is forbidden` al pedir aislado.
+
+    O sea que en ESA cuenta no es que el sistema falle: es que el aislado
+    NO EXISTE y no se va a conseguir reintentando. Por eso el motivo se
+    guarda y se devuelve: un "operacion rechazada" sin causa es
+    inaccionable, y el operador no puede arreglar lo que no se le explica.
+    """
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10)
+    FakeAPI.margin_mode_real = "cross"
+    FakeAPI.margin_mode_error = (
+        'bybit {"retCode":100028,"retMsg":"unified account is forbidden"}')
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade["action"] == "live_failed"
+    assert "100028" in trade["margin_mode_origen"], (
+        "el motivo real del exchange tiene que llegar al informe")
+    assert "unified account" in trade["como_resolver"]
+    assert "require_isolated_margin=False" in trade["como_resolver"], (
+        "tiene que decir cual es la salida, no solo que fallo")
+
+
+def test_con_require_isolated_false_se_opera_a_conciencia(fake_api):
+    """Ponerlo a False es una DECISION, no un forget: entonces se abre y
+    se avisa por el log de que la perdida la paga toda la cuenta."""
+    orch, signal = _orch_lev(fake_api, leverage_real=10, lev_pedido=10,
+                             require_isolated_margin=False)
+    FakeAPI.margin_mode_real = "cross"
+    trade = orch._execute_live_order(signal, 100.0, "buy", 100.0, 10, 1.0)
+
+    assert trade.get("action") != "live_failed", trade.get("error")
+    assert len(fake_api.instances[-1].orders) == 1, "se abre, no se cierra"
+    assert "stopLoss" in fake_api.instances[-1].orders[0]["params"], (
+        "y sigue yendo protejida aunque se acepte el cruce")
+
+
+def test_read_back_margin_mode_traduce_el_tradeMode_de_bybit():
+    """Bybit V5 devuelve 0=cruce, 1=aislado. Que se traduzca bien importa:
+    invertirlo abriria justo lo que se quiere impedir."""
+    # OJO: se usa REAL_EXCHANGE_API, NO un import de ExchangeAPI aqui
+    # dentro. El fixture `fake_api` sustituye esa clase por el doble, y un
+    # import en el cuerpo del test traeria el doble: el metodo probado
+    # seria el del doble y el test pasaria sin probar nada. (Ya paso una
+    # vez en este mismo fichero con set_leverage.)
+    assert REAL_EXCHANGE_API is not None
+
+    class _Cliente:
+        def __init__(self, filas):
+            self.filas = filas
+            self._require_auth = None
+
+        def privateGetV5PositionList(self, params):
+            return {"result": {"list": self.filas}}
+
+    api = object.__new__(REAL_EXCHANGE_API)
+    api._require_auth = lambda: None
+    api._to_swap_symbol = lambda s: s
+
+    for valor, esperado in ((1, "isolated"), (0, "cross")):
+        api.exchange = _Cliente([{"tradeMode": valor}])
+        assert api.read_back_margin_mode("BTCUSDT") == esperado, (
+            f"tradeMode={valor} deberia ser {esperado}")
+
+    # Sin dato o ilegible -> None, que es "NO SE SABE", no "aislado".
+    for filas in ([], [{"otro": 1}], [{"tradeMode": "x"}]):
+        api.exchange = _Cliente(filas)
+        assert api.read_back_margin_mode("BTCUSDT") is None
 
 
 def test_un_auto_cierre_que_no_puede_mandar_no_grita_alarma_falsa(fake_api):

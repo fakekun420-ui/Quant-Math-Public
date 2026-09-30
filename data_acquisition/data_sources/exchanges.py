@@ -495,6 +495,52 @@ class ExchangeAPI:
                     continue
         return None
 
+    def read_back_margin_mode(self, symbol: str) -> Optional[str]:
+        """Modo de margen REAL de la posicion, leido del exchange.
+
+        Devuelve "isolated", "cross" o None si no se pudo saber. None NO es
+        "aislado": quien llama tiene que tratar un None como desconfianza.
+
+        Por que importa mas de lo que parece: en modo CRUCE la perdida de
+        una posicion la paga TODA la cuenta, no solo el margen de esa
+        posicion. Con 5 USDT de capital, la diferencia entre "perdi 0,10"
+        y "perdi los 5" es el modo de margen. Medido el 2026-09-30: la
+        cuenta estaba en `tradeMode=0` (cruce) en BTC, XRP y ETH.
+        """
+        self._require_auth()
+        swap = self._to_swap_symbol(symbol)
+        # OJO: los endpoints PRIVADOS de Bybit V5 no aceptan el formato de
+        # ccxt. Hay que pasar `BTCUSDT`, no `BTC/USDT:USDT`.
+        #
+        # Y el truco NO es "quitar barras y dos puntos": `BTC/USDT:USDT`
+        # se quedaria en `BTCUSDTUSDT`, que tampoco existe. Hay que
+        # quitar el sufijo del PERPETUAL (`:USDT`) y despues las barras.
+        #
+        # Medido el 2026-09-30: con el simbolo mal formado este metodo
+        # devolvia SIEMPRE None, o sea que la verificacion PARECIA
+        # funcionar cuando en realidad no leia nada. Un chequeo que siempre
+        # responde "no se" es peor que no tenerlo, porque aparenta que ha
+        # pasado cuando solo ha fallado en silencio.
+        crudo = swap.split(":", 1)[0].replace("/", "").upper()
+        try:
+            resp = self.exchange.privateGetV5PositionList(
+                {"category": "linear", "symbol": crudo, "limit": 1})
+        except Exception as exc:
+            logger.warning("[margin_mode] no se pudo leer: %s", exc)
+            return None
+        filas = (resp.get("result") or {}).get("list") or []
+        if not filas:
+            return None
+        modo = filas[0].get("tradeMode")
+        if modo is None:
+            return None
+        try:
+            modo = int(modo)
+        except (TypeError, ValueError):
+            return None
+        # Bybit V5: 0 = cross, 1 = isolated.
+        return "isolated" if modo == 1 else "cross"
+
     def available_margin(self) -> Optional[float]:
         """MARGEN DISPONIBLE de la cuenta, en la moneda de margen.
 

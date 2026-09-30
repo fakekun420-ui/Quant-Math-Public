@@ -138,6 +138,19 @@ class OrchestratorConfig:
     # None = sin tope (comportamiento anterior). Se recomienda fijarlo
     # siempre que se opere con apalancamiento.
     max_notional_per_entry_pct: Optional[float] = None
+    # ¿Exigir margen AISLADO antes de operar?
+    #
+    # MEDIDO el 2026-09-30: la cuenta de testnet es una UNIFIED ACCOUNT y
+    # Bybit responde `100028 unified account is forbidden` al pedir aislado.
+    # O sea que en ESA cuenta el modo aislado no existe: esta en cruce y no
+    # se puede cambiar.
+    #
+    # Con True (por defecto) el motor se NIEGA a abrir si la posicion no
+    # esta aislada, porque en cruce la perdida la paga toda la cuenta. En
+    # una unified account eso dejaria el sistema sin operar nunca, y por eso
+    # es una decision del operador y no un default silencioso: ponerlo a
+    # False es decir "se que estoy en cruce y acepto el riesgo de cuenta".
+    require_isolated_margin: bool = True
     # Cada cuantos ciclos se reconcilian las posiciones contra el exchange.
     # Por defecto TODAS LAS HORAS (24 ciclos a intervalo 1h = una vez por
     # hora), no 0. Con 0 no se comparaba nunca y una posicion huerfana con
@@ -1803,16 +1816,18 @@ class Orchestrator:
             # mas lejos, el SL puede quedar IRREACHABLE y la posicion real
             # es 5x mas grande de la que se cree. Es la misma cosa que
             # operar con datos falsos, y por eso aqui FALLA CERRADO.
+            _modo_error = None
             try:
                 api.set_margin_mode(signal["symbol"], "isolated")
             except Exception as exc:
-                # El modo de margen tambien importa: en cross una perdida
-                # de una posicion se paga con TODA la cuenta. Se avisa pero
-                # no se bloquea, porque el exchange puede rechazar el
-                # cambio si ya hay posicion y aun asi el isolated estar
-                # puesto de antes.
-                logger.warning("[live] set_margin_mode fallo (%s); reviso "
-                               "que la posicion quede aislada", exc)
+                # El motivo se GUARDA, no se pierde en un warning: es lo
+                # que permite decirle al operador que hacer. Medido el
+                # 2026-09-30: `100028 unified account is forbidden`, o sea
+                # que en una unified account el aislado no es una opcion y
+                # no se va a conseguir reintentando.
+                _modo_error = str(exc)[:200]
+                logger.warning("[live] set_margin_mode fallo (%s); se "
+                               "comprobara donde esta la posicion", exc)
             try:
                 api.set_leverage(signal["symbol"], lev_used)
             except Exception as exc:
@@ -1925,6 +1940,80 @@ class Orchestrator:
                         "reason": "apalancamiento distinto del pedido"}
             logger.info("[live] apalancamiento VERIFICADO en el exchange: "
                         "%sx (era lo pedido)", real)
+
+            # --- MODO DE MARGEN: tambien se COMPRUEBA -----------------
+            #
+            # Antes: `set_margin_mode` fallaba, se escribia un warning y se
+            # abria igual. Medido el 2026-09-30: la cuenta estaba en CRUCE
+            # (tradeMode=0) en BTC, XRP y ETH.
+            #
+            # En cruce la perdida de una posicion la paga TODA la cuenta,
+            # no solo el margen de esa posicion. Con 5 USDT de capital la
+            # diferencia entre "perdi 0,10" y "perdi los 5" es exactamente
+            # este ajuste. Es el mismo fallo que el apalancamiento: se
+            # suponia en vez de comprobarse.
+            try:
+                modo = api.read_back_margin_mode(signal["symbol"])
+            except Exception as exc:
+                logger.warning("[live] no se pudo leer el modo de margen: %s",
+                               exc)
+                modo = None
+            # El motivo del fallo del `set_margin_mode` se guarda para poder
+            # explicarle al operador POR QUE no esta aislado, en vez de
+            # dejarle un "operacion rechazada" sin causa accionable.
+            if modo is not None and modo != "isolated" \
+                    and not self.config.require_isolated_margin:
+                logger.error(
+                    "[live] MARGEN CRUCE y require_isolated_margin=False: "
+                    "se opera A CONSCIENCIA. En cruce la perdida de esta "
+                    "posicion la paga TODA la cuenta, no solo su margen. "
+                    "Origen del aviso al ponerlo: %s", _modo_error or "?")
+            if modo is not None and modo != "isolated" \
+                    and self.config.require_isolated_margin:
+                logger.error("[live] MARGEN CRUCE: se pidio isolated y la "
+                             "posicion esta en %s; se cierra", modo)
+                _cerrado = self._cerrar_si_no_verifica(
+                    api, signal["symbol"], side, qty,
+                    f"margen {modo} != isolated")
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed", "symbol": signal["symbol"],
+                        "error": f"margen {modo}, se pidio isolated",
+                        "margin_mode": modo,
+                        "margin_mode_origen": _modo_error,
+                        "auto_closed": _cerrado,
+                        "reason": "margen no aislado",
+                        "como_resolver": (
+                            "Bybit no permite margen aislado en una unified "
+                            "account (retCode 100028). O se crea una cuenta "
+                            "CLASICA, o se pone require_isolated_margin=False "
+                            "y se acepta que la perdida la paga toda la "
+                            "cuenta.")}
+            if modo is None and self.config.require_isolated_margin:
+                logger.error("[live] el exchange NO dice el modo de margen; "
+                             "no se fia, se cierra")
+                _cerrado = self._cerrar_si_no_verifica(
+                    api, signal["symbol"], side, qty,
+                    "modo de margen ilegible")
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed", "symbol": signal["symbol"],
+                        "error": "modo de margen ilegible",
+                        "margin_mode": None, "auto_closed": _cerrado,
+                        "reason": "modo de margen no verificable"}
+            # Si se llega aqui: o es "isolated", o el operador puso
+            # require_isolated_margin=False y ya se le aviso. Ojo: este
+            # `if` con la lista de motivos tiene que ser el UNICO sitio
+            # que decide. Hubo un duplicado que hacia que la rama blanda
+            # ejecutase el log de "a conciencia" y acto seguido cerrara
+            # igual, que es justo lo contrario de lo que significa.
+            if modo == "isolated":
+                logger.info("[live] modo de margen VERIFICADO: isolated "
+                            "(en cruce la perdida la paga toda la cuenta)")
 
             try:
                 api.close()
