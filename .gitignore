@@ -22,3 +22,12 @@ runtime/
 # Knowledge graph index (generated, large)
 graphify-out/
 .venv/
+
+# Node — ESTABA FALTANDO y por eso webui/frontend/node_modules/indleaba
+# 12.938 ficheros en git (de 13.158 rastreables). Un node_modules no se
+# versiona nunca: se reinstala con `npm ci` a partir de package-lock.json.
+# Sin esta linea, el .gitignore de la raiz no lo cubria porque node_modules
+# cuelga de webui/ y no hay ningun .gitignore dentro de webui/.
+node_modules/
+webui/frontend/dist/
+webui/frontend/.vite/
