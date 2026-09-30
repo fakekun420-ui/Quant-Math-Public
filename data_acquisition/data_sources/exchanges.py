@@ -30,9 +30,34 @@ def api_keys_present() -> bool:
     return bool(os.getenv("BYBIT_API_KEY") and os.getenv("BYBIT_API_SECRET"))
 
 
+# DOS EJES DISTINTOS, NO CONFUNDIR (correccion 5, 2026-09-29)
+# ------------------------------------------------------------------
+# 1. DOMINIO DE DATOS -> de donde salen las VELAS (publico, sin claves)
+# 2. VENUE DE ORDENES -> donde acaban las ordenes (privado, con claves)
+#
+# Antes un solo flag (`sandbox`) gobernaba los dos, y como `.env` trae
+# BYBIT_TESTNET=true el sistema leia velas del TESTNET: precios que no son
+# los del mercado. Medido el 2026-09-29, BTCUSDT ultimo cierre:
+#   mainnet 83.465,6   testnet 83.532,6   -> 67 USD de diferencia.
+# Decision de Leonardo 2026-09-29: los datos son del mercado real.
+# El venue de ordenes NO cambia de default: sigue siendo testnet-seguro.
 def is_testnet() -> bool:
-    """True unless BYBIT_TESTNET is explicitly false."""
+    """VENUE DE ORDENES: True salvo que BYBIT_TESTNET se ponga a false.
+
+    Esto NO dice nada de de donde salen los velas — para eso, `data_sandbox()`.
+    Se mantiene el default True a proposito: es lo que evita operar en real
+    por accidente. No lo cambies sin revisar el bloqueo de mainnet.
+    """
     return os.getenv("BYBIT_TESTNET", "true").lower() not in ("0", "false", "no")
+
+
+def data_sandbox() -> bool:
+    """DOMINIO DE DATOS: False (mercado real) salvo que se pida sandbox.
+
+    Por defecto mainnet. Solo se activa con BYBIT_DATA_SANDBOX=1, y entonces
+    hay que decirlo a proposito: el research se mide contra el mercado real.
+    """
+    return os.getenv("BYBIT_DATA_SANDBOX", "").lower() in ("1", "true", "yes")
 
 
 class ExchangeAPI:
@@ -77,26 +102,71 @@ class ExchangeAPI:
             api_secret = os.getenv("BYBIT_API_SECRET") or None
         env_testnet = os.getenv("BYBIT_TESTNET", "").lower() in ("1", "true", "yes")
         if env_testnet:
+            # SOLO el venue de ordenes. Los datos no se ven afectados: antes
+            # este bloque metia las velas en el sandbox y por eso el research
+            # corria contra precios del testnet (correccion 5).
             sandbox = True
 
-        exchange_config = {
+        base_config = {
             'enableRateLimit': True,
             'options': {
                 'defaultType': 'swap',  # USDT perpetuals (Futures)
             }
         }
 
+        # 1) Venue de ORDENES: privado, respeta `sandbox` (testnet por
+        #    defecto). Es el unico que lleva claves.
+        order_config = dict(base_config)
         if api_key:
-            exchange_config['apiKey'] = api_key
+            order_config['apiKey'] = api_key
         if api_secret:
-            exchange_config['secret'] = api_secret
-
+            order_config['secret'] = api_secret
         if sandbox:
-            exchange_config['sandbox'] = True
+            order_config['sandbox'] = True
+        self.exchange = exchange_class(order_config)
 
-        self.exchange = exchange_class(exchange_config)
+        # 2) Cliente de DATOS: publico, mainnet por defecto. Sin claves y
+        #    sin sandbox salvo que se pida explicitamente con
+        #    BYBIT_DATA_SANDBOX=1. Son dos clientes y no uno porque en ccxt
+        #    `sandbox` afecta a velas Y a ordenes a la vez: con un solo
+        #    objeto no se puede leer el mercado real y mandar a testnet.
+        self._data_exchange = None
+        self._data_sandbox = data_sandbox()
+        # El sandbox REAL del venue de ordenes, ya con el env aplicado. Se
+        # guarda aparte porque `is_testnet()` y este valor no siempre
+        # coinciden (el primero asume True por defecto), y comparar contra
+        # el equivocado hacia que el atajo de abajo reutilizara el cliente
+        # equivocado.
+        self._order_sandbox = bool(sandbox)
 
-        logger.info(f"Initialized {exchange_id} exchange connection")
+        logger.info(
+            "Initialized %s exchange connection (ordenes: %s | datos: %s)",
+            exchange_id,
+            "testnet" if sandbox else "mainnet",
+            "testnet" if self._data_sandbox else "mainnet",
+        )
+
+    @property
+    def data_client(self):
+        """Cliente de mercado (velas, libro, ticker). NUNCA lleva ordenes.
+
+        Se construye laxo para no abrir una segunda conexion si nadie pide
+        datos. Si falla, cae al cliente de ordenes: peor medida que caerse,
+        y deja rastro en el log.
+        """
+        if self._data_exchange is None:
+            if self._data_sandbox == self._order_sandbox:
+                # Coinciden: no hace falta un segundo cliente.
+                self._data_exchange = self.exchange
+            else:
+                cfg = {
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'swap'},
+                }
+                if self._data_sandbox:
+                    cfg['sandbox'] = True
+                self._data_exchange = getattr(ccxt, self.exchange_id)(cfg)
+        return self._data_exchange
 
     def fetch_ohlcv(
         self,
@@ -117,12 +187,13 @@ class ExchangeAPI:
         Returns:
             List of [timestamp, open, high, low, close, volume] lists
         """
+        symbol = self._to_data_symbol(symbol)
         # Reintentos con backoff: un timeout transitorio de una pagina no
         # debe abortar el ciclo completo del orchestrator (F1).
         last_err = None
         for attempt in range(1, 4):
             try:
-                ohlcv = self.exchange.fetch_ohlcv(
+                ohlcv = self.data_client.fetch_ohlcv(
                     symbol,
                     timeframe,
                     since=since,
@@ -157,7 +228,7 @@ class ExchangeAPI:
             Order book as dictionary
         """
         try:
-            order_book = self.exchange.fetch_order_book(symbol, limit)
+            order_book = self.data_client.fetch_order_book(symbol, limit)
             return order_book
 
         except Exception as e:
@@ -175,7 +246,7 @@ class ExchangeAPI:
             Ticker data dictionary
         """
         try:
-            ticker = self.exchange.fetch_ticker(symbol)
+            ticker = self.data_client.fetch_ticker(symbol)
             return ticker
 
         except Exception as e:
@@ -194,7 +265,7 @@ class ExchangeAPI:
             List of trade dictionaries
         """
         try:
-            trades = self.exchange.fetch_trades(symbol, limit=limit)
+            trades = self.data_client.fetch_trades(symbol, limit=limit)
             return trades
 
         except Exception as e:
@@ -237,10 +308,67 @@ class ExchangeAPI:
             return symbol + ":USDT"
         return symbol
 
+    def _to_data_symbol(self, symbol: str) -> str:
+        """Normaliza el simbolo de la RUTA DE DATOS al mercado correcto.
+
+        Medido el 2026-09-29: `BTC/USDT` y `BTC/USDT:USDT` son dos mercados
+        distintos en ccxt — el primero SPOT (83.601,4) y el segundo el
+        PERPETUAL (83.559,1). El sistema entero es de perps (apalancamiento,
+        funding, liquidacion) y el wizard ofrecia `BTC/USDT` por defecto, asi
+        que se leian velas de spot creyendo que eran del perp. Los dos precios
+        son plausibles, asi que el fallo era SILENCIOSO.
+
+        No se fuerza el sufijo a ciegas: solo se corrige si el simbolo tal
+        cual resuelve a spot Y existe su equivalente perpetual. Un par de spot
+        de verdad (BTC/USDC) o un par de forex se queda como esta.
+        """
+        if self._data_exchange is None and self._data_sandbox == self._order_sandbox:
+            # Puede que aun no haya cliente de datos construido.
+            try:
+                self.data_client
+            except Exception as exc:  # pragma: no cover - sin red
+                logger.warning("[datos] no se pudo normalizar %s: %s", symbol, exc)
+                return symbol
+        markets = getattr(self.data_client, "markets", None)
+        if not markets:
+            # ccxt no tiene los mercados hasta que se piden. Se cargan una
+            # vez (ccxt los cachea) y de ahi en adelante es una lookup.
+            try:
+                self.data_client.load_markets()
+                markets = getattr(self.data_client, "markets", None)
+            except Exception as exc:  # pragma: no cover - sin red
+                logger.warning("[datos] no se pudieron cargar los mercados: %s", exc)
+                return symbol
+        if not markets:
+            return symbol
+        actual = markets.get(symbol)
+        if actual is None or actual.get("type") != "spot":
+            return symbol
+        swap = self._to_swap_symbol(symbol)
+        if swap == symbol or markets.get(swap) is None:
+            # Es un spot de verdad: no hay perpetual equivalente. Se deja
+            # como esta, pero se dice, porque un spot con apalancamiento no
+            # tiene sentido en este sistema.
+            logger.warning(
+                "[datos] %s es SPOT y no tiene perpetual equivalente: se "
+                "mide spot. Con apalancamiento eso no es lo que se operaria.",
+                symbol)
+            return symbol
+        logger.info(
+            "[datos] %s -> %s (perp): el simbolo sin sufijo es SPOT y el "
+            "sistema opera perps", symbol, swap)
+        return swap
+
     def set_sandbox_mode(self, enabled: bool = True) -> None:
-        """Route to Bybit Testnet (sandbox) or Mainnet."""
+        """Venue de ORDENES: Bybit Testnet (sandbox) o Mainnet.
+
+        No toca el cliente de datos a proposito: conmutar el sandbox de
+        mercado seria devolver el research al testnet sin que nadie lo pidiera
+        (el bug que corrigio la separacion). Para leer velas de testnet hay
+        que arrancar con BYBIT_DATA_SANDBOX=1.
+        """
         self.exchange.set_sandbox_mode(enabled)
-        logger.info("sandbox mode: %s", enabled)
+        logger.info("sandbox mode (ordenes): %s", enabled)
 
     def set_leverage(self, symbol: str, leverage: int,
                      params: Optional[Dict] = None) -> Any:
@@ -297,7 +425,7 @@ class ExchangeAPI:
             List of trading pairs
         """
         try:
-            markets = self.exchange.load_markets()
+            markets = self.data_client.load_markets()
             symbols = list(markets.keys())
             return symbols
 
@@ -341,7 +469,7 @@ class ExchangeAPI:
             Symbol info dictionary
         """
         try:
-            markets = self.exchange.load_markets()
+            markets = self.data_client.load_markets()
             return markets.get(symbol)
 
         except Exception as e:
