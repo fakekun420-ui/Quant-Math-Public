@@ -375,6 +375,89 @@ def test_margin_cap_rejects_when_global_loss_limit_hit():
         assert orch._apply_margin_cap(50.0, 10, "h1", sl_distance=0.025) == 0.0
 
 
+# ---------------------------------------------------------------------------
+# 5b. TOPE DE NOCIONAL: el freno que faltaba con apalancamiento
+#
+# MEDIDO el 2026-09-30 con el plan de Leonardo (5 USDT de capital, 50x,
+# SL al 0,5%): el tope de RIESGO daba 0,10 USDT y con un SL del 0,5% eso
+# autoriza 0,10 / 0,005 = 20 USDT de nocional, o sea 4x el capital. El
+# tope cumplia (el riesgo eran 0,10 exactos) pero la posicion era cuatro
+# veces mas grande de la que el plan pedia.
+#
+# El riesgo y el TAMANO no son lo mismo: un SL corto permite una posicion
+# enorme perdiendo poco. El capital tampoco lo frena, porque el margen es
+# una fraccion minuscula del nocional. Sin un tope de nocional, el
+# apalancamiento manda.
+# ---------------------------------------------------------------------------
+
+def test_el_tope_de_riesgo_solo_autoriza_un_nocional_4x_el_capital():
+    """Primero el hecho, para que el tope de nocional no parezca arbitrario.
+
+    Si este test falla, el dimensionado cambio y el resto de estos habria
+    que reescribirlos.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, mode="classic", leverage=50, take_profit_roe=0.50,
+                   stop_loss_roe=0.25, initial_capital=5.0, entry_pct=1.0)
+        assert cfg.stop_loss_pct == pytest.approx(0.005, rel=1e-6), (
+            "el plan: SL al 0,5% de precio a 50x = 25% de ROE")
+        # tope de riesgo: 2% de 5 = 0,10 USDT
+        assert cfg.max_risk_per_trade_usd == pytest.approx(0.10, rel=1e-6)
+        autorizado = cfg.max_risk_per_trade_usd / cfg.stop_loss_pct
+        assert autorizado == pytest.approx(20.0, rel=1e-3)
+        assert autorizado == pytest.approx(cfg.initial_capital * 4), (
+            "4x el capital: por eso hace falta el tope de nocional")
+
+
+def test_el_tope_de_nocional_recorta_lo_que_el_apalancamiento_infla():
+    """5 USDT de capital, tope 100%: 20 USDT de nocional se quedan en 5."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, mode="classic", leverage=50, take_profit_roe=0.50,
+                   stop_loss_roe=0.25, initial_capital=5.0, entry_pct=1.0,
+                   max_notional_per_entry_pct=1.0)
+        orch = _orch(cfg)
+        fuera = orch._apply_margin_cap(20.0, 50, "h1", sl_distance=0.005)
+        assert fuera == pytest.approx(5.0, rel=1e-6), (
+            f"el nocional debe quedarse en el capital, salio {fuera}")
+
+
+def test_el_tope_de_nocional_no_toca_lo_que_ya_cabe():
+    """Si la posicion ya esta dentro del techo, no se toca. Un tope que
+    aprieta de mas tambien es un fallo: cerria operaciones que son
+    legitimas."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, mode="classic", leverage=50, take_profit_roe=0.50,
+                   stop_loss_roe=0.25, initial_capital=5.0, entry_pct=1.0,
+                   max_notional_per_entry_pct=1.0)
+        orch = _orch(cfg)
+        dentro = orch._apply_margin_cap(4.0, 50, "h1", sl_distance=0.005)
+        assert dentro == pytest.approx(4.0, rel=1e-6)
+
+
+def test_sin_tope_de_nocional_no_se_cambia_el_comportamiento():
+    """Por defecto (None) el dimensionado es el de antes. El freno nuevo es
+    opt-in porque impose una politica que el operador tiene que querer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, mode="classic", leverage=50, take_profit_roe=0.50,
+                   stop_loss_roe=0.25, initial_capital=5.0, entry_pct=1.0)
+        assert cfg.max_notional_per_entry_pct is None
+        orch = _orch(cfg)
+        assert orch._apply_margin_cap(20.0, 50, "h1",
+                                      sl_distance=0.005) == pytest.approx(20.0)
+
+
+def test_un_tope_de_nocional_imposible_reventa_al_arrancar():
+    """Se valida en la config, no en mitad de una operacion. Un tope
+    invalido que solo falla al operar es un fallo que aparece cuando ya
+    hay dinero en juego."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for malo in (0.0, -0.5, 1.5, 2.0):
+            with pytest.raises(ValueError, match="max_notional_per_entry_pct"):
+                _cfg(tmp, mode="classic", leverage=50, take_profit_roe=0.50,
+                     stop_loss_roe=0.25, initial_capital=5.0, entry_pct=1.0,
+                     max_notional_per_entry_pct=malo)
+
+
 def test_risk_per_trade_cap_in_usd_is_enforced():
     """El tope de riesgo por operacion en USD recorta el nocional.
 

@@ -119,6 +119,25 @@ class OrchestratorConfig:
     max_open_positions: int = 5             # block entries at/above this count
     drawdown_limit: float = 0.2             # block entries past this drawdown
     max_position_pct: float = 0.2           # max margin per entry vs account
+    # Techo de NOCIONAL por entrada, como fraccion del capital. Es el
+    # freno que falta para que el apalancamiento no infle la posicion.
+    #
+    # MEDIDO el 2026-09-30 con el plan de Leonardo (5 USDT de capital, 50x,
+    # SL al 0,5%): el tope de RIESGO por operacion daba 0,10 USDT (2% de
+    # 5), y con un SL del 0,5% eso autoriza 0,10 / 0,005 = 20 USDT de
+    # nocional. O sea 4x el capital. El tope de riesgo cumplia su trabajo
+    # (el riesgo eran exactamente 0,10 USDT) pero la POSICION era cuatro
+    # veces mas grande de la que el plan pedia.
+    #
+    # La razon: el riesgo y el tamano son cosas distintas, y con
+    # apalancamiento dejan de ir juntas. Un SL muy corto permite una
+    # posicion enorme con poco riesgo, y el capital no limita nada porque
+    # el margen es una fraccion minuscula. Por eso hace falta un tope que
+    # mire el NOCIONAL y no solo lo que se puede perder.
+    #
+    # None = sin tope (comportamiento anterior). Se recomienda fijarlo
+    # siempre que se opere con apalancamiento.
+    max_notional_per_entry_pct: Optional[float] = None
     # Cada cuantos ciclos se reconcilian las posiciones contra el exchange.
     # Por defecto TODAS LAS HORAS (24 ciclos a intervalo 1h = una vez por
     # hora), no 0. Con 0 no se comparaba nunca y una posicion huerfana con
@@ -166,6 +185,11 @@ class OrchestratorConfig:
             raise ValueError("symbols no puede estar vacío")
         if not 0 < self.entry_pct <= 1:
             raise ValueError(f"entry_pct debe estar en (0, 1], recibido {self.entry_pct}")
+        if (self.max_notional_per_entry_pct is not None
+                and not 0 < float(self.max_notional_per_entry_pct) <= 1):
+            raise ValueError(
+                "max_notional_per_entry_pct debe estar en (0, 1], recibido "
+                f"{self.max_notional_per_entry_pct}")
         if self.take_profit_pct <= 0:
             raise ValueError(f"take_profit_pct debe ser > 0, recibido {self.take_profit_pct}")
         if self.min_paper_trades < 1:
@@ -1526,6 +1550,27 @@ class Orchestrator:
                     print(f"  [risk] riesgo/trade: ${risk_usd:.2f} -> "
                           f"${cap_usd:.2f} tope ({self.config.max_risk_per_trade_pct:.1%} "
                           f"de ${account:.2f}); nocional ${max_notional:.2f}")
+            # --- tope de NOCIONAL: el freno del apalancamiento ----------
+            # Va AL FINAL, y a proposito: es el techo de verdad. Si se
+            # pusiera antes, cualquier tope posterior podria dejar el
+            # nocional por encima, y entonces este no seria un tope sino
+            # una sugerencia.
+            tope_pct = self.config.max_notional_per_entry_pct
+            if tope_pct:
+                max_notional_cap = account * float(tope_pct)
+                if notional > max_notional_cap:
+                    antes = notional
+                    notional = max_notional_cap
+                    logger.warning(
+                        "[risk] NOCIONAL capado por max_notional_per_entry_"
+                        "pct=%.2f%%: $%.2f -> $%.2f (margen $%.2f a %sx). "
+                        "El tope de RIESGO autorizaba mas: riesgo y tamano "
+                        "no son lo mismo con apalancamiento.",
+                        float(tope_pct) * 100, antes, notional,
+                        notional / max(1, lev_used), lev_used)
+                    print(f"  [risk] nocional capado: ${antes:.2f} -> "
+                          f"${notional:.2f} (techo {float(tope_pct):.0%} de "
+                          f"${account:.2f})")
             return notional
         except Exception as exc:
             # CIERRE, no apertura. Si no se puede comprobar el riesgo,
