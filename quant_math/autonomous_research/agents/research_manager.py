@@ -58,7 +58,8 @@ class ResearchManager:
         monte_carlo_engine: MonteCarloEngine,
         statistical_validator: StatisticalValidator,
         risk_manager: RiskManager,
-        agent_registry: "AgentRegistry" = None
+        agent_registry: "AgentRegistry" = None,
+        validated_score_threshold: float = 0.0,
     ):
         """
         Initialize the Research Manager.
@@ -78,6 +79,13 @@ class ResearchManager:
         self.risk_manager = risk_manager
 
         self.agent_registry = agent_registry or AgentRegistry()
+
+        # Umbral para marcar `validated`. Por defecto 0.0: el score es una
+        # suma ponderada de tres componentes que NO estan normalizadas a 0-1,
+        # asi que un corte en 0,6 medido sobre datos reales (maximo observado
+        # 0,13 el 2026-09-30) deja TODO en `failed`. Quien decide si una
+        # hipotesis se opera es el gate de expectancy contra el coste real.
+        self.validated_score_threshold = float(validated_score_threshold)
 
         # Research state
         self.current_phase = ResearchPhase.HYPOTHESIS_GENERATION
@@ -299,7 +307,20 @@ class ResearchManager:
         )
 
         hypothesis.scientific_score = scientific_score
-        hypothesis.status = StrategyStatus.VALIDATED if scientific_score > 0.6 else StrategyStatus.FAILED
+        # El umbral 0,6 estaba HARDCODADO y marcado todas las hipotesis como
+        # `failed`: medido el 2026-09-30, 17 hipotesis de una corrida real
+        # Tener scientific_score entre 0,099 y 0,131, o sea que NINGUNA podia
+        # pasar. Y `failed` no es inerte: esta en QUERYABLE_STATUSES, asi que
+        # seguian siendo operables pero con eletro semantico de "descartada".
+        #
+        # El score es 0,2*validacion + 0,5*backtest + 0,3*monte_carlo, y
+        # ninguna de las tres componentes se normaliza a 0-1, asi que 0,6
+        # medido sobre datos reales no significa nada. Por defecto el umbral
+        # es 0.0: el score informa, y quien decide es el gate de expectancy
+        # (que compara contra el COSTE REAL, medido en el exchange).
+        hypothesis.status = (StrategyStatus.VALIDATED
+                             if scientific_score > self.validated_score_threshold
+                             else StrategyStatus.FAILED)
 
         # Update knowledge base
         self.knowledge_base.update_hypothesis(hypothesis_id, {

@@ -14,9 +14,12 @@ import sys
 import os
 import json
 import time
+import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
+
+logger = logging.getLogger(__name__)
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -105,6 +108,84 @@ class AQDERunner:
         # lookback_days). El orchestrator la invalida al inicio de cada ciclo;
         # nunca persiste entre ciclos.
         self._mkt_cache: Dict[Any, Any] = {}
+        # El historico de rendimiento se SIEMBRA desde la Knowledge Base.
+        # Antes era memoria pura: se perdia en cada reinicio, o sea que la
+        # generacion adaptativa (`analyze_performance` ->
+        # `generate_adaptive_hypotheses`) empeizaba siempre de cero y el
+        # sistema no podia acumular conocimiento entre corridas. Eso es justo
+        # lo contrario de lo que se le pidio ("que vaya generando mas y
+        # mejores hipotesis").
+        self._seed_performance_from_kb()
+
+    def _seed_performance_from_kb(self):
+        """Carga en `performance_history` lo que la KB ya sabe.
+
+        La KB es append-only y sobrevive a los reinicios; el historico en
+        memoria no. Se siembra con los campos que `analyze_performance` mira
+        (status, n_trades, symbol, total_return, sharpe, expectancy), y el
+        `status` se traduce al vocabulario INTERNO del runner ('success' /
+        'no_trades'), que es distinto del de la KB ('backtested' / 'failed').
+
+        Si la KB esta vacia o no existe, no es un error: el sistema arranca
+        sin historico, que es lo que hacia antes siempre.
+        """
+        try:
+            kb = getattr(self, "knowledge_base", None)
+            if kb is None:
+                return 0
+            registros = self._read_kb_records()
+        except Exception as exc:  # pragma: no cover - KB opcional
+            logger.debug("[seed] no se pudo sembrar el historico: %s", exc)
+            return 0
+
+        sembrados = 0
+        for rec in registros:
+            if rec.get("status") not in ("backtested", "validated"):
+                continue
+            try:
+                n_trades = int(rec.get("n_trades") or 0)
+            except (TypeError, ValueError):
+                continue
+            if n_trades <= 0:
+                # Sin operaciones no hay nada que aprender: es exactamente
+                # el filtro que ya hacia `analyze_performance`.
+                continue
+            self.performance_history.append({
+                "hypothesis_id": rec.get("hypothesis_id", ""),
+                "symbol": rec.get("symbol", ""),
+                "status": "success",
+                "n_trades": n_trades,
+                "total_return": float(rec.get("total_return") or 0.0),
+                "total_return_pct": float(rec.get("total_return_pct") or 0.0),
+                "expectancy": float(rec.get("expectancy") or 0.0),
+                "sharpe_ratio": float(rec.get("sharpe_ratio") or 0.0),
+                "win_rate": float(rec.get("win_rate") or 0.0),
+                "strategy_type": rec.get("strategy_type", ""),
+                "from_kb": True,
+            })
+            sembrados += 1
+        if sembrados:
+            self.performance_history = self.performance_history[-500:]
+            logger.info("[seed] historico sembrado desde la KB: %d registros",
+                        sembrados)
+        return sembrados
+
+    def _read_kb_records(self) -> List[Dict]:
+        """Lee la KB cruda (JSONL) tolerando un formato inesperado."""
+        ruta = getattr(getattr(self, "knowledge_base", None), "storage_path", "")
+        if not ruta or not os.path.exists(ruta):
+            return []
+        out: List[Dict] = []
+        with open(ruta, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return out
 
     def _prune_memory(self):
         """Prune unbounded data structures to prevent memory growth."""
