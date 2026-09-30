@@ -975,6 +975,52 @@ class DecisionEngine:
                     ops.append(rec)
         return ops
 
+    def abandon_entry(self, hypothesis_id: str, symbol: str,
+                      motivo: str = "entrada no ejecutada") -> bool:
+        """Retira una entrada que se registro pero que NO llego a existir.
+
+        MEDIDO el 2026-09-30 en testnet: `decide()` da por buena una
+        hipotesis y REGISTRA la posicion en `open_positions` ANTES de que el
+        orquestador mande la orden. Si esa orden se rechaza (y se rechazan:
+        apalancamiento que no cuadra, margen que no es aislado, margen
+        insuficiente), la posicion se queda en el estado local sin haber
+        existido jamas en el exchange.
+
+        El efecto era doble y malo: el brazo se contaba una posicion viva
+        que no existia (y con `max_open_positions` justo la bloquearia), y
+        la reconciliacion la encontraba como fantasma, o sea que se
+        abria un problema para arreglar un problema.
+
+        Distinto de `close_position` a proposito: aqui no hubo entrada, asi
+        que no hay nada que cerrar ni PnL que registrar. Inventar un
+        cierre para una operacion que no ocurrio seria exactamente el dato
+        falso que el resto del sistema evita a proposito.
+        """
+        key = self._position_key(hypothesis_id, symbol)
+        if key not in self.open_positions:
+            return False
+        self.open_positions.pop(key, None)
+        self._persist_positions()
+        # La posicion se registro con `self.paper_trade_counts[key] += 1`.
+        # Ese contador es lo que `close_position` usa para medir
+        # operaciones ha hecho esa hipotesis, asi que hay que devolverlo
+        # ATRAS o la cuenta como operacion algo que no ocurrio.
+        try:
+            prev = int(self.paper_trade_counts.get(key, 0)) - 1
+            if prev <= 0:
+                self.paper_trade_counts.pop(key, None)
+            else:
+                self.paper_trade_counts[key] = prev
+            self._append_state(self.paper_trades_path,
+                               {"key": key, "count": max(0, prev)})
+        except Exception as exc:               # pragma: no cover
+            logger.warning("[abandon] no se pudo ajustar el contador de %s: "
+                           "%s", key, exc)
+        logger.warning("[abandon] entrada retirada sin existir: %s (%s). "
+                       "La hipotesis sigue contando como posible, no como "
+                       "operada.", key, motivo)
+        return True
+
     def _refresh_live_expectancy(self, hypothesis_id: str, symbol: str):
         """PA: expectancy viva con shrinkage bayesiano doble.
 

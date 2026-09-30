@@ -16,6 +16,7 @@ construyen las llamadas, que es justo donde estaba el fallo.
 """
 
 import json
+import os
 
 import pytest
 
@@ -541,6 +542,84 @@ def test_con_require_isolated_false_se_opera_a_conciencia(fake_api):
     assert len(fake_api.instances[-1].orders) == 1, "se abre, no se cierra"
     assert "stopLoss" in fake_api.instances[-1].orders[0]["params"], (
         "y sigue yendo protejida aunque se acepte el cruce")
+
+
+def test_una_entrada_que_el_exchange_rechaza_no_deja_posicion(fake_api):
+    """EL BUG MEDIDO el 2026-09-30 con el brazo corriendo en testnet.
+
+    `decide()` REGISTRA la posicion en `open_positions` antes de que se
+    mande la orden. Cuando la orden se rechaza (apalancamiento que no
+    cuadra, margen que no es aislado, margen insuficiente), la posicion se
+    queda en el estado local sin haber existido jamas en el exchange.
+
+    El log de aquella corrida decia `abiertas 1/5 | sin marcar 1` con 0
+    posiciones en el exchange: el brazo contandose una posicion viva que
+    no existia. Y como ademas no se registro la entrada, `_last_entry_sizing`
+    caeria en su fallback y el PnL de un cierre posterior seria erroneo.
+    """
+    from quant_math.decision_engine import DecisionEngine
+    import tempfile, json as _json
+    tmp = tempfile.mkdtemp(prefix="abandon-")
+    eng = DecisionEngine(symbols=["BTC/USDT:USDT"], kb_path=f"{tmp}/kb.jsonl",
+                         state_dir=tmp, min_paper_trades=1, use_postgres=False,
+                         data_provider=lambda s: None)
+    key = eng._position_key("h1", "BTC/USDT:USDT")
+    eng.open_positions[key] = {"symbol": "BTC/USDT:USDT", "side": "buy",
+                               "entry_price": 100.0}
+    eng.paper_trade_counts[key] = 1
+    eng._persist_positions()
+
+    from quant_math.orchestrator import Orchestrator
+    o = _orch()
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.config = o
+    orch.cycle_count = 1
+    orch.engine = eng
+
+    signal = {"symbol": "BTC/USDT:USDT", "side": "buy", "price": 100.0,
+              "hypothesis_id": "h1", "expectancy": 0.01,
+              "timestamp": 1790000000000}
+    orch._abandon_if_rejected(signal, {"action": "live_failed",
+                                       "error": "margen cross"})
+
+    assert key not in eng.open_positions, \
+        "una entrada rechazada no puede quedar como posicion viva"
+    assert eng.paper_trade_counts.get(key, 0) == 0, (
+        "y tampoco puede contar como operacion: la hipotesis no se opero")
+    with open(os.path.join(tmp, "paper_executions.jsonl"), "a",
+              encoding="utf-8") as fh:
+        fh.write("")           # toca el fichero vacio, a proposito
+    with open(eng.paper_trades_path, encoding="utf-8") as fh:
+        filas = [_json.loads(l) for l in fh if l.strip()]
+    assert filas[-1]["count"] == 0, "el contador escrito tambien se corrige"
+
+
+def test_una_entrada_que_si_se_abrió_no_se_retira(fake_api):
+    """Lo contrario: si la orden SI salio, la posicion se queda. Un
+    retraction que se~” fires con la misma logica dejaria al brazo sin
+    posiciones y perderia el control del riesgo."""
+    from quant_math.decision_engine import DecisionEngine
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="abandon2-")
+    eng = DecisionEngine(symbols=["BTC/USDT:USDT"], kb_path=f"{tmp}/kb.jsonl",
+                         state_dir=tmp, min_paper_trades=1, use_postgres=False,
+                         data_provider=lambda s: None)
+    key = eng._position_key("h1", "BTC/USDT:USDT")
+    eng.open_positions[key] = {"symbol": "BTC/USDT:USDT", "side": "buy",
+                               "entry_price": 100.0}
+
+    from quant_math.orchestrator import Orchestrator
+    o = _orch()
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.config = o
+    orch.cycle_count = 1
+    orch.engine = eng
+    signal = {"symbol": "BTC/USDT:USDT", "side": "buy", "price": 100.0,
+              "hypothesis_id": "h1", "expectancy": 0.01,
+              "timestamp": 1790000000000}
+    orch._abandon_if_rejected(signal, {"mode": "live-testnet",
+                                       "leverage": 10})
+    assert key in eng.open_positions, "una entrada abierta no se retira"
 
 
 def test_read_back_margin_mode_traduce_el_tradeMode_de_bybit():

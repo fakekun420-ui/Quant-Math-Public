@@ -1638,9 +1638,14 @@ class Orchestrator:
         # Fase 3: live path (config guard guarantees testnet + keys,
         # or mainnet with QUANTMATH_ALLOW_MAINNET=1 — see __post_init__).
         if not self.config.dry_run:
-            return self._execute_live_order(
+            _t = self._execute_live_order(
                 signal, price, side, notional, lev_used,
                 margin if self.config.mode == "burst" else None)
+            # Si la orden no llego a existir, `decide()` ya habia registrado
+            # la posicion local y hay que retirarla. Sin esto el brazo cuenta
+            # una posicion viva que no esta en el exchange.
+            self._abandon_if_rejected(signal, _t)
+            return _t
         quantity = notional / price
         plan = self.config.roe_plan
         if plan is not None:
@@ -1794,6 +1799,35 @@ class Orchestrator:
         except (TypeError, ValueError) as exc:
             logger.error("[live] respuesta de posicion ilegible: %s", exc)
             return None
+
+    def _abandon_if_rejected(self, signal: Dict, trade: Dict) -> None:
+        """Si la orden NO llego a existir, la posicion local se retira.
+
+        `decide()` registra la posicion en `open_positions` ANTES de que se
+        mande la orden. Si la orden se rechaza, esa posicion se queda ahi
+        sin haber existido nunca en el exchange, y el brazo acaba
+        contando una posicion viva que no existe (MEDIDO el 2026-09-30 en
+        testnet: exactamente eso, con `sin marcar 1` en el riesgo).
+
+        Importante: no se registra ningun cierre. No hubo entrada, luego no
+        hay PnL que anotar, y fabricar uno seria el dato falso que el
+        resto del sistema evita a proposito.
+        """
+        if not isinstance(trade, dict):
+            return
+        if trade.get("action") != "live_failed":
+            return
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return
+        quitter = getattr(engine, "abandon_entry", None)
+        if quitter is None:
+            return
+        try:
+            quitter(signal.get("hypothesis_id"), signal.get("symbol"),
+                    motivo=str(trade.get("error") or "orden rechazada")[:120])
+        except Exception as exc:                # pragma: no cover
+            logger.error("[abandon] no se pudo retirar la entrada: %s", exc)
 
     def _execute_live_order(self, signal: Dict, price: float, side: str,
                             notional: float, lev_used: int,
