@@ -503,8 +503,28 @@ class ExchangeAPI:
             info = pos.get("info") or {}
             for destino, clave in (("stopLoss", "stopLoss"),
                                    ("takeProfit", "takeProfit")):
-                nodo = info.get(clave) or {}
-                if isinstance(nodo, dict):
+                nodo = info.get(clave)
+                # MEDIDO el 2026-10-01 contra el exchange: Bybit v5
+                # devuelve el precio como CADENA plana
+                #   "stopLoss": "2690.63"
+                # y no como diccionario. Este lector solo miraba la forma
+                # de diccionario, devolvia None, y el guardia post-entrada
+                # cerraba posiciones que SI estaban protegidas. Es decir:
+                # fallo cerrado pero en la direccion que hace que el sistema
+                # no pueda operar nunca. Un guardia que siempre dice "no"
+                # es tan inservible como uno que nunca lo dice.
+                #
+                # Se aceptan las dos formas porque no son inventadas: la
+                # plana es la medida hoy en Bybit, y la de diccionario con
+                # `triggerBy` aparece en otras respuestas (y es la unica que
+                # trae el tipo de disparador).
+                if isinstance(nodo, str):
+                    try:
+                        if nodo.strip() and float(nodo) > 0:
+                            out[destino] = float(nodo)
+                    except (TypeError, ValueError):
+                        pass
+                elif isinstance(nodo, dict):
                     precio = nodo.get("stopLossPrice" if destino == "stopLoss"
                                       else "takeProfitPrice")
                     if precio in (None, "", "0", 0):

@@ -322,6 +322,7 @@ def build_roe_plan(
     take_profit_roe: Optional[float] = None,
     stop_loss_roe: Optional[float] = None,
     maintenance_margin_rate: Optional[float] = None,
+    mmr_origen_explicito: Optional[str] = None,
     sl_liquidation_safety_frac: float = DEFAULT_SL_LIQUIDATION_SAFETY_FRAC,
     market: str = "crypto",
     max_tp_price_distance: Optional[float] = None,
@@ -355,7 +356,12 @@ def build_roe_plan(
     # apalancamiento. Es el dato que decide cuanto puede acercarse el SL
     # a la liquidacion, asi que se deja de donde viene anotado en el
     # plan y no como un numeroAnonimo.
-    mmr_origen = "explicito"
+    # `mmr_origen_explicito` lo pasa quien YA resolvio el MMR por su cuenta
+    # (el orquestador, que consulta la tabla por cada simbolo). Sin el, el
+    # origen se diria "explicito" y mentiria: el numero no venia de quien
+    # lo pasa sino del exchange. Un campo de origen que miente es peor que
+    # no tenerlo, porque es lo unico que hace auditable la cifra.
+    mmr_origen = (mmr_origen_explicito or "explicito")
     if maintenance_margin_rate is not None:
         mmr = float(maintenance_margin_rate)
     elif symbol:

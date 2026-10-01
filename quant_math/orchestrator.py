@@ -352,9 +352,11 @@ class OrchestratorConfig:
                     _mmrs.append(mmr_for_symbol(_sym, self.effective_leverage))
                 except Exception:
                     continue
+            _mmr_origen = None
             if _mmrs:
                 _peor = max(_mmrs, key=lambda t: t[0])
                 _mmr_arg = _peor[0]
+                _mmr_origen = _peor[1]
                 logger.info(
                     "[roe] MMR mas conservador de %d simbolo(s) a %sx: "
                     "%.4f%% (%s) -> se usa ese para el clamp del SL",
@@ -368,6 +370,7 @@ class OrchestratorConfig:
                 take_profit_roe=self.take_profit_roe,
                 stop_loss_roe=self.stop_loss_roe,
                 maintenance_margin_rate=_mmr_arg,
+                mmr_origen_explicito=_mmr_origen,
                 sl_liquidation_safety_frac=self.sl_liquidation_safety_frac,
                 market=self.market,
                 max_tp_price_distance=self.max_tp_price_distance,
