@@ -27,6 +27,14 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from quant_math.decision_engine import DecisionEngine
+from quant_math.risk.gate_policy import (
+    FIELD_MC_CONCLUSIVE,
+    FIELD_PVALUE,
+    FIELD_PVALUE_ALPHA,
+    FIELD_SCIENTIFICALLY_VALIDATED,
+    FIELD_SCIENTIFIC_REASONS,
+    FIELD_VALIDATION_SCORE,
+)
 from quant_math.risk.circuit_breaker import (
     DEFAULT_MAX_DAILY_LOSS_PCT,
     DailyGuard,
@@ -1333,8 +1341,11 @@ class Orchestrator:
             self.runner.performance_history.extend(results)
             self.runner._prune_memory()
 
+            verdicts = self._evaluate_backtest_results(results)
             for result in results:
-                record = self._result_to_kb_record(result, symbol)
+                record = self._result_to_kb_record(
+                    result, symbol,
+                    verdict=verdicts.get(result.get("hypothesis_id")))
                 if record is not None:
                     new_records.append(record)
                     made += 1
@@ -1394,14 +1405,67 @@ class Orchestrator:
             self.runner.performance_history.extend(results)
             self.runner._prune_memory()
 
+        verdicts = self._evaluate_backtest_results(results)
         for result in results:
-            record = self._result_to_kb_record(result, symbol)
+            record = self._result_to_kb_record(
+                result, symbol, verdict=verdicts.get(result.get("hypothesis_id")))
             if record is not None:
                 records.append(record)
         return records
 
-    def _result_to_kb_record(self, result: Dict, symbol: str) -> Optional[Dict]:
-        """Convert an AQDE backtest result into a KB JSONL record."""
+    def _evaluate_backtest_results(self, results: List[Dict]) -> Dict[str, Dict]:
+        """Corre las tres fases de validacion sobre los backtests YA HECHOS.
+
+        MEDIDO el 2026-10-01: `run_validation`, `run_monte_carlo` y
+        `score_hypothesis` estaban enteros y desconectados. Sus unicas
+        llamadas vivian en `AQDERunner.run()`, que solo se ejecuta con
+        `python aqde_runner.py`; el motor de produccion
+        (`quant_math_bg.py` -> `run_forever`) nunca entra ahi. Por eso la
+        formula `0,2*validacion + 0,5*backtest + 0,3*monte_carlo` no se habia
+        ejecutado jamas sobre una hipotesis real, y `_result_to_kb_record`
+        publicaba un 0,098 de reserva porque `hyp.scientific_score` valia
+        0,0.
+
+        Se llama DESPUES del backtest y nunca en su lugar: las tres fases
+        beben del mismo `research_manager.results[id]` que produjo el
+        backtest. No se usa `execute_workflow()` porque su backtest interno
+        vuelve a bajar datos a 7 dias @1m y pisa `self.results`: el Monte
+        Carlo y el score saldrian de un backtest DISTINTO del que se uso.
+
+        Ante un fallo se marca NO operable con el motivo (fallo cerrado): una
+        hipotesis que no se ha podido medir no puede afirmarse medida.
+        """
+        verdicts: Dict[str, Dict] = {}
+        rm = self.runner.research_manager
+        for res in results:
+            if res.get("status") != "success":
+                continue
+            hid = res.get("hypothesis_id")
+            if not hid:
+                continue
+            try:
+                verdicts[hid] = rm.evaluate_hypothesis(hid)
+            except Exception as exc:
+                logger.exception("[valid] %s fallo el pipeline: %s", hid, exc)
+                verdicts[hid] = {
+                    "hypothesis_id": hid,
+                    "scientifically_validated": False,
+                    "scientific_reasons": [
+                        f"pipeline_error: {type(exc).__name__}: {exc}"],
+                }
+        return verdicts
+
+    def _result_to_kb_record(self, result: Dict, symbol: str,
+                             verdict: Optional[Dict] = None) -> Optional[Dict]:
+        """Convert an AQDE backtest result into a KB JSONL record.
+
+        `verdict` es lo que devuelve `_evaluate_backtest_results`. Si viene,
+        el registro lleva el veredicto de las tres fases y el gate puede
+        decidir con el; si NO viene, el registro se publica SIN veredicto y
+        conserva la semantica anterior. No se inventa un veredicto por
+        omision: "no evaluado" y "evaluado y no valido" son cosas distintas
+        y confundirlas seria volver a meter el fallo que se acaba de cerrar.
+        """
         from quant_math.autonomous_research.interfaces import StrategyStatus
 
         hyp_id = result.get("hypothesis_id")
@@ -1454,7 +1518,7 @@ class Orchestrator:
                         status = "validated"
                     break
 
-        return {
+        record = {
             "hypothesis_id": hyp_id,
             "name": getattr(hyp, "name", hyp_id),
             "description": getattr(hyp, "description", ""),
@@ -1476,6 +1540,35 @@ class Orchestrator:
             "orchestrator_cycle": self.cycle_count,
             "created_at": time.time(),
         }
+
+        # El veredicto de las TRES fases viaja con el registro. Son campos
+        # nuevos a proposito: sin ellos, `hyp.scientific_score` a secas no
+        # distingue "puntuado y malo" de "puntuado con un CI sobre 7
+        # operaciones", que es justo la confusion que hacia operable lo que
+        # no se ha medido.
+        #
+        # El `status` NO se toca aqui: el corte del 0,6 y la elevacion por
+        # validacion cruzada son reglas congeladas y ademas `failed` esta en
+        # QUERYABLE_STATUSES, luego el status nunca decidio operabilidad. Quien
+        # decide es el gate, leyendo estos campos.
+        if isinstance(verdict, dict):
+            record.update({
+                "scientifically_validated": bool(
+                    verdict.get(FIELD_SCIENTIFICALLY_VALIDATED)),
+                "scientific_reasons": list(
+                    verdict.get(FIELD_SCIENTIFIC_REASONS) or []),
+                "statistical_significance": verdict.get(FIELD_PVALUE),
+                "statistical_significance_alpha": verdict.get(FIELD_PVALUE_ALPHA),
+                "monte_carlo_conclusive": bool(verdict.get(FIELD_MC_CONCLUSIVE)),
+                "monte_carlo_mean": float(verdict.get("monte_carlo_mean") or 0.0),
+                "monte_carlo_lower_bound": float(
+                    verdict.get("monte_carlo_lower_bound") or 0.0),
+                "monte_carlo_upper_bound": float(
+                    verdict.get("monte_carlo_upper_bound") or 0.0),
+                "min_trades_conclusion": verdict.get("min_trades_conclusion"),
+                "validation_score": float(verdict.get(FIELD_VALIDATION_SCORE) or 0.0),
+            })
+        return record
 
     # ------------------------------------------------------------------
     # Stage 3: persistence + decisions + paper execution
@@ -1664,25 +1757,22 @@ class Orchestrator:
             pass
         return today, total
 
-    def _ledger_kelly_stats(self) -> Tuple[Optional[float], Optional[float],
-                                           Optional[float], int]:
-        """(win_rate, avg_win, avg_loss, n_cierres) MEDIDOS del ledger.
+    def _ledger_closures(self) -> List[Tuple[float, float]]:
+        """(exit_time, pnl) de cada cierre DEDUPLICADO del libro.
 
-        Kelly con datos inventados es peor que Kelly sin datos, asi que
-        aqui solo salen numeros observados. Dos decisiones, ambas por
-        medicion del 2026-10-01:
+        UNICO punto de parseo del `paper_executions.jsonl`: de aqui salen
+        tanto las estadisticas del Kelly como la serie que alimenta
+        VaR/ES y Sharpe. Dos parseos distintos del mismo libro son dos
+        fuentes de verdad para la misma muestra, y acaban divergiendo.
 
-        1. Las filas repetidas de UNA misma posicion (mismo `key`,
-           `entry_time` y `quantity`) son re-marcas del mismo cierre, no
-           operaciones nuevas: el ledger de state_classic-xrp tenia 25
-           filas de cierre para 9 posiciones, y alguna de esas filas
-           repite la misma entrada con pnl de signo OPUESTO. Sin
-           deduplicar, el win_rate salia 0.80; deduplicado (ultima
-           marca), 0.56. Se queda la fila con `exit_time` mas reciente.
-        2. El piso de muestra NO se decide aqui: lo aplica
-           `RiskManager.MIN_CLOSURES_FOR_KELLY` (la politica de riesgo
-           vive en el modulo de riesgo). Aqui se devuelve la n real para
-           que el registro pueda decir "solo 9 cierres".
+        Deduplicacion (medida el 2026-10-01): las filas repetidas de UNA
+        misma posicion (mismo `key`, `entry_time` y `quantity`) son
+        re-marcas del mismo cierre, no operaciones nuevas: el ledger de
+        state_classic-xrp tenia 25 filas de cierre para 9 posiciones, y
+        alguna de esas filas repite la misma entrada con pnl de signo
+        OPUESTO. Sin deduplicar, el win_rate salia 0.80; deduplicado
+        (ultima marca), 0.56. Se queda la fila con `exit_time` mas
+        reciente.
 
         Nunca lanza: un libro ausente o a medias es "sin datos", no una
         excepcion — esta llamada cae dentro del `try` de
@@ -1715,15 +1805,44 @@ class Orchestrator:
                         ultima[grupo] = (exit_time, pnl)
         except OSError:
             pass
+        return [(exit_time, pnl) for (exit_time, pnl) in ultima.values()]
 
-        if not ultima:
+    def _ledger_pnl_series(self) -> List[float]:
+        """PnL en USD de cada cierre deduplicado, para VaR/ES y Sharpe.
+
+        Devuelve la serie COMPLETA, incluidos los cierres planos (pnl
+        0.0): un cierre a cero es una observacion real de la cola y
+        quitarlo inflaria la desviacion. El filtro de pnl != 0 es
+        exclusivo del Kelly, donde un cero no informa de ventaja ni de
+        desventaja.
+        """
+        return [pnl for (_exit_time, pnl) in self._ledger_closures()]
+
+    def _ledger_kelly_stats(self) -> Tuple[Optional[float], Optional[float],
+                                           Optional[float], int]:
+        """(win_rate, avg_win, avg_loss, n_cierres) MEDIDOS del ledger.
+
+        Kelly con datos inventados es peor que Kelly sin datos, asi que
+        aqui solo salen numeros observados. Dos decisiones, ambas por
+        medicion del 2026-10-01:
+
+        1. Deduplica por posicion (ver `_ledger_closures`, que es de
+           donde salen estos numeros).
+        2. El piso de muestra NO se decide aqui: lo aplica
+           `RiskManager.MIN_CLOSURES_FOR_KELLY` (la politica de riesgo
+           vive en el modulo de riesgo). Aqui se devuelve la n real para
+           que el registro pueda decir "solo 9 cierres".
+
+        Un pnl de 0.00 exacto no informa de ventaja ni de desventaja: no
+        entra en ninguno de los dos lados (contarlo como perdida, como
+        hace el contador de rachas, hundiria avg_loss y dispararia el
+        Kelly).
+        """
+        cierres = self._ledger_closures()
+        if not cierres:
             return None, None, None, 0
 
-        pnls = [p for (_exit, p) in ultima.values()]
-        # Un pnl de 0.00 exacto no informa de ventaja ni de desventaja:
-        # no entra en ninguno de los dos lados (contarlo como perdida,
-        # como hace el contador de rachas, hundiria avg_loss y dispararia
-        # el Kelly).
+        pnls = [p for (_exit, p) in cierres]
         wins = [p for p in pnls if p > 0]
         losses = [-p for p in pnls if p < 0]
         n = len(wins) + len(losses)
@@ -1761,6 +1880,12 @@ class Orchestrator:
         `RiskManager` lo declara (`kelly_status`) en vez de devolver 0.0.
         Es el unico cambio de esta funcion respecto al tope de margen:
         la aprobacion y los topes no dependen del Kelly.
+
+        La MISMA serie de cierres (`_ledger_pnl_series`) alimenta
+        ademas VaR/ES (`var_status`) y Sharpe/Sortino
+        (`sharpe_status`), con el mismo trato: estado explicito y SOLO
+        logging, nunca un veto — ver `RiskManager._tail_risk_assessment`
+        y `._quality_assessment`.
         """
         notional = float(notional)
         lev_used = max(1, int(lev_used))
@@ -1788,10 +1913,16 @@ class Orchestrator:
             # los numeros en la mano, en vez de devolver un 0.0 que
             # pareciera una medida (bug latente del 2026-10-01).
             wr, aw, al, n_closures = self._ledger_kelly_stats()
+            # Serie de cierres (mismo libro, misma deduplicacion) para
+            # VaR/ES y Sharpe: RiskManager calcula o DECLARA el estado
+            # segun el piso de muestra. Pasa la serie tal cual, sin
+            # filtrar y sin tocar el resultado: quien aplica los pisos y
+            # decide que se calcula es el modulo de riesgo.
+            serie = self._ledger_pnl_series()
             chk = self._risk_manager.check_position_size(
                 hypothesis_id, margin_used, account,
                 win_rate=wr, avg_win=aw, avg_loss=al,
-                n_closures=n_closures)
+                n_closures=n_closures, pnl_series=serie)
             kstatus = chk.get("kelly_status")
             if kstatus != "ok":
                 # Solo logging: no toca el tamano. Es la diferencia entre
@@ -1802,6 +1933,22 @@ class Orchestrator:
             elif chk.get("kelly_advisory"):
                 logger.info("[risk] %s (%s)",
                             chk["kelly_advisory"], hypothesis_id)
+            # VaR/ES y Sharpe: mismo trato que el Kelly — SOLO logging.
+            # Ninguno de los dos estados aprueba, recorta ni rechaza: hoy
+            # son medida con estado explicito, no frenos (para ser frenos
+            # haria falta un umbral decidido con replay, y la muestra
+            # actual no lo permite).
+            vstatus = chk.get("var_status")
+            sstatus = chk.get("sharpe_status")
+            if vstatus not in (None, "ok", "ok_95"):
+                logger.info("[risk] VaR/ES %s para %s: %s",
+                            vstatus, hypothesis_id, chk.get("var_note"))
+            if sstatus not in (None, "ok"):
+                logger.info("[risk] Sharpe %s para %s: %s",
+                            sstatus, hypothesis_id, chk.get("sharpe_note"))
+            if (vstatus not in (None, "ok", "ok_95")
+                    or sstatus not in (None, "ok")):
+                print(f"  [risk] var={vstatus} sharpe={sstatus}")
             reasons = list(chk.get("reasons") or [])
             if not chk.get("approved"):
                 # `max_position` es la MISMA regla que aplica RiskManager.

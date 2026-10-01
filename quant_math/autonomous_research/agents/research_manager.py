@@ -6,8 +6,12 @@ autonomous discovery pipeline. It manages the research workflow,
 deploys agents for specific tasks, and tracks hypothesis lifecycle.
 """
 
+import hashlib
+import os
+import threading
 import uuid
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Protocol, TypeVar
 from enum import Enum
 
@@ -26,7 +30,31 @@ from ..interfaces import (
     StatisticalValidator,
     RiskManager,
 )
+from quant_math.expectation.statistical_tests import StatisticalTests
+from quant_math.risk.gate_policy import (
+    FIELD_MC_CONCLUSIVE,
+    FIELD_PVALUE,
+    FIELD_PVALUE_ALPHA,
+    FIELD_SCIENTIFICALLY_VALIDATED,
+    FIELD_SCIENTIFIC_REASONS,
+    FIELD_VALIDATION_SCORE,
+    resolve_scientific_policy,
+)
 from .agent_registry import AgentRegistry
+
+#: El bootstrap del Monte Carlo (el puerto inyectado, o sea el adapter) usa el
+#: `np.random` GLOBAL. El pipeline corre en paralelo por simbolo
+#: (`_generate_and_backtest_symbol` se lanza en un ThreadPoolExecutor de 3),
+#: luego sembrar sin este candado haria que dos hipotesis se repartieran el
+#: mismo stream y el resultado dependiera del ORDEN de los hilos: el mismo
+#: backtest daría un CI95 distinto en cada ciclo. El candado convierte la
+#: simulacion en una seccion critica sembrada, que es determinista.
+_MC_SEED_LOCK = threading.Lock()
+
+#: Iteraciones por defecto del bootstrap. 1000 es lo que usa el puerto; con
+#: el sembrado determinista mas abajo, un numero mayor no cuesta nada de
+#: varianza pero si de CPU, asi que se deja en el valor declarado.
+DEFAULT_MC_ITERATIONS = 1000
 
 
 class ResearchPhase(Enum):
@@ -92,10 +120,25 @@ class ResearchManager:
         self.hypotheses: Dict[str, Hypothesis] = {}
         self.results: Dict[str, StrategyResult] = {}
         self.monte_carlo_results: Dict[str, MonteCarloResult] = {}
+        #: Veredictos por fase. Viven aparte del resultado porque el
+        #: resultado es un NUMERO y el veredicto es "este numero significa
+        #: algo / no significa nada". Con 7 operaciones el bootstrap devuelve
+        #: un intervalo igual de preciso que con 400, y sin este campo
+        #: aparte no habria forma de distinguir los dos casos.
+        self.statistical_results: Dict[str, Dict[str, Any]] = {}
+        self.monte_carlo_verdicts: Dict[str, Dict[str, Any]] = {}
         self.experiments: List[Dict[str, Any]] = []
+
+        # Politica de la validacion cientifica (umbrales declarados, una sola
+        # vez): ver `quant_math.risk.gate_policy`.
+        self.scientific_policy = resolve_scientific_policy()
 
         print(f"[ResearchManager] Initialized with knowledge_base, backtest_engine, "
               f"monte_carlo_engine, statistical_validator, risk_manager")
+        print(f"[ResearchManager] politica cientifica: min_operaciones="
+              f"{self.scientific_policy['min_trades']} alpha="
+              f"{self.scientific_policy['alpha']} gate="
+              f"{self.scientific_policy['require']}")
 
     def generate_hypothesis(
         self,
@@ -283,7 +326,74 @@ class ResearchManager:
             print("[ResearchManager] Backtest complete")
         return result
 
-    def run_monte_carlo(self, hypothesis_id: str, n_iterations: int = 1000) -> MonteCarloResult:
+    @staticmethod
+    def _trade_pnls(result: Any) -> List[float]:
+        """PnL por operacion del resultado de backtest, en la unidad del PnL.
+
+        Acepta `Trade` (dataclass con `.pnl`) y dicts con cualquiera de las
+        claves que se han usado en el repo. Se recorre el campo REAL del
+        backtester y no el agregado: un CI sobre la media agregado seria una
+        medida de una sola operacion.
+        """
+        pnls: List[float] = []
+        for trade in (getattr(result, "trades", None) or []):
+            valor = None
+            if isinstance(trade, dict):
+                for clave in ("pnl", "PnL", "profit_loss", "net_pnl"):
+                    if trade.get(clave) is not None:
+                        valor = trade.get(clave)
+                        break
+            else:
+                for clave in ("pnl", "PnL", "profit_loss", "net_pnl"):
+                    valor = getattr(trade, clave, None)
+                    if valor is not None:
+                        break
+            if valor is None:
+                continue
+            try:
+                pnls.append(float(valor))
+            except (TypeError, ValueError):
+                continue
+        return pnls
+
+    @staticmethod
+    def _mc_seed(hypothesis_id: str, n_trades: int, n_iterations: int) -> int:
+        """Semilla derivada de la identidad de la hipotesis, no del reloj.
+
+        `hash()` de Python esta SALADO por proceso (`PYTHONHASHSEED`), asi
+        que sembrar con el daria un CI distinto en cada arranque y el
+        `scientific_score` no seria reproducible. `hashlib` no.
+        """
+        clave = f"{hypothesis_id}|{n_trades}|{n_iterations}".encode("utf-8")
+        return int(hashlib.sha256(clave).hexdigest()[:8], 16)
+
+    @staticmethod
+    def _mc_result_vacio(hypothesis_id: str, n_trades: int) -> Any:
+        """Resultado con la FORMA de `MonteCarloResult` y todos los campos a 0.
+
+        Devolver `None` romperia a los llamantes que leen `.mean` /
+        `.lower_bound` (los reales: `AQDERunner.run_monte_carlo_for_results`),
+        y devolver el numero de una simulacion sobre 7 operaciones seria
+        JUSTO el fallo que se quiere evitar. Se devuelve la forma sin
+        contenido y el veredicto (con su motivo) va en
+        `self.monte_carlo_verdicts`, que es donde se lee.
+        """
+        return SimpleNamespace(
+            hypothesis_id=hypothesis_id,
+            n_iterations=0,
+            mean=0.0,
+            median=0.0,
+            std_dev=0.0,
+            min_value=0.0,
+            max_value=0.0,
+            lower_bound=0.0,
+            upper_bound=0.0,
+            confidence_level=0.0,
+            inconclusive=True,
+            n_observed_trades=n_trades,
+        )
+
+    def run_monte_carlo(self, hypothesis_id: str, n_iterations: int = DEFAULT_MC_ITERATIONS) -> MonteCarloResult:
         """
         Run Monte Carlo simulation on a hypothesis.
 
@@ -292,31 +402,169 @@ class ResearchManager:
             n_iterations: Number of simulation iterations
 
         Returns:
-            MonteCarloResult with distribution statistics
+            MonteCarloResult with distribution statistics. Si el numero de
+            operaciones no llega al minimo declarado, se devuelve la forma
+            vacia y el veredicto queda en `self.monte_carlo_verdicts`.
         """
         print(f"[ResearchManager] Running Monte Carlo for {hypothesis_id} ({n_iterations} iterations)")
 
-        result = self.monte_carlo_engine.simulate_distribution(
-            self.results[hypothesis_id],
-            n_iterations=n_iterations
-        )
+        result = self.results.get(hypothesis_id)
+        if result is None:
+            raise ValueError(
+                f"Monte Carlo sin resultado de backtest para {hypothesis_id}: "
+                "la fase se alimenta del backtest YA hecho, nunca de otro "
+                "distinto. Llama antes a run_backtest().")
+
+        n_trades = len(self._trade_pnls(result))
+        min_trades = int(self.scientific_policy["min_trades"])
+
+        # El umbral se APLICA, no se comenta. Por debajo no se simula: un
+        # CI95 sobre un puñado de operaciones sale con la misma forma que uno
+        # sobre cientos y no significa nada, asi que devolverlo seria justo el
+        # numero que parece una medida. Medido sobre las ejecuciones reales del
+        # libro (ver `gate_policy.MIN_TRADES_CONCLUSION`): a n=7 el intervalo
+        # de la media/trade es [-0,133, +0,430] y contiene el cero; a n=30 es
+        # [+0,087, +0,351] y ya no.
+        if n_trades < min_trades:
+            motivo = (f"n_operaciones={n_trades} < {min_trades}: el CI95 no "
+                      "concluye nada")
+            self.monte_carlo_verdicts[hypothesis_id] = {
+                "conclusive": False,
+                "n_trades": n_trades,
+                "min_trades": min_trades,
+                "n_iterations": 0,
+                "mean": 0.0,
+                "lower_bound": 0.0,
+                "upper_bound": 0.0,
+                "reason": motivo,
+            }
+            self.knowledge_base.update_hypothesis(hypothesis_id, {
+                FIELD_MC_CONCLUSIVE: False,
+            })
+            print(f"[ResearchManager] Monte Carlo NO concluyente para "
+                  f"{hypothesis_id}: {motivo}")
+            return self._mc_result_vacio(hypothesis_id, n_trades)
+
+        with _MC_SEED_LOCK:
+            import numpy as np
+            np.random.seed(self._mc_seed(hypothesis_id, n_trades, n_iterations))
+            result = self.monte_carlo_engine.simulate_distribution(
+                result, n_iterations=n_iterations
+            )
 
         self.monte_carlo_results[hypothesis_id] = result
+        self.monte_carlo_verdicts[hypothesis_id] = {
+            "conclusive": True,
+            "n_trades": n_trades,
+            "min_trades": min_trades,
+            "n_iterations": int(getattr(result, "n_iterations", n_iterations) or 0),
+            "mean": float(getattr(result, "mean", 0.0) or 0.0),
+            "lower_bound": float(getattr(result, "lower_bound", 0.0) or 0.0),
+            "upper_bound": float(getattr(result, "upper_bound", 0.0) or 0.0),
+            "reason": "",
+        }
 
         # Update knowledge base
         self.knowledge_base.update_hypothesis(hypothesis_id, {
             "monte_carlo_score": result.mean,
-            "status": StrategyStatus.MONTE_CARLO_TESTED.value
+            "status": StrategyStatus.MONTE_CARLO_TESTED.value,
+            FIELD_MC_CONCLUSIVE: True,
         })
 
-        print(f"[ResearchManager] Monte Carlo complete: mean={result.mean:.2%}")
+        print(f"[ResearchManager] Monte Carlo complete: mean={result.mean:.2%} "
+              f"(n={n_trades} operaciones, CI95=[{result.lower_bound:.2%}, "
+              f"{result.upper_bound:.2%}])")
         return result
+
+    def run_statistical_validation(self, hypothesis_id: str,
+                                  result: Any = None) -> Dict[str, Any]:
+        """Test de significancia sobre el PnL REAL de las operaciones.
+
+        Conecta `quant_math/expectation/statistical_tests.py`, que llevaba 466
+        lineas sin una sola llamada. Se usa el t de una muestra en UNA cola
+        (`media > 0`) porque lo que se quiere responder es si el edge existe,
+        no si es distinto de cero, y porque es de forma cerrada: no siembra
+        nada y por tanto el veredicto es el mismo en cada ciclo.
+
+        Por debajo del minimo declarado de operaciones el p-value se calcula
+        pero NO se puede concluir: se marca `conclusive=False` y el motivo.
+        """
+        result = result if result is not None else self.results.get(hypothesis_id)
+        if result is None:
+            raise ValueError(
+                f"validacion sin resultado de backtest para {hypothesis_id}")
+
+        pnls = self._trade_pnls(result)
+        n = len(pnls)
+        min_trades = int(self.scientific_policy["min_trades"])
+        alpha = float(self.scientific_policy["alpha"])
+
+        if n == 0:
+            veredicto = {
+                "hypothesis_id": hypothesis_id,
+                "test": "one_sample_ttest",
+                "n_trades": 0,
+                "min_trades": min_trades,
+                "mean_pnl": 0.0,
+                "t_statistic": 0.0,
+                "p_value": 1.0,
+                "alpha": alpha,
+                "significant": False,
+                "conclusive": False,
+                "reason": "sin operaciones: no hay nada que testear",
+            }
+        else:
+            res = StatisticalTests.test_strategy_significance(pnls, test='ttest')
+            p_value = float(res.get("p_value", 1.0))
+            # El p-value tambien cabe en el campo que el puerto declara
+            # (`StrategyResult.statistical_significance`). En el camino real el
+            # objeto es un `backtesting.BacktestResult`, que NO tiene ese
+            # campo, y el backtester esta congelado: se rellena cuando existe
+            # y el valor viaja igualmente en el registro de la KB, que es
+            # donde lo lee el gate.
+            if hasattr(result, "statistical_significance"):
+                try:
+                    result.statistical_significance = p_value
+                except Exception:  # pragma: no cover - dataclass sin slots
+                    pass
+            suficiente = n >= min_trades
+            veredicto = {
+                "hypothesis_id": hypothesis_id,
+                "test": res.get("test", "one_sample_ttest"),
+                "n_trades": n,
+                "min_trades": min_trades,
+                "mean_pnl": float(res.get("mean_excess_return", 0.0) or 0.0),
+                "t_statistic": float(res.get("t_statistic", 0.0) or 0.0),
+                "p_value": p_value,
+                "alpha": alpha,
+                "significant": bool(p_value < alpha) if suficiente else False,
+                "conclusive": suficiente,
+                "reason": "" if suficiente else (
+                    f"n_operaciones={n} < {min_trades}: el p-value={p_value:.4f} "
+                    "no se puede leer"),
+            }
+        veredicto["p_value_field_on_result"] = hasattr(
+            result, "statistical_significance")
+        self.statistical_results[hypothesis_id] = veredicto
+
+        if not veredicto["conclusive"] or not veredicto["significant"]:
+            print(f"[ResearchManager] significancia {hypothesis_id}: "
+                  f"n={n} p={veredicto['p_value']:.4f} "
+                  f"concluyente={veredicto['conclusive']} "
+                  f"significativo={veredicto['significant']}"
+                  + (f" ({veredicto['reason']})" if veredicto["reason"] else ""))
+        return veredicto
 
     def score_hypothesis(self, hypothesis_id: str) -> Dict[str, Any]:
         """
         Calculate comprehensive score for a hypothesis.
 
         Combines validation, backtest, and Monte Carlo scores.
+
+        La fase de Monte Carlo solo pesa si CONCLUYE. Si no hay operaciones
+        suficientes, su contribucion es 0 y no su numero: el pondero es
+        0,3*monte_carlo, y meterle el Bootstrap de 7 operaciones seria
+        puntuar con ruido.
 
         Args:
             hypothesis_id: ID of hypothesis to score
@@ -327,11 +575,24 @@ class ResearchManager:
         print(f"[ResearchManager] Scoring hypothesis: {hypothesis_id}")
 
         hypothesis = self.hypotheses.get(hypothesis_id)
+        if hypothesis is None:
+            raise ValueError(
+                f"no se puede puntuar {hypothesis_id}: no esta en el manager")
 
         # Get scores from different phases
         validation_score = hypothesis.validation_score
         backtest_score = self._calculate_backtest_score(self.results.get(hypothesis_id))
-        monte_carlo_score = self.monte_carlo_results.get(hypothesis_id).mean if hypothesis_id in self.monte_carlo_results else 0.0
+
+        mc_verdict = self.monte_carlo_verdicts.get(hypothesis_id)
+        if mc_verdict is None:
+            monte_carlo_score = 0.0
+            mc_conclusive = False
+        elif mc_verdict.get("conclusive"):
+            monte_carlo_score = float(mc_verdict.get("mean", 0.0) or 0.0)
+            mc_conclusive = True
+        else:
+            monte_carlo_score = 0.0
+            mc_conclusive = False
 
         # Weighted scientific score
         scientific_score = (
@@ -362,15 +623,137 @@ class ResearchManager:
             "status": hypothesis.status.value
         })
 
-        print(f"[ResearchManager] Scientific score: {scientific_score:.2%}")
+        # El score ORDENA. Quien decide si algo se OPERA es el veredicto de
+        # las tres fases, que va aparte: son preguntas distintas y una sola
+        # (el score) no puede responder a las dos. Ver `evaluate_hypothesis`.
+        stats = self.statistical_results.get(hypothesis_id, {})
+        operativo, motivos = self._verdict(hypothesis_id)
+
+        print(f"[ResearchManager] Scientific score: {scientific_score:.2%} "
+              f"(operable={operativo}"
+              + (f", motivos={'; '.join(motivos)}" if motivos else "") + ")")
 
         return {
             "hypothesis_id": hypothesis_id,
             "validation_score": validation_score,
             "backtest_score": backtest_score,
             "monte_carlo_score": monte_carlo_score,
-            "scientific_score": scientific_score
+            "monte_carlo_conclusive": mc_conclusive,
+            "statistical_significance": stats.get("p_value"),
+            "statistical_significance_alpha": stats.get("alpha"),
+            "significance_conclusive": bool(stats.get("conclusive", False)),
+            "significance_significant": bool(stats.get("significant", False)),
+            "scientific_score": scientific_score,
+            FIELD_SCIENTIFICALLY_VALIDATED: operativo,
+            FIELD_SCIENTIFIC_REASONS: motivos,
         }
+
+    def _verdict(self, hypothesis_id: str) -> tuple:
+        """(operable, motivos) leyendo los veredictos de las tres fases.
+
+        Las tres tienen que CONCLUIR y tener el resultado bueno:
+          1. validacion de parametros: score >= 0,5 (la regla que ya usaba
+             `execute_workflow`, sin tocarla),
+          2. significancia del PnL: p < alfa Y con operaciones suficientes,
+          3. Monte Carlo: bootstrap por encima del minimo declarado.
+        """
+        motivos: List[str] = []
+        hyp = self.hypotheses.get(hypothesis_id)
+        if hyp is None:
+            return False, ["hipotesis_desconocida"]
+        if float(getattr(hyp, "validation_score", 0.0) or 0.0) < 0.5:
+            motivos.append(
+                f"validacion={float(getattr(hyp, 'validation_score', 0.0) or 0.0):.2f}<0,5")
+
+        stats = self.statistical_results.get(hypothesis_id)
+        if stats is None:
+            motivos.append("significancia: fase no ejecutada")
+        elif not stats.get("conclusive"):
+            motivos.append(f"significancia: {stats.get('reason') or 'no concluyente'}")
+        elif not stats.get("significant"):
+            motivos.append(
+                f"significancia: p={float(stats.get('p_value', 1.0)):.4f}"
+                f">={float(stats.get('alpha', 0.05))}")
+
+        mc = self.monte_carlo_verdicts.get(hypothesis_id)
+        if mc is None:
+            motivos.append("monte_carlo: fase no ejecutada")
+        elif not mc.get("conclusive"):
+            motivos.append(f"monte_carlo: {mc.get('reason') or 'no concluyente'}")
+
+        return (not motivos), motivos
+
+    def evaluate_hypothesis(self, hypothesis_id: str,
+                            n_iterations: int = DEFAULT_MC_ITERATIONS
+                            ) -> Dict[str, Any]:
+        """Corre las TRES fases sobre el backtest que YA se ha hecho.
+
+        Este es el punto de entrada del pipeline de validacion en el CAMINO
+        REAL (`orchestrator._generate_and_backtest_symbol`). El orden no es
+        arbitrario:
+
+            1. validacion   -> no depende de datos, cheapest, y puede
+                               parar el pipeline sin gastar nada
+            2. significancia-> necesita los PnL REALES de las operaciones
+            3. monte carlo  -> necesita los MISMOS PnL, y ademas depende de
+                               que haya operaciones suficientes (si no, no
+                               simula)
+            4. puntuacion   -> pondera las tres
+
+        Y del backtest NO SE VUELVE A CORRER. Por eso esto NO es
+        `execute_workflow()`: el backtest interno de ese metodo vuelve a
+        bajar datos a 7 dias @1m y pisa `self.results`, luego el Monte Carlo
+        y el score se calcularian sobre un backtest DISTINTO del que se uso
+        para decidir. Aqui las tres fases beben del MISMO `self.results[id]`
+        que produjo el backtest.
+
+        Returns:
+            Diccionario con el veredicto de cada fase y si la hipotesis es
+            operable. Nunca lanza por un fallo de fase: una excepcion se
+            traduce en "no operable" con el motivo, porque una hipotesis que
+            no se ha podido medir no puede afirmarse operable.
+        """
+        val = self.run_validation(hypothesis_id)
+        out: Dict[str, Any] = {
+            "hypothesis_id": hypothesis_id,
+            "validation_score": val.get("validation_score", 0.0),
+        }
+        try:
+            out["statistical"] = self.run_statistical_validation(hypothesis_id)
+        except Exception as exc:
+            out["statistical"] = {"conclusive": False, "significant": False,
+                                  "p_value": None, "reason": f"error: {exc}"}
+            print(f"[ResearchManager] significancia fallo en {hypothesis_id}: "
+                  f"{type(exc).__name__}: {exc}")
+        try:
+            out["monte_carlo"] = self.run_monte_carlo(
+                hypothesis_id, n_iterations=n_iterations)
+        except Exception as exc:
+            out["monte_carlo"] = self._mc_result_vacio(hypothesis_id, 0)
+            self.monte_carlo_verdicts[hypothesis_id] = {
+                "conclusive": False, "n_trades": 0, "mean": 0.0,
+                "lower_bound": 0.0, "upper_bound": 0.0,
+                "reason": f"error: {type(exc).__name__}: {exc}"}
+            print(f"[ResearchManager] Monte Carlo fallo en {hypothesis_id}: "
+                  f"{type(exc).__name__}: {exc}")
+        score = self.score_hypothesis(hypothesis_id)
+        out["scoring"] = score
+        out[FIELD_SCIENTIFICALLY_VALIDATED] = bool(
+            score.get(FIELD_SCIENTIFICALLY_VALIDATED))
+        out[FIELD_SCIENTIFIC_REASONS] = list(
+            score.get(FIELD_SCIENTIFIC_REASONS) or [])
+        out[FIELD_PVALUE] = score.get(FIELD_PVALUE)
+        out[FIELD_PVALUE_ALPHA] = score.get(FIELD_PVALUE_ALPHA)
+        out[FIELD_MC_CONCLUSIVE] = bool(score.get(FIELD_MC_CONCLUSIVE))
+        out[FIELD_VALIDATION_SCORE] = score.get("validation_score")
+        mc = self.monte_carlo_verdicts.get(hypothesis_id, {})
+        out["monte_carlo_mean"] = mc.get("mean", 0.0)
+        out["monte_carlo_lower_bound"] = mc.get("lower_bound", 0.0)
+        out["monte_carlo_upper_bound"] = mc.get("upper_bound", 0.0)
+        out["min_trades_conclusion"] = int(
+            self.scientific_policy["min_trades"])
+        out["scientific_score"] = score.get("scientific_score")
+        return out
 
     def execute_workflow(self, hypothesis_id: str, enable_monte_carlo: bool = True) -> Dict[str, Any]:
         """

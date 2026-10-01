@@ -24,7 +24,9 @@ from quant_math.risk.gate_policy import (
     append_gate_audit,
     resolve_gate_thresholds,
     resolve_learn_mode,
+    resolve_scientific_policy,
     round_trip_cost_pct,
+    scientific_block_reason,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,8 @@ class DecisionEngine:
         # `failed` sigue siendo operable (esta en QUERYABLE_STATUSES).
         min_expectancy: Optional[float] = None,
         min_scientific_score: Optional[float] = None,
+        require_scientific_validation: Optional[bool] = None,
+        strict_scientific_legacy: Optional[bool] = None,
         mode: str = "classic",
         burst_margin: float = 10.0,
         burst_leverage: int = 10,
@@ -142,6 +146,19 @@ class DecisionEngine:
                                      else bool(learn_mode))
         self.min_expectancy, self.min_scientific_score = (
             resolve_gate_thresholds(min_expectancy, min_scientific_score))
+        # Gate cientifico (2026-10-01). `require_scientific_validation` es
+        # distinto de los otros dos umbrales a proposito: no mide tolerancia al
+        # riesgo sino si el dato esta MEDIDO. Por eso `learn_mode` no lo
+        # salta (ver `gate_policy`: esta encendido por defecto en los dos
+        # lanzadores de produccion, y honoringlo lo dejaria como no-op).
+        self.scientific_policy = resolve_scientific_policy(
+            explicit_require=require_scientific_validation,
+            explicit_strict_legacy=strict_scientific_legacy)
+        self.require_scientific_validation = bool(
+            self.scientific_policy["require"])
+        self.strict_scientific_legacy = bool(
+            self.scientific_policy["strict_legacy"])
+        self._scientific_blocked: Dict[str, str] = {}
         # Una posicion por simbolo. Bybit funde las ordenes del mismo
         # simbolo (modo net) y el motor no, luego abrir dos sobre el mismo
         # activo deja mas posiciones locales que reales. MEDIDO el
@@ -217,6 +234,23 @@ class DecisionEngine:
         _slip = (self.burst_slippage_pct if self.mode == "burst"
                  else self.slippage_pct)
         self.cost_floor_pct = round_trip_cost_pct(_slip, taker=self.taker)
+
+        # Gate de VIABILIDAD (2026-10-01). No mide la estrategia, mide la
+        # ARITMETICA: si el coste de ida y vuelta es mayor que el movimiento
+        # que se persigue, o el stop no cabe entre el ruido de la vela y la
+        # liquidacion, esa combinacion no puede ganar por mucho que se
+        # escriba. Se coloca aqui, y no antes, porque necesita `slippage_pct`,
+        # `taker` y `cost_floor_pct`, que se resuelven justo arriba: leerlos
+        # antes seria medir con un coste distinto del con el que se opera.
+        #
+        # `QUANTMATH_VIABILITY_GATE=off` lo apaga para quien quiera medir sin
+        # el filtro. Default True explicito, porque un default silencioso en
+        # False es el mismo fallo que ya se cometio con `env_flag` y con el
+        # learn_mode: una proteccion que nace apagada no protege.
+        self.require_viability = (
+            os.environ.get("QUANTMATH_VIABILITY_GATE", "1") != "0")
+        self.cost_pct = self.cost_floor_pct
+        self._viability_blocked: Dict[str, str] = {}
 
         # O6: sizing vol-targetado solo con gate activo (post-graduacion)
         self.vol_target_enabled = (
@@ -404,13 +438,96 @@ class DecisionEngine:
         self._save_hypothesis(record)
         return hid
 
+    def viability_block_reason(self, symbol: str) -> Optional[str]:
+        """Motivo por el que (simbolo, apalancamiento, temporalidad) no puede
+        ganar, o None si es viable.
+
+        2026-10-01: este filtro NO es de estrategia, es de aritmetica. A un
+        horizonte dado, hay que capturar `coste / movimiento_medio` de la vela;
+        si eso es >= 1 el techo de expectativa es negativo antes de mirar la
+        hipotesis. Y el stop tiene que caber entre el ruido de la vela (p90)
+        y la distancia de liquidacion, o no hay donde ponerlo.
+
+        MEDIDO con velas reales de mainnet: a 100x solo BTC sobrevive, y XRP y
+        SOL no tienen NINGUNA temporalidad viable porque su liquidacion esta
+        mas cerca que el 90% de sus velas. Con taker a 1m ningun simbolo
+        sobrevive en ningun apalancamiento.
+
+        Es un filtro aparte del cientifico a proposito: uno mide la estrategia
+        y el otro mide el mercado, y se pueden fallar los dos a la vez.
+
+        A diferencia del cientifico, este filtro es RUIDO de mercado y no
+        opinion: por eso NO lo salta `learn_mode`. Explorar con expectativa
+        negativa es una decision; operar por encima de la liquidacion no lo
+        es. Conmutable con `QUANTMATH_VIABILITY_GATE=off` para quien quiera
+        medirlo sin el filtro.
+        """
+        if not self.require_viability:
+            return None
+        try:
+            from quant_math.risk.viabilidad import viabilidad
+            v = viabilidad(symbol, self.leverage, self.timeframe,
+                           self.cost_pct)
+        except Exception as exc:
+            # Un filtro que no puede calcular NO bloquea: bloquearia por una
+            # excepcion de import, no por una medicion.
+            logger.warning("[viabilidad] no se pudo calcular: %s", exc)
+            return None
+        if v.get("viable") is None:
+            # Tampoco se bloquea por falta de dato: `insuficiente` no es
+            # `imposible`. Se registra para que quede visible.
+            logger.info("[viabilidad] %s: %s", symbol, v.get("motivo"))
+            return None
+        if v["viable"]:
+            return None
+        if self._viability_blocked.get(symbol) != v["motivo"]:
+            self._viability_blocked[symbol] = v["motivo"]
+            logger.info("[viabilidad] %s NO se opera a %sx en %s: %s",
+                        symbol, self.leverage, self.timeframe, v["motivo"])
+        return v["motivo"]
+
+    def scientifically_operable(self, record: Dict[str, Any]) -> tuple:
+        """(operable, motivo) — UNA definicion de operable, usada por las tres.
+
+        2026-10-01: el pipeline de validacion existia entero y desconectado,
+        asi que el ranking ordenaba por `scientific_score` un campo que
+        `_result_to_kb_record` se inventaba (0,098) porque las tres fases no se
+        ejecutaban. Ahora el registro trae el veredicto y aqui se lee.
+
+        `learn_mode` NO salta este filtro: es una decision de explorar con
+        expectativa negativa, no una licencia para afirmar que algo se ha
+        medido. Las filas anteriores al pipeline no tienen veredicto y por
+        eso conservan la semantica anterior en vez de borrar el universo de
+        golpe (`strict_legacy` las cierra).
+
+        Devuelve `(True, "")` cuando no hay nada que objetar.
+        """
+        if not self.require_scientific_validation:
+            return True, ""
+        motivo = scientific_block_reason(
+            record, strict_legacy=self.strict_scientific_legacy)
+        if motivo is None:
+            return True, ""
+        hid = record.get("hypothesis_id")
+        if hid and self._scientific_blocked.get(hid) != motivo:
+            self._scientific_blocked[hid] = motivo
+            logger.info(
+                "[gate] %s NO operable cientificamente (%s): validacion "
+                "exigida=%s strict_legacy=%s",
+                hid, motivo, self.require_scientific_validation,
+                self.strict_scientific_legacy)
+        return False, motivo
+
     def ranked_candidates(self, symbol: str) -> List[Dict[str, Any]]:
         """Todos los candidatos consultables ordenados por
         (expectancy DESC, scientific_score DESC)."""
+        if self.viability_block_reason(symbol):
+            return []
         candidates = [
             h for h in self.hypotheses.values()
             if h.get("symbol", h.get("asset")) == symbol
             and h.get("status") in QUERYABLE_STATUSES
+            and self.scientifically_operable(h)[0]
         ]
         return sorted(
             candidates,
@@ -420,10 +537,13 @@ class DecisionEngine:
 
     def select_best_hypothesis(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Best hypothesis for symbol by (expectancy DESC, scientific_score DESC)."""
+        if self.viability_block_reason(symbol):
+            return None
         candidates = [
             h for h in self.hypotheses.values()
             if h.get("symbol", h.get("asset")) == symbol
             and h.get("status") in QUERYABLE_STATUSES
+            and self.scientifically_operable(h)[0]
         ]
         if not candidates:
             return None

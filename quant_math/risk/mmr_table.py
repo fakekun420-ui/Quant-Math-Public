@@ -68,11 +68,84 @@ CACHE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".bybit_risk_limit.json")
 CACHE_MAX_AGE_S = 24 * 3600
 
-#: MMR por defecto cuando el exchange no dice. Es el valor MEDIDO en una
-#: posicion real de BTC a 150x (mantenimiento 0,3207 / nocional 83,3849 =
-#: 0,003846), NO el 0,0033 de la tabla, que era mas pequeno y por tanto
-#: mas optimista de lo permitido. Ver el docstring del modulo.
+#: MMR MEDIDO en posiciones REALES de la cuenta (no de la tabla).
+#:
+#: MEDIDO el 2026-10-01 con `positionMM / positionValue` sobre posiciones
+#: vivas a 100x, leyendo el exchange. Esto se midio y se guardaba, y
+#: solo servia mientras la posicion estaba abierta: `mmr_for_symbol`
+#: cae a la tabla o al valor por defecto cuando no hay posicion, y en
+#: el PRIMER calculo (que es justo cuando hace falta para colocar el SL)
+#: no hay ninguna. Con estos numeros, el primer calculo tambien es real.
+#:
+#:   XRP  0,5543%   ETH  0,3856%   SOL  0,5556%
+#:
+#: Comparado con lo que se asumia (0,3846%, el de BTC a 150x): XRP y
+#: SOL son un 44% MAS altos. Con el supuesto, su liquidacion se
+#: calculaba mas lejos de la real de lo que esta, y el clamp del SL
+#: dejaba pasar un stop mas apretado del debido en justo los dos
+#: simbolos con mas volatilidad.
+#:
+#: Se aplica solo cuando la tabla NO tiene el simbolo (medido: la tabla
+#: publica de Bybit tiene 675 simbolos y XRP y SOL no estan). Cuando la
+#: tabla tiene fila, manda la tabla, que es la fuente oficial y se
+#: actualiza sola. Aqui no se sustituye una fuente por un dato fijo,
+#: se rellena un hueco que la fuente no cubre.
+#: MEDIDO a 100x y SOLO a 100x. El MMR de Bybit escala con el
+#: apalancamiento en escalones (medido con BTC: 2,5% a 25x, 1,0% a 50x,
+#: 0,5% a 100x), asi que un valor medido a 100x aplicado a 25x NO es una
+#: aproximacion conservative: es un numero falso. Como la tabla publica no
+#: tiene estos simbolos, a 25x y 50x no se puede dar el MMR y se devuelve
+#: "no medido". Se prefiere eso a inventar el escalon.
+MMR_MEDIDOS: Dict[Tuple[str, int], float] = {
+    ("XRPUSDT", 100): 0.005543,
+    ("SOLUSDT", 100): 0.005556,
+}
+
+#: MMR por defecto cuando el exchange no dice NADA, y no solo para un
+#: apalancamiento.
+#:
+#: MEDIDO el 2026-10-01 en la tabla publica de Bybit para BTC, y el MMR escala
+#: en escalones con el apalancamiento:
+#:
+#:     5x -> 12,00%   10x -> 6,50%   25x -> 2,50%
+#:    50x ->  1,00%  100x -> 0,50%  125x -> 0,33%
+#:
+#: Antes se aplicaba 0,003846 a TODO, o sea el valor de 150x tambien a 25x.
+#: Eso NO era conservador, era al reves: con MMR plano a 25x la liquidacion
+#: se ponia a (4,00% - 0,38%) = 3,62% cuando la real esta a 1,50%. El
+#: clamp del SL dejaba pasar stops que el exchange habria rechazado, y hacia
+#: creer que habia el doble de margen del que hay. Sobreestimar el espacio
+#: es la direccion que da pnls falsos.
+#:
+#: Estos escalones son los de BTC, un simbolo de la capitalizacion mas
+#: grande de la lista. Para un simbolo que no esta en la tabla son una
+#: APROXIMACION y asi se etiqueta en `origen`. La unica forma de cerrarla es
+#: que el simbolo este en la tabla, que es lo que hace `cargar_tabla`.
+ESCALONES_MMR: Tuple[Tuple[int, float], ...] = (
+    (1, 0.120000), (10, 0.065000), (25, 0.025000),
+    (50, 0.010000), (100, 0.005000), (125, 0.003300),
+)
 FALLBACK_MMR = 0.003846
+
+
+def _mmr_por_escalon(leverage) -> float:
+    """MMR estimado por escalon de apalancamiento.
+
+    Si el apalancamiento es MAYOR que el ultimo escalon conocido se usa ese,
+    que es el mas bajo: es el supuesto que mas espacio da, y por eso solo se
+    acepta cuando de verdad no hay nada mejor.
+    """
+    try:
+        lev = max(1, int(leverage))
+    except (TypeError, ValueError):
+        lev = 100
+    elegido = ESCALONES_MMR[0][1]
+    for tope, valor in ESCALONES_MMR:
+        if lev <= tope:
+            elegido = valor
+            break
+        elegido = valor
+    return elegido
 
 #: Simbolos que se saben ausentes de la tabla publica (medido: no
 #: aparecen en las 40 paginas, 600 simbolos). Sin esto se consultaria y
@@ -232,7 +305,10 @@ def mmr_for_symbol(simbolo: Optional[str], leverage) -> Tuple[float, str]:
     sym = _normaliza(simbolo or "")
     cargar_tabla()
     if not _CACHE:
-        return FALLBACK_MMR, "por_defecto"
+        est = _mmr_por_escalon(lev)
+        logger.debug("[mmr] la tabla de riesgo no esta disponible: se estima "
+                     "por escalon %.4f%% (NO es medida)", est * 100)
+        return est, f"estimado_escalon:{lev}x"
     if sym in _CACHE:
         filas = _CACHE[sym]
         if lev in filas:
@@ -247,9 +323,27 @@ def mmr_for_symbol(simbolo: Optional[str], leverage) -> Tuple[float, str]:
         elegido = max(filas)
         return filas[elegido], f"exchange:{sym}@{elegido}x"
     if sym in KNOWN_ABSENT:
-        logger.debug("[mmr] %s no esta en la tabla publica de Bybit: se usa "
-                     "el valor por defecto %.6f", sym, FALLBACK_MMR)
-    return FALLBACK_MMR, "por_defecto"
+        # MEDIDO el 2026-10-01: para estos dos simbolos la tabla publica no
+        # existe, pero el MMR REAL se midio en sus posiciones vivas. Se usa
+        # ese en vez del valor por defecto de otro activo: medido, es un
+        # 44% mas alto, y la liquidacion calculada con el supuesto estaba
+        # mas lejos de la real de lo que esta.
+        medido = MMR_MEDIDOS.get((sym, int(leverage)))
+        if medido is not None:
+            logger.debug("[mmr] %s a %sx no esta en la tabla de Bybit; se usa "
+                         "el MEDIDO en su posicion real: %.4f%%", sym,
+                         leverage, medido * 100)
+            return medido, f"medido:{sym}@{leverage}x"
+        logger.debug("[mmr] %s a %sx no esta en la tabla publica de Bybit ni "
+                     "hay medida a ESE apalancamiento: se estima por escalon "
+                     "%.4f%% (escalones de BTC, NO es medida).", sym,
+                     leverage, _mmr_por_escalon(leverage) * 100)
+        return _mmr_por_escalon(leverage), f"estimado_escalon:{leverage}x"
+    est = _mmr_por_escalon(leverage)
+    logger.debug("[mmr] %s a %sx: la tabla no esta disponible; se estima por "
+                 "escalon %.4f%% (escalones de BTC, NO es medida).", sym,
+                 leverage, est * 100)
+    return est, f"estimado_escalon:{leverage}x"
 
 
 def mmr_from_live_position(simbolo: Optional[str], api=None) -> Tuple[

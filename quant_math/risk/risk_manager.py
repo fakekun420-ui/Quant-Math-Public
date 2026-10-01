@@ -24,6 +24,28 @@ class RiskManager:
     and stress testing using Quant-Math core modules.
     """
 
+    # ------------------------------------------------------------------
+    # Pisos de muestra para las estadisticas de la SERIE DE CIERRES
+    # ------------------------------------------------------------------
+    # Mismo numero que el Kelly y por la misma razon: por debajo de 20
+    # observaciones una sola operacion mueve la estadistica mas de 5 pp
+    # (1/N) y el numero deja de ser una medida. Toda serie que alimente
+    # VaR/ES o Sharpe pasa por aqui ANTES de calcularse.
+    MIN_CLOSURES_FOR_SAMPLE = 20
+
+    # Compatibilidad: la politica de muestra empezo con el Kelly y el
+    # nombre viejo sigue referenciado fuera de aqui. Un solo numero,
+    # dos nombres: dos constantes con el mismo valor a mano son dos
+    # constantes que acaban divergiendo.
+    MIN_CLOSURES_FOR_KELLY = MIN_CLOSURES_FOR_SAMPLE
+
+    # Piso aparte para el nivel 99%. Un cuantil al 99% se apoya en UNA
+    # observacion de cada 100: con menos de 100 cierres no hay cola
+    # empirica que medir y el numero sale entero del supuesto de
+    # normalidad, no de los datos. Por eso VaR/ES-95 y VaR/ES-99 no se
+    # activan juntos.
+    MIN_CLOSURES_FOR_VAR99 = 100
+
     def __init__(
         self,
         max_position_size_pct: float = 0.2,
@@ -73,6 +95,7 @@ class RiskManager:
         avg_win: Optional[float] = None,
         avg_loss: Optional[float] = None,
         n_closures: Optional[int] = None,
+        pnl_series: Optional[List[float]] = None,
         **risk_params
     ) -> Dict[str, Any]:
         """
@@ -89,12 +112,22 @@ class RiskManager:
                 Si viene y es menor que MIN_CLOSURES_FOR_KELLY, NO se
                 calcula Kelly: una muestra chica lo mueve una sola
                 operacion y el tamano resultante seria una invencion.
+            pnl_series: PnL en USD de cada cierre DEDUPLICADO del ledger,
+                en orden. Alimenta VaR/ES (cola) y Sharpe/Sortino
+                (calidad). Si no viene, esos bloques se declaran
+                `sin_datos` en vez de inventar un numero.
             **risk_params: Additional risk parameters
 
         Returns:
             Dictionary with risk check results. El registro incluye
             `kelly_status` + `kelly_note` (por que hay o no hay Kelly) y
-            `kelly_advisory` (aviso si el pedido supera el Kelly medido).
+            `kelly_advisory` (aviso si el pedido supera el Kelly medido),
+            mas `var_status`/`var_note`/`var_*_frac` (VaR y Expected
+            Shortfall de la cola por cierre) y
+            `sharpe_status`/`sharpe_note`/`sharpe`/`sortino` (calidad de
+            la serie). Ninguno de esos cuatro estados toca `approved` ni
+            `reasons`: son ESTADO MEDIDO, no frenos (los frenos vivos son
+            DailyGuard y los topes de margen/riesgo).
         """
         # Apply position limits
         max_position = account_value * self.max_position_size_pct
@@ -108,6 +141,16 @@ class RiskManager:
             account_value, win_rate, avg_win, avg_loss, n_closures
         )
         kelly_size = kelly["size"]  # float | None: nunca un 0 sin explicar
+
+        # VaR/ES (cola del PnL) y Sharpe/Sortino (calidad de la serie),
+        # calculados con los modulos canonicos `risk.var` y
+        # `expectation.sharpe_metrics` sobre la MISMA serie de cierres que
+        # alimenta el Kelly, y con el mismo piso de muestra. Los dos
+        # devuelven ESTADO (`*_status`/`*_note`): si no hay datos o no hay
+        # muestra suficiente lo dicen con el numero en la mano en vez de
+        # entregar un VaR o un Sharpe de ruido.
+        cola = self._tail_risk_assessment(pnl_series, account_value)
+        calidad = self._quality_assessment(pnl_series, account_value)
 
         # Check constraints
         approved = True
@@ -158,6 +201,11 @@ class RiskManager:
             "kelly_note": kelly["note"],
             "kelly_fraction_applied": kelly["fraction"],
             "kelly_advisory": kelly_advisory,
+            # cola (VaR/ES) y calidad (Sharpe/Sortino): estado medido,
+            # nunca un veto — ver `_tail_risk_assessment` y
+            # `_quality_assessment`.
+            **cola,
+            **calidad,
             "account_value": account_value
         }
 
@@ -172,12 +220,8 @@ class RiskManager:
 
         return check_record
 
-    # Muestra minima de cierres para dar por bueno un win_rate medido del
-    # libro de operaciones. No es un capricho: con N=20 un solo cierre
-    # mueve el win_rate 5 puntos porcentuales (1/N), y por debajo de eso
-    # el Kelly se dispara o se anula por el ruido de UNA operacion — el
-    # tamano resultante dejaria de ser una medida para ser una invencion.
-    MIN_CLOSURES_FOR_KELLY = 20
+    # (el piso comun MIN_CLOSURES_FOR_SAMPLE, definido arriba: con N=20
+    # una sola operacion mueve el win_rate 5 puntos porcentuales)
 
     def _kelly_assessment(
         self,
@@ -299,6 +343,217 @@ class RiskManager:
                 f"{account_value * fraction:.2f} USD de margen "
                 f"(win_rate={wr:.4f}, {n_txt})"
             ),
+        }
+
+    # ------------------------------------------------------------------
+    # Cola (VaR/ES) y calidad (Sharpe/Sortino) de la serie de cierres
+    # ------------------------------------------------------------------
+    #: Unidad en la que se reporta TODO lo de este bloque: fraccion de la
+    #: cuenta por cierre. Sin una unidad declarada, dos calculos con el
+    #: mismo nombre no son comparables entre si ni con los frenos vivos
+    #: (DailyGuard habla de % de capital, el tope de margen tambien).
+    SERIE_UNIDAD = "fraccion de la cuenta por cierre"
+
+    def _serie_cierres(
+        self,
+        pnl_series: Optional[List[float]],
+        account_value: float,
+    ) -> Tuple[str, Optional[np.ndarray], str]:
+        """Serie de cierres normalizada a fraccion de la cuenta.
+
+        Devuelve (estado, serie, nota). La serie es None salvo en "ok":
+        el motivo de que no lo este va siempre en la nota, para que el
+        registro pueda explicar por que no hay numero en vez de devolver
+        un cero que parezca una medida (el mismo bug que tuvo el Kelly).
+
+        Nunca lanza: esta llamada vive dentro del `try` de
+        `_apply_margin_cap`, donde cualquier excepcion RECHAZA la entrada
+        y un fallo de parseo del ledger no debe costar una operacion.
+        """
+        if not pnl_series:
+            return ("sin_datos", None, (
+                "sin serie de cierres: NO se calcula. Unidad que se "
+                f"usaria: {self.SERIE_UNIDAD}; horizonte = 1 cierre, NO "
+                "diario. El sistema sigue con sus frenos vivos "
+                "(DailyGuard, tope de margen y tope de riesgo por "
+                "operacion)."
+            ))
+        try:
+            arr = np.array([float(x) for x in pnl_series], dtype=float)
+            cuenta = float(account_value)
+            validos = (arr.size > 0 and bool(np.isfinite(arr).all())
+                       and np.isfinite(cuenta) and cuenta > 0)
+        except (TypeError, ValueError, OverflowError):
+            validos = False
+        if not validos:
+            return ("datos_invalidos", None, (
+                f"serie de cierres o cuenta fuera de dominio (n="
+                f"{len(pnl_series)}, cuenta={account_value}): NO se "
+                "calcula en vez de calcular algo dudoso. Unidad que se "
+                f"usaria: {self.SERIE_UNIDAD}."
+            ))
+        return ("ok", arr / cuenta, "")
+
+    def _tail_risk_assessment(
+        self,
+        pnl_series: Optional[List[float]],
+        account_value: float,
+    ) -> Dict[str, Any]:
+        """VaR y Expected Shortfall de la cola, CON estado explicito.
+
+        Que mide: la perdida maxima esperada (VaR) y la perdida media mas
+        alla de esa cola (ES) de UN cierre, en fraccion de la cuenta.
+        Delega el calculo en los modulos canonicos
+        `quant_math.risk.var.ValueAtRisk` / `ExpectedShortfall`
+        (parametrico normal), que hasta el 2026-10-01 no tenian NINGUN
+        llamador en produccion.
+
+        Por que no veta: un freno por cola exige un umbral, y el umbral
+        se decide con replay sobre el ledger — con la muestra actual
+        (9 cierres) el replay deja el VaR-95 entre 0.026 y 0.060 de la
+        cuenta segun que cierre se quita, asi que cualquier umbral seria
+        una decision tomada sobre ruido. Mientras no haya muestra, esto es
+        estado medido y nada mas: `approved` y `reasons` no se tocan.
+
+        Por que dos pisos (20 y 100): ver `MIN_CLOSURES_FOR_SAMPLE` y
+        `MIN_CLOSURES_FOR_VAR99`.
+        """
+        vacio = {"var_95_frac": None, "es_95_frac": None,
+                 "var_99_frac": None, "es_99_frac": None}
+        status, serie, motivo = self._serie_cierres(pnl_series, account_value)
+        if serie is None:
+            return {"var_status": status, "var_note": motivo, **vacio}
+
+        n = int(serie.size)
+        if n < self.MIN_CLOSURES_FOR_SAMPLE:
+            return {
+                "var_status": "insuficiente",
+                "var_note": (
+                    f"solo {n} cierres medidos (piso "
+                    f"{self.MIN_CLOSURES_FOR_SAMPLE}): NO se calcula "
+                    "VaR/ES. Con N tan chica una sola operacion mueve el "
+                    "VaR-95 mas de un 50% (leave-one-out medido sobre el "
+                    "ledger real: 0.026-0.060 de la cuenta con N=9), o sea "
+                    "que el numero seria ruido. Unidad: "
+                    f"{self.SERIE_UNIDAD}; horizonte = 1 cierre. Mandan "
+                    "los frenos vivos."
+                ),
+                **vacio,
+            }
+
+        media = float(np.mean(serie))
+        dstd = float(np.std(serie, ddof=1))
+        var_95 = float(self.var_calculator.calculate(media, dstd, 0.95))
+        es_95 = float(self.es_calculator.calculate(media, dstd, 0.95))
+        var_99 = None
+        es_99 = None
+        if n >= self.MIN_CLOSURES_FOR_VAR99:
+            var_99 = float(self.var_calculator.calculate(media, dstd, 0.99))
+            es_99 = float(self.es_calculator.calculate(media, dstd, 0.99))
+            nota_99 = (
+                f"VaR-99={var_99:.4%} y ES-99={es_99:.4%} de la cuenta "
+                f"medidos con {n} cierres (piso "
+                f"{self.MIN_CLOSURES_FOR_VAR99})"
+            )
+            status = "ok"
+        else:
+            nota_99 = (
+                f"VaR/ES-99 NO medidos: {n} cierres < piso "
+                f"{self.MIN_CLOSURES_FOR_VAR99} (el nivel 99% se apoya en "
+                "1 observacion de cada 100 y aqui no hay cola empirica "
+                "que medir; saldria del supuesto de normalidad, no de los "
+                "datos)"
+            )
+            status = "ok_95"
+        return {
+            "var_status": status,
+            "var_note": (
+                f"VaR-95={var_95:.4%} y ES-95={es_95:.4%} de la cuenta — "
+                f"unidad: {self.SERIE_UNIDAD}; horizonte = 1 cierre, NO "
+                f"diario; metodo parametrico normal sobre {n} cierres. "
+                f"{nota_99}. Estado informativo: NO aprueba ni veta "
+                "entradas."
+            ),
+            "var_95_frac": var_95,
+            "es_95_frac": es_95,
+            "var_99_frac": var_99,
+            "es_99_frac": es_99,
+        }
+
+    def _quality_assessment(
+        self,
+        pnl_series: Optional[List[float]],
+        account_value: float,
+    ) -> Dict[str, Any]:
+        """Sharpe y Sortino de la serie de cierres, CON estado explicito.
+
+        Delega en `quant_math.expectation.sharpe_metrics.SharpeMetrics`,
+        que hasta el 2026-10-01 solo se instanciaba en `__init__` y no
+        tenia ni un llamador.
+
+        Dos decisiones, ambas por medicion:
+
+        1. **NO se anualiza.** La serie es por CIERRE, no diaria:
+           `periods_per_year=1`. Anualizarla con 252 (el default del
+           modulo) multiplicaria el Sharpe por sqrt(252)=15.9 sin que
+           exista ningun horizonte diario detras: con la serie real del
+           ledger, -0.29 saldria -4.58 pareciendo una estrategia
+           desastrosa cuando solo se ha cambiado la unidad.
+        2. **No se compara contra un umbral.** `check_sharpe_threshold`
+           (umbral 1.0) sigue sin llamarse: 1.0 es un default sin
+           evidencia de este negocio, y aplicarlo con n<20 seria vetar
+           entradas con ruido. Cuando haya muestra, el umbral se decide
+           con replay.
+        """
+        vacio = {"sharpe": None, "sortino": None}
+        status, serie, motivo = self._serie_cierres(pnl_series, account_value)
+        if serie is None:
+            return {"sharpe_status": status, "sharpe_note": motivo, **vacio}
+
+        n = int(serie.size)
+        if n < self.MIN_CLOSURES_FOR_SAMPLE:
+            return {
+                "sharpe_status": "insuficiente",
+                "sharpe_note": (
+                    f"solo {n} cierres medidos (piso "
+                    f"{self.MIN_CLOSURES_FOR_SAMPLE}): NO se calcula "
+                    "Sharpe/Sortino. Con menos de 20 operaciones una sola "
+                    "mueve la estadistica 1/N >= 5 pp, y ademas aqui NO "
+                    "se anualiza: la serie es por cierre. Unidad: "
+                    f"{self.SERIE_UNIDAD}."
+                ),
+                **vacio,
+            }
+
+        # periods_per_year=1 -> sin anualizar (la serie es por cierre).
+        sharpe = float(SharpeMetrics.sharpe_ratio(serie, periods_per_year=1))
+        sortino = float(SharpeMetrics.sortino_ratio(serie, periods_per_year=1))
+        # `inf` es un caso de borde del modulo (sin perdidas, o
+        # desviacion a la baja 0): se guarda None para que el registro
+        # siga siendo JSON valido y el motivo quede en la nota, no un
+        # Infinity que quien lea el registro no sabe interpretar.
+        nota_borde = ""
+        if not np.isfinite(sharpe) or not np.isfinite(sortino):
+            nota_borde = (" (borde del modulo: sin perdidas o con "
+                          "desviacion a la baja 0, el ratio no tiene "
+                          "definicion finita)")
+            sharpe = sharpe if np.isfinite(sharpe) else None
+            sortino = sortino if np.isfinite(sortino) else None
+        if float(np.std(serie, ddof=1)) == 0:
+            nota_borde = (" (serie plana: std=0, el modulo devuelve 0.0 "
+                          "por definicion, no por medida)")
+        return {
+            "sharpe_status": "ok",
+            "sharpe_note": (
+                f"Sharpe={sharpe if sharpe is None else round(sharpe, 4)} y "
+                f"Sortino={sortino if sortino is None else round(sortino, 4)} "
+                f"POR OPERACION y SIN anualizar (serie de {n} cierres, no "
+                "diaria; delegado en SharpeMetrics con periods_per_year=1). "
+                f"Unidad: {self.SERIE_UNIDAD}.{nota_borde} Estado "
+                "informativo: NO aprueba ni veta entradas."
+            ),
+            "sharpe": sharpe,
+            "sortino": sortino,
         }
 
     def check_drawdown_limit(

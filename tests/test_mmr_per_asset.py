@@ -116,13 +116,25 @@ def test_si_el_exchange_no_responde_se_dice_no_se_finge():
     forma comun es aparecer como si todo estuviera bien.
     """
     mmr, origen = mmr_table.mmr_for_symbol("NOEXISTE/USDT:USDT", 100)
-    assert origen == "por_defecto", "un simbolo inexistente da por_defecto"
-    assert mmr == mmr_table.FALLBACK_MMR
-    # Y el valor por defecto es el MEDIDO en BTC a 150x (0,3207/83,3849),
-    # no el 0,0033 de la tabla, que era mas pequeño y mas optimista.
-    assert mmr_table.FALLBACK_MMR > 0.0033, (
-        "el valor por defecto tiene que ser MAS restrictivo que el 0,0033 "
-        "de la tabla: usar el menor es justamente el bug que se corrige")
+    # 2026-10-01: el origen ya no es el ambiguo "por_defecto". Con el MMR
+    # plano un valor unico para todo apalancamiento sobrestimaba el colchon
+    # a 25x (daba 3,62% con un MMR de 150x cuando el real es 1,50%), y
+    # "por_defecto" no decia de que apalancamiento salia el numero. Ahora el
+    # origen lleva el escalon (`estimado_escalon:100x`), que es precisamente
+    # lo que hace falta para saber que el valor es una estimacion y no una
+    # medida. La propiedad que este test protege no es el nombre: es que el
+    # origen NO pueda confundirse con una lectura del exchange.
+    assert origen.startswith("estimado_escalon:"), (
+        "un simbolo inexistente tiene que decir que se ESTIMA, no medido")
+    assert "exchange" not in origen, (
+        "un simbolo fuera de la tabla no puede llevar origen de exchange")
+    # El valor sale del escalon del apalancamiento pedido, no de uno fijo.
+    assert mmr == mmr_table._mmr_por_escalon(100)
+    # Y sigue siendo MAS restrictivo que el 0,0033 plano que era el bug:
+    # a 100x el escalon es 0,005, mayor que 0,0033.
+    assert mmr > 0.0033, (
+        "el MMR estimado tiene que ser MAS restrictivo que el 0,0033 de la "
+        "tabla: usar el menor es justamente el bug que se corrige")
 
 
 def test_el_simbolo_se_traduce_al_formato_del_endpoint():

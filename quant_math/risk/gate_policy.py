@@ -86,6 +86,95 @@ DEFAULT_COST_FLOOR_GATE: float = 0.0
 MIN_SCIENTIFIC_SCORE_ENV = "QUANTMATH_MIN_SCIENTIFIC_SCORE"
 DEFAULT_MIN_SCIENTIFIC_SCORE: float = 0.0
 
+# ---------------------------------------------------------------------------
+# GATE CIENTIFICO (2026-10-01) — las tres fases, por fin, en el camino real
+# ---------------------------------------------------------------------------
+#
+# Que es esto
+# -----------
+# El pipeline de validacion estaba entero y DESCONECTADO: `run_validation`,
+# `run_monte_carlo` y `score_hypothesis` solo se llamaban desde
+# `AQDERunner.run()`, que solo se ejecuta con `python aqde_runner.py`. El
+# motor de produccion (`quant_math_bg.py` -> `orchestrator.run_forever`) nunca
+# entra ahi. Consecuencia medida: la formula
+# `scientific_score = 0,2*validacion + 0,5*backtest + 0,3*monte_carlo` NO se
+# habia ejecutado jamas sobre una hipotesis real, y `orchestrator.
+# _result_to_kb_record` se inventaba un 0,098 porque `hyp.scientific_score`
+# valia 0,0.
+#
+# Con las tres fases conectadas, el registro de la KB lleva ya el veredicto.
+# Este modulo es la POLITICA de como ese veredicto se convierte en operable,
+# y vive aqui (no en el motor, no en el orquestador) para que las tres cosas
+# que lo leen no puedan discrepar entre si.
+#
+# POR QUE el gate cientifico NO lo salta `learn_mode`
+# ---------------------------------------------------
+# `learn_mode` salta el gate de expectancy y el de `scientific_score`, y eso
+# es coherente: es una decision de EXPLORAR con expectativa negativa. Pero
+# aqui no se trata de tolerancia al riesgo, sino de una AFIRMACION sobre los
+# datos: si no hay operaciones suficientes, no se ha medido nada, y ninguna
+# hipotesis no medida puede afirmar que es operable. `learn_mode` esta ENCENDIDO
+# por defecto en los dos lanzadores de produccion (`quant_math_bg.py:119` y
+# `quant_math/cli/main.py:307`), asi que honrarlo como bypass dejaria este
+# gate como un no-op en produccion. Decision: el gate cientifico SIEMPRE
+# aplica.
+#
+# El umbral de operaciones
+# ------------------------
+# Sin un minimo, un CI95% sobre 7 operaciones sale con la misma autoridad
+# que uno sobre 400. MEDIDO sobre las ejecuciones REALES del libro
+# (runtime/state_classic-xrp/paper_executions.jsonl, 14 cierres) con bootstrap
+# parametrico sobre los PnL reales:
+#
+#     n=  7   CI95 de la media/trade = [-0,1329, +0,4297]  ancho 0,5626
+#     n= 30   CI95 de la media/trade = [+0,0875, +0,3509]  ancho 0,2635
+#     n=188   CI95 de la media/trade = [+0,1292, +0,2416]  ancho 0,1124
+#
+# A n=7 el intervalo es 3,8 veces la propia estimacion y CONTIENE el cero: no
+# dice nada. A n>=30 ya es 1,2 veces la estimacion y excluye el cero. 30 es
+# tambien el punto en que el semiplano del IC al 95% deja de depender de la
+# aproximacion (t_29 = 2,045 frente a t_3 = 3,182). Por debajo de 30 la fase
+# NO CONCLUYE y la hipotesis se marca como tal: no se devuelve el numero.
+MIN_TRADES_CONCLUSION_ENV = "QUANTMATH_MIN_TRADES_CONCLUSION"
+DEFAULT_MIN_TRADES_CONCLUSION: int = 30
+
+#: Alfa del test de significancia (una cola: interesa el PnL POR ENCIMA de 0,
+#: no que sea distinto de 0). 0,05 es el habitual y no es un numero inventado
+#: aqui: lo que cambia respecto a antes no es el alfa sino que antes NO habia
+#: ningun test.
+SIGNIFICANCE_ALPHA_ENV = "QUANTMATH_SIGNIFICANCE_ALPHA"
+DEFAULT_SIGNIFICANCE_ALPHA: float = 0.05
+
+#: Interruptor del gate cientifico. Apagado = el registro se sigue publicando
+#: con su veredicto pero la decision engine no lo filtra (para poder comparar
+#: antes/despues sin tocar el exchange).
+REQUIRE_SCIENTIFIC_ENV = "QUANTMATH_REQUIRE_SCIENTIFIC_VALIDATION"
+DEFAULT_REQUIRE_SCIENTIFIC: bool = True
+
+#: Las filas de la KB publicadas ANTES de que existiera el pipeline no tienen
+#: veredicto. Son la mayoria (medido el 2026-10-01: 674 de 766 filas de
+#: runtime/hypotheses_classic-xrp.jsonl). Con esto APAGADO se les conserva la
+#: semantica anterior en vez de borrar el universo de golpe; cada una recibe
+#: veredicto en cuanto su firma se re-backtestea
+#: (`QUANTMATH_SIG_REFRESH_CYCLES`, 5 por defecto), asi que la migracion es
+#: gradual y sola. ENCENDIDO es el modo estricto: lo que no se ha medido no
+#: opera.
+STRICT_SCIENTIFIC_LEGACY_ENV = "QUANTMATH_STRICT_SCIENTIFIC_LEGACY"
+DEFAULT_STRICT_SCIENTIFIC_LEGACY: bool = False
+
+#: Nombres de los campos del veredicto. Declarados AQUI para que el
+#: orquestador (que los escribe) y el motor (que los lee) no puedan separarse.
+FIELD_SCIENTIFICALLY_VALIDATED = "scientifically_validated"
+FIELD_SCIENTIFIC_REASONS = "scientific_reasons"
+FIELD_PVALUE = "statistical_significance"
+FIELD_PVALUE_ALPHA = "statistical_significance_alpha"
+FIELD_MC_CONCLUSIVE = "monte_carlo_conclusive"
+FIELD_MC_MEAN = "monte_carlo_mean"
+FIELD_MC_LOWER = "monte_carlo_lower_bound"
+FIELD_MC_UPPER = "monte_carlo_upper_bound"
+FIELD_MIN_TRADES = "min_trades_conclusion"
+FIELD_VALIDATION_SCORE = "validation_score"
+
 #: COMISION REAL de Bybit (LEIDA el 2026-09-30 del endpoint publico de
 #: mercados, campo `taker`/`maker` del mercado, NO una cifra de wiki):
 #:
@@ -287,6 +376,79 @@ def resolve_gate_thresholds(explicit_min_expectancy: Optional[float] = None,
                  else env_float(MIN_SCIENTIFIC_SCORE_ENV,
                                 DEFAULT_MIN_SCIENTIFIC_SCORE))
     return min_exp, min_score
+
+
+def resolve_scientific_policy(
+        explicit_require: Optional[bool] = None,
+        explicit_strict_legacy: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Politica del gate cientifico resuelta y DECLARADA.
+
+    Devuelve el umbral de operaciones, el alfa, y los dos interruptores, para
+    que quien llame no tenga que repetir las reglas ni inventar defaults.
+    """
+    if explicit_require is None:
+        require, was_set = env_flag(REQUIRE_SCIENTIFIC_ENV)
+        if not was_set:
+            # `env_flag` devuelve False cuando la variable NO existe, y el
+            # default declarado aqui es True. Sin este matiz el gate se
+            # encontraria apagado en cualquier despliegue que no exporte la
+            # variable, o sea el caso normal: un default silencioso.
+            require = DEFAULT_REQUIRE_SCIENTIFIC
+    else:
+        require = bool(explicit_require)
+    if explicit_strict_legacy is None:
+        strict, was_set = env_flag(STRICT_SCIENTIFIC_LEGACY_ENV)
+        if not was_set:
+            strict = DEFAULT_STRICT_SCIENTIFIC_LEGACY
+    else:
+        strict = bool(explicit_strict_legacy)
+    min_trades = int(env_float(MIN_TRADES_CONCLUSION_ENV,
+                               DEFAULT_MIN_TRADES_CONCLUSION))
+    if min_trades < 2:
+        # Un t-test necesita al menos 2 observaciones para tener grados de
+        # libertad; un umbral de 1 seria un umbral que no dice nada.
+        logger.warning("[gate] %s=%s es <2; se usa 2",
+                       MIN_TRADES_CONCLUSION_ENV, min_trades)
+        min_trades = 2
+    alpha = env_float(SIGNIFICANCE_ALPHA_ENV, DEFAULT_SIGNIFICANCE_ALPHA)
+    if not 0.0 < alpha < 1.0:
+        logger.warning("[gate] %s=%s no es un alfa; se usa %s",
+                       SIGNIFICANCE_ALPHA_ENV, alpha, DEFAULT_SIGNIFICANCE_ALPHA)
+        alpha = DEFAULT_SIGNIFICANCE_ALPHA
+    return {
+        "require": require,
+        "strict_legacy": strict,
+        "min_trades": min_trades,
+        "alpha": alpha,
+    }
+
+
+def scientific_block_reason(record: Dict[str, Any],
+                            strict_legacy: bool = False) -> Optional[str]:
+    """Motivo por el que un registro NO es operable cientificamente, o None.
+
+    UNA sola definicion de "operable" para las tres cosas que la consultan
+    (`ranked_candidates`, `select_best_hypothesis` y el gate de `decide`): si
+    cada una decidiera por su cuenta, el motor podria Promote una hipotesis
+    que el panel no muestra o al reves, y eso ya ha pasado con otros filtros.
+
+    Devuelve None cuando la hipotesis es operable a efectos cientificos.
+    """
+    if not isinstance(record, dict):
+        return "registro no es un dict"
+    if FIELD_SCIENTIFICALLY_VALIDATED not in record:
+        # Fila anterior al pipeline: NO se ha medido, pero tampoco se afirma
+        # que sea mala. Con `strict_legacy` se cierra el paso.
+        return ("sin_pipeline" if strict_legacy else None)
+    if record.get(FIELD_SCIENTIFICALLY_VALIDATED):
+        return None
+    reasons = record.get(FIELD_SCIENTIFIC_REASONS) or []
+    if isinstance(reasons, (list, tuple)):
+        detalle = "; ".join(str(r) for r in reasons)
+    else:
+        detalle = str(reasons)
+    return detalle or "no_validada_sin_motivo"
 
 
 def round_trip_cost_pct(slippage_pct: float = DEFAULT_SLIPPAGE_PCT,

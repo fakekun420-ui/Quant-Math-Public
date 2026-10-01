@@ -246,13 +246,30 @@ class ExpectedShortfall:
             raise ValueError(f"Unknown ES method: {method}")
 
     def _parametric_es(self, mean: float, std: float, alpha: float, portfolio_value: float) -> float:
-        """Parametric ES assuming normal distribution."""
-        # For normal: ES = -[mu + sigma * phi(z_alpha) / alpha]
-        # where phi is the standard normal PDF
+        """Expected shortfall parametrico asumiendo distribucion normal.
+
+        Para una normal, el ES (perdida media mas alla del VaR) se
+        devuelve como PERDIDA positiva con:
+
+            ES = -(mu - sigma * phi(z_alpha) / alpha)
+
+        CORREGIDO 2026-10-01 — el signo del termino de dispersion estaba
+        cambiado (`-(mu + sigma*phi/alpha)`), lo que lo volvia NEGATIVO en
+        el caso normal: con mu=0, sigma=1, alpha=0.05 salia -2.06 y el
+        `max(0.0, ...)` lo convertia en 0.0. Medido antes de conectar el
+        modulo: `ExpectedShortfall().calculate(0.0, 1.0, 0.95)` devolvia
+        exactamente 0.0 en vez de 2.06, es decir el modulo afirmaba que NO
+        hay perdida en la cola del 5%. Un numero que miente es peor que no
+        calcularlo: por eso var.py no se conecto hasta arreglar esto.
+
+        Con la formula correcta se cumple ademas la invarianza obligatoria
+        `ES >= VaR` del mismo nivel (phi(z_alpha)/alpha > |z_alpha| siempre:
+        2.06 > 1.645 al 95%).
+        """
         z_score = ValueAtRisk._norm_ppf(alpha)
         # Standard normal PDF
         phi_z = np.exp(-0.5 * z_score**2) / np.sqrt(2 * np.pi)
-        es = -(mean + std * phi_z / alpha) * portfolio_value
+        es = -(mean - std * phi_z / alpha) * portfolio_value
         return max(0.0, es)
 
     def _cornish_fisher_es(self, mean: float, std: float, alpha: float,
