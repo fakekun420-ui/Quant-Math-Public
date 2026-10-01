@@ -164,15 +164,26 @@ def test_el_cierre_fallido_dice_que_no_se_ejecuto():
 def test_el_cierre_manda_al_perp_no_al_spot():
     """`BTC/USDT` es SPOT y `BTC/USDT:USDT` es el PERP.
 
-    Medido el 2026-09-30: 34,6 USD de diferencia en BTC. Si el cierre
-    fuera al simbolo equivocado, la posicion sigue viva en el perps
-    mientras el sistema cree que la cerro: exactamente el fallo que hay
-    que cazar, pero por otra causa.
+    MEDIDO el 2026-09-30: 34,6 USD de diferencia en BTC. MEDIDO el
+    2026-10-01: la conversion estaba REIMPLEMENTADA a mano en el cierre
+    y producia `SOL/USDT/USDT:USDT`, que el exchange rechaza con `does
+    not have market symbol`; el cierre fallaba y la posicion se quedaba
+    abierta. Eran ya TRES copias distintas de la misma regla en el
+    fichero, y tres copias son tres formas de equivocarse.
+
+    Ahora el cierre usa el metodo que ya existe en el cliente
+    (`_to_swap_symbol`), que sabe hacerlo bien.
     """
     src = inspect.getsource(Orchestrator._live_close_order)
-    assert '"/USDT:USDT"' in src, (
-        "el cierre tiene que convertir a PERP: BTC/USDT es spot y "
-        "BTC/USDT:USDT es el perps")
+    assert "api._to_swap_symbol(symbol)" in src, (
+        "el cierre tiene que usar la conversion del cliente, no una "
+        "propia: la manual producia `SOL/USDT/USDT:USDT` y el exchange "
+        "rechazaba el cierre con `does not have market symbol`, dejando "
+        "la posicion abierta")
+    codigo = "\n".join(ln for ln in src.splitlines()
+                       if not ln.strip().startswith("#"))
+    assert 'symbol + "/USDT:USDT"' not in codigo, (
+        "vuelve la conversion manual al cierre: es la que se rompio")
 
 
 def test_el_cierre_usa_reduce_only():

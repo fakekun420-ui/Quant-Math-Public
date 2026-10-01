@@ -323,6 +323,7 @@ def build_roe_plan(
     stop_loss_roe: Optional[float] = None,
     maintenance_margin_rate: Optional[float] = None,
     mmr_origen_explicito: Optional[str] = None,
+    mmr_api=None,
     sl_liquidation_safety_frac: float = DEFAULT_SL_LIQUIDATION_SAFETY_FRAC,
     market: str = "crypto",
     max_tp_price_distance: Optional[float] = None,
@@ -366,7 +367,26 @@ def build_roe_plan(
         mmr = float(maintenance_margin_rate)
     elif symbol:
         from quant_math.risk.mmr_table import mmr_for_symbol
-        mmr, mmr_origen = mmr_for_symbol(symbol, lev)
+        # MEDIDO el 2026-10-01: si ya hay una posicion viva de este
+        # simbolo, su MMR es el dato REAL (`positionMM` / `positionValue`)
+        # y gana a la tabla. Se prefiere porque la tabla publica no
+        # cubre todos los simbolos —SOL y XRP no aparecen en sus 675
+        # entradas— y para esos el MMR acababa siendo el de otro activo.
+        # Medido en SOL a 100x: 0,5556% real frente al 0,50% que prestaba
+        # la tabla de ETH, un 11% mas alto, con la liquidacion mas cerca
+        # de lo que el sistema creia.
+        if mmr_api is not None:
+            try:
+                from quant_math.risk.mmr_table import mmr_from_live_position
+                _vivo, _o = mmr_from_live_position(symbol, mmr_api)
+                if _vivo is not None:
+                    mmr, mmr_origen = _vivo, _o
+                else:
+                    mmr, mmr_origen = mmr_for_symbol(symbol, lev)
+            except Exception:
+                mmr, mmr_origen = mmr_for_symbol(symbol, lev)
+        else:
+            mmr, mmr_origen = mmr_for_symbol(symbol, lev)
     else:
         mmr = DEFAULT_MAINTENANCE_MARGIN_RATE
         mmr_origen = "por_defecto_sin_simbolo"

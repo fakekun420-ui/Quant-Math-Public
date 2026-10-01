@@ -663,6 +663,85 @@ class ExchangeAPI:
         logger.info("set margin mode %s on %s", mode, swap)
         return result
 
+    def cantidad_minima(self, symbol: str) -> Dict[str, Any]:
+        """Minimo que el exchange IMPONE para este simbolo. Leido de el.
+
+        MEDIDO el 2026-10-01 contra los mercados de Bybit:
+
+            BTC/USDT:USDT   min_amount 0,001   min_cost 5 USDT
+            ETH/USDT:USDT   min_amount 0,01    min_cost 5 USDT
+            XRP/USDT:USDT   min_amount 0,1     min_cost 5 USDT
+            SOL/USDT:USDT   min_amount 0,1     min_cost 5 USDT
+
+        El minimo DIFIERE por simbolo porque el coste por unidad cambia:
+        0,001 BTC son ~83 USDT y 0,001 ETH son ~2,7 USDT, que el exchange
+        no acepta. Un minimo global es un numero que no significa nada,
+        y usarlo como si lo significara produce ordenes RECHAZADAS.
+
+        El `precision` tambien viene por aqui, porque es lo que decide si
+        una cantidad es representable: si el minimo es 0,001 y la
+        precision admite 3 decimales, 0,001 es justo lo mas pequeno que se
+        puede mandar.
+        """
+        swap = self._to_swap_symbol(symbol)
+        out = {"min_amount": None, "min_cost": None, "precision": None,
+               "swap": swap}
+        try:
+            mercado = (self.exchange.markets.get(swap)
+                       or self.exchange.market(swap))
+        except Exception:
+            return out
+        if not mercado:
+            return out
+        lim = mercado.get("limits") or {}
+        out["min_amount"] = ((lim.get("amount") or {}).get("min"))
+        out["min_cost"] = ((lim.get("cost") or {}).get("min"))
+        out["precision"] = (mercado.get("precision") or {}).get("amount")
+        return out
+
+    def ajusta_a_minimo(self, symbol: str, cantidad: float,
+                        precio: Optional[float] = None) -> float:
+        """Cantidad redondeada ARRIBA al minimo del exchange.
+
+        Por que ARRIBA y no abajo: una cantidad por debajo del minimo se
+        RECHAZA entera (`amount of ETH/USDT:USDT must be greater than
+        minimum amount`), y ahi no se abre nada. Redondear hacia arriba
+        es lo unico que hace que la orden sea aceptable.
+
+        Ojo al coste: subir al minimo puede elevar la posicion por encima
+        de lo que se pedia. Cuando el minimo de coste (5 USDT) manda mas
+        que la cantidad, el minimo a respetar es el que de verdad
+        sostiene el exchange, y se devuelve ese. Quien llama tiene que
+        volver a comprobar el riesgo con la cantidad devuelta: subir la
+        cantidad para que la orden pase y no mirar el riesgo que eso
+        genera seria cambiar el riesgo en silencio.
+        """
+        swap = self._to_swap_symbol(symbol)
+        try:
+            mercado = (self.exchange.markets.get(swap)
+                       or self.exchange.market(swap))
+        except Exception:
+            mercado = None
+        if not mercado:
+            return cantidad
+        lim = mercado.get("limits") or {}
+        min_amount = (lim.get("amount") or {}).get("min")
+        min_cost = (lim.get("cost") or {}).get("min")
+        cantidad = float(cantidad)
+        if min_amount:
+            cantidad = max(cantidad, float(min_amount))
+        if min_cost and precio:
+            min_por_coste = float(min_cost) / float(precio)
+            cantidad = max(cantidad, min_por_coste)
+        prec = (mercado.get("precision") or {}).get("amount")
+        if prec is not None:
+            try:
+                cantidad = float(self.exchange.amount_to_precision(
+                    swap, cantidad))
+            except Exception:
+                pass
+        return cantidad
+
     def create_order(self, symbol: str, side: str, amount: float,
                      price: Optional[float] = None,
                      order_type: str = "market",

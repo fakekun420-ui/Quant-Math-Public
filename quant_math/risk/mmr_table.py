@@ -252,6 +252,50 @@ def mmr_for_symbol(simbolo: Optional[str], leverage) -> Tuple[float, str]:
     return FALLBACK_MMR, "por_defecto"
 
 
+def mmr_from_live_position(simbolo: Optional[str], api=None) -> Tuple[
+        Optional[float], str]:
+    """MMR REAL de una posicion viva, leido del exchange. Es el dato bueno.
+
+    MEDIDO el 2026-10-01. La tabla publica `/v5/market/risk-limit` cubre
+    675 simbolos y BTC y ETH estan, pero SOL y XRP NO aparecen (buscados
+    por nombre y por coincidencia parcial). Para esos el MMR se caia al
+    valor por defecto, que es el de otro activo: subestimaba su
+    liquidacion sin que nada lo dijera.
+
+    Bybit resuelve el problema en la propia posicion: el campo
+    `positionMM` es el mantenimiento real, y `positionValue` el nocional,
+    luego el MMR es su cociente. Medido en SOL a 100x:
+
+        positionValue 23,5380   positionMM 0,130783   ->  MMR 0,5556%
+
+    Que es un 68% MAS ALTO que el 0,33% que asumia el codigo. Con la
+    tabla prestada de ETH (0,50%) seguia quedarse corto.
+
+    Devuelve None si no hay posicion viva: es el dato que solo existe
+    cuando ya se ha abierto algo, asi que no sirve para el PRIMER calculo
+    (antes de entrar), que es justo cuando hace falta para colocar el
+    SL. Por eso `mmr_for_symbol` sigue usando la tabla como primera
+    opcion y esta es la segunda, que corrige en cuanto hay posicion.
+    """
+    if api is None:
+        return None, "sin_api"
+    sym = _normaliza(simbolo or "")
+    try:
+        raw = api.exchange.fetch_position(sym if ":" in (simbolo or "")
+                                          else f"{sym}/USDT:USDT")
+    except Exception:
+        return None, "sin_posicion"
+    info = (raw or {}).get("info") or {}
+    try:
+        nocional = float(info.get("positionValue") or 0.0)
+        mant = float(info.get("positionMM") or 0.0)
+    except (TypeError, ValueError):
+        return None, "sin_posicion"
+    if nocional <= 0 or mant <= 0:
+        return None, "sin_posicion"
+    return mant / nocional, f"exchange:{sym}:positionMM"
+
+
 def liquidation_price_distance_for_symbol(simbolo: Optional[str],
                                            leverage) -> Tuple[float, float, str]:
     """`(distancia, mmr, origen)` de la liquidacion de un simbolo concreto.

@@ -112,6 +112,23 @@ class FakeAPI:
         valida el TP/SL contra `LastPrice`, no contra el libro."""
         return self
 
+    def ajusta_a_minimo(self, symbol, cantidad, precio=None):
+        """El minimo del exchange, como lo hace el real.
+
+        MEDIDO el 2026-10-01: el minimo es POR SIMBOLO (BTC 0,001 /
+        ETH 0,01 / XRP 0,1 / SOL 0,1) porque depende del valor de la
+        unidad. Este doble usa `FakeAPI.min_amount`, que por defecto es
+        None: sin minimo, la cantidad no se toca, que es lo que pasaba
+        antes de que el codigo lo mirara.
+        """
+        if FakeAPI.min_amount is not None:
+            cantidad = max(float(cantidad), float(FakeAPI.min_amount))
+        return cantidad
+
+    def cantidad_minima(self, symbol):
+        return {"min_amount": FakeAPI.min_amount, "min_cost": None,
+                "precision": None, "swap": symbol}
+
     def load_markets(self, reload=False, params=None):
         if FakeAPI.load_markets_error:
             raise RuntimeError(FakeAPI.load_markets_error)
@@ -174,6 +191,7 @@ def fake_api(monkeypatch):
     FakeAPI.stops_drop = False
     FakeAPI.load_markets_error = None
     FakeAPI.load_markets_calls = 0
+    FakeAPI.min_amount = None
     FakeAPI.book_price = 100.0
     FakeAPI.book_error = None
     import data_acquisition.data_sources.exchanges as ex

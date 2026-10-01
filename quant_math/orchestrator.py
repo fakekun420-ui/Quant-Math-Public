@@ -873,8 +873,17 @@ class Orchestrator:
         from data_acquisition.data_sources.exchanges import ExchangeAPI
         api = self._exchange()
         try:
-            swap = symbol if ":" in symbol else (
-                symbol + "/USDT:USDT" if symbol.endswith("/USDT") else symbol)
+            # MEDIDO el 2026-10-01: aqui se reimplementaba a mano la
+            # conversion a perp y salia `SOL/USDT/USDT:USDT`, que el
+            # exchange rechaza con `does not have market symbol`. El cierre
+            # fallaba y la posicion se quedaba abierta. Se usa el metodo
+            # que YA existe en el cliente y que sabe hacerlo bien, en vez
+            # de una tercera copia de la misma regla: tres copias de una
+            # conversion son tres formas de equivocarse.
+            try:
+                swap = api._to_swap_symbol(symbol)
+            except Exception:
+                swap = symbol
             # Cargar los mercados ANTES de construir la orden. `load_markets`
             # es idempotente: si ya estan cargados no vuelve a pedir nada,
             # y si falla se dice POR QUE en vez de dejar que reviente
@@ -2109,6 +2118,26 @@ class Orchestrator:
                                (precio_fresco - price) / price * 100)
             price = precio_fresco
             qty = notional / price
+            # MEDIDO el 2026-10-01: el MINIMO es por simbolo y el codigo
+            # lo ignoraba. El exchange rechaza la orden entera si la
+            # cantidad no llega (`amount of ETH/USDT:USDT must be greater
+            # than minimum amount`), y ahi no se abre nada. Medido:
+            #
+            #   BTC 0,001 (~83 USDT)   ETH 0,01 (~27 USDT)
+            #   XRP 0,1   (~15 USDT)   SOL 0,1   (~24 USDT)
+            #
+            # La diferencia no es de unidades sino de VALOR: 0,001 son 83
+            # USDT en BTC y 2,7 USDT en ETH, que el exchange no acepta.
+            # Un minimo global no significa nada, y usarlo como si lo
+            # significara produce rechazos.
+            _q0 = qty
+            qty = api.ajusta_a_minimo(signal["symbol"], qty, price)
+            if qty > _q0 * 1.0000001:
+                logger.warning(
+                    "[live] %s: cantidad elevada de %.8f a %.8f para llegar al "
+                    "minimo del exchange; el riesgo de esta operacion cambia",
+                    signal["symbol"], _q0, qty)
+                notional = qty * price
             # Los precios de salida se calculan ANTES de mandar la orden
             # (correccion 6): antes se mandaba la entrada desnuda y el TP/SL
             # se calculaba despues, solo para guardarlo en el ledger. La
