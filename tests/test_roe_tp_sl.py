@@ -128,14 +128,39 @@ def test_clamp_actually_bites_at_high_leverage():
     """A 152x el SL en ROE se aparta de la liquidacion: el clamp actua.
 
     El umbral estaba en 125x cuando el MMR por defecto era el SUPUESTO 0,005.
-    Con el MMR REAL de Bybit (0,0033, primer tramo, medido el 2026-09-30) hay
-    mas margen hasta la liquidacion, asi que 125x ya NO necesita clamp y el
-    corte se mueve a 152x. Menos clamp no es un aflojo: es que el exchange
-    deja la posicion mas lejos de la liquidacion de lo que asumiamos.
+    Con el MMR LEIDO de la tabla (0,0033) habia mas margen hasta la
+    liquidacion, asi que el corte se movio a 152x.
+
+    MEDIDO el 2026-10-01 contra una posicion REAL: el MMR de BTC es
+    0,003846 (0,3207 / 83,3849), NO el 0,0033 de la tabla. Con el dato
+    medido el clamp aprieta 22x antes: el corte pasa de 152x a 130x.
+
+    Barrido medido (SL clasico al 25% de ROE contra el techo del 50% de
+    la liquidacion):
+
+        125x  liq 0,4154%  techo 0,2077%  SL 0,2000%  libre
+        130x  liq 0,3846%  techo 0,1923%  SL 0,1923%  libre  <- justo
+        135x  liq 0,3561%  techo 0,1781%  SL 0,1852%  CLAMPA
+
+    Menos clamp no es un aflojo: es que el exchange deja la posicion mas
+    lejos de lo que se asumia. Y aqui aplica al reves: el dato medido es
+    MAS restrictivo que el de la tabla, asi que aprieta MAS. El MMR de la
+    tabla (0,0033) era mas pequeno que el real (0,003846) y por eso
+    fingia mas margen del que hay.
     """
-    plan = build_roe_plan(mode="classic", leverage=152)
-    assert plan.sl_clamped, "a 152x el clamp deberia morder"
-    assert plan.sl_price_distance < roe_to_price_distance(0.25, 152)
+    plan = build_roe_plan(mode="classic", leverage=140)
+    assert plan.sl_clamped, "a 140x el clamp deberia morder"
+    assert plan.sl_price_distance < roe_to_price_distance(0.25, 140)
+    # El corte medido con el MMR REAL esta en 130x. Con el de la tabla
+    # (0,0033, mas pequeño) estaba en 152x: 22x de diferencia por usar un
+    # numero de la tabla en vez de uno medido.
+    assert not build_roe_plan(mode="classic",
+                               leverage=130).sl_clamped, (
+        "a 130x el clamp todavia no debe morder con el MMR medido")
+    assert build_roe_plan(mode="classic",
+                          leverage=130, stop_loss_roe=0.30).sl_clamped, (
+        "a 130x un SL al 30% de ROE si debe morder: el corte depende del "
+        "SL pedido, no solo del apalancamiento")
     assert plan.realized_ratio > 2.0
     assert plan.sl_liquidation_headroom == pytest.approx(
         1.0 / DEFAULT_SL_LIQUIDATION_SAFETY_FRAC, rel=1e-6)
@@ -151,8 +176,9 @@ def test_sin_mmr_real_el_clamp_morde_antes():
     pedido = roe_to_price_distance(0.25, 125)
     assert pedido > max_sl_price_distance(125, 0.005, 0.5), (
         "con MMR 0,005 el clamp deberia morder a 125x")
-    assert pedido <= max_sl_price_distance(125, 0.0033, 0.5), (
-        "con el MMR real 0,0033 no hace falta clampar a 125x")
+    assert pedido <= max_sl_price_distance(125, 0.003846, 0.5), (
+        "con el MMR MEDIDO de una posicion real (0,003846) no hace falta "
+        "clampar a 125x")
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +296,7 @@ def test_classic_records_margin_and_leverage():
         # 2026-09-30 contra /v5/market/risk-limit). Antes era 0,095 porque el
         # MMR por defecto era el supuesto 0,005. Con el dato, la liquidacion
         # queda un poco mas lejos: 0,1 - 0,0033 = 0,0967.
-        assert trade["liquidation_price_distance"] == pytest.approx(0.0967)
+        assert trade["liquidation_price_distance"] == pytest.approx(0.096154)
         assert trade["sl_clamped"] is False
         assert trade["quantity"] > 0
         with open(os.path.join(tmp, "paper_executions.jsonl"),

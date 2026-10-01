@@ -474,26 +474,49 @@ def test_una_reconciliacion_fallida_no_tumba_el_ciclo(fake_api):
 def test_reconcile_tabla_leida_coincide_con_la_api(fake_api):
     """El MMR por defecto tiene que ser el dato, no una constante inventada.
 
-    Este test pegaria si alguien vuelve a poner 0,005 como supuesto.
+    MEDIDO el 2026-10-01 contra una posicion REAL de la cuenta de
+    Leonardo: nocional 83,3849, mantenimiento 0,3207 -> MMR 0,003846.
+
+    Este test pegaria si alguien vuelve a poner 0,0033 (el valor de la
+    TABLA por nocional) o 0,005 (el supuesto antiguo). Se cambio porque
+    la tabla resulto ser MENOS restrictiva que la realidad: con 0,0033
+    la distancia a liquidacion se calculaba 0,0546 puntos de precio mas
+    amplia de lo real, o sea que ningun SL quedaba mas lejos de lo
+    permitido. Eso es justo lo que este test pretendia evitar.
     """
     from quant_math.risk.roe_targets import DEFAULT_MAINTENANCE_MARGIN_RATE
-    assert DEFAULT_MAINTENANCE_MARGIN_RATE == 0.0033, (
-        "el MMR por defecto debe ser el primer tramo real de Bybit (0,0033)")
+    assert DEFAULT_MAINTENANCE_MARGIN_RATE == 0.003846, (
+        "el MMR por defecto debe ser el MEDIDO (0,003846 = 0,3207/83,3849 "
+        "de una posicion real de BTC), no el 0,0033 de la tabla: la tabla "
+        "es mas pequena, luego la liquidacion se calculaba mas lejos de "
+        "la real y el clamp dejaba pasar un SL mas apretado del debido")
 
 
-def test_el_mmr_por_defecto_es_el_LEIDO_de_bybit(fake_api):
+def test_el_mmr_por_defecto_es_el_MEDIDO_no_el_de_la_tabla(fake_api):
     """El MMR por defecto no puede volver a ser un supuesto.
 
-    Medido el 2026-09-30 contra el endpoint publico /v5/market/risk-limit:
-    primer tramo 0,0033. Antes era 0,005 (punto medio de un barrido propio).
-    Este test falla si alguien vuelve a inventarse el numero.
+    MEDIDO el 2026-10-01 contra la cuenta REAL (no contra la tabla):
+        BTCUSDT  nocional 83,3849  mantenimiento 0,3207  ->  0,003846
+        ENAUSDT  nocional 25,8883  mantenimiento 0,2728  ->  0,010538
+
+    De ahi dos cosas, y la segunda es la que importa: el MMR es POR
+    ACTIVO, no solo por nocional. ENA da 2,7 veces el de BTC con
+    nocionales en el MISMO tramo (15-200 USD). La tabla por nocional no
+    captura esa dimension.
     """
     from quant_math.risk.roe_targets import (
         DEFAULT_MAINTENANCE_MARGIN_RATE, mmr_for_notional, BYBIT_MMR_TIERS)
-    assert DEFAULT_MAINTENANCE_MARGIN_RATE == 0.0033
-    # El tamano real de este sistema cae en el primer tramo
+    assert DEFAULT_MAINTENANCE_MARGIN_RATE == 0.003846
+    # Y la tabla por nocional sigue siendo la que es: no se inventa que
+    # vale 0,003846, porque ESA tabla da 0,0033 para este tramo. El
+    # valor por defecto es el MEDIDO; la tabla es la tabla.
     for nocional in (15.0, 100.0, 200.0, 300_000.0):
-        assert mmr_for_notional(nocional) == 0.0033
+        assert mmr_for_notional(nocional) == 0.0033, (
+            "la TABLA por nocional no cambia: da 0,0033 en el primer "
+            "tramo. Lo medido en la cuenta real (0,003846) es OTRO "
+            "dato, y por eso vive en la constante por defecto y no "
+            "arreglando la tabla. Confundir los dos seria tapar una "
+            "medida con un supuesto")
     # Y crecer SI sube el MMR, porque la liquidacion se acerca.
     # Tramos reales: <=300k -> 0,0033 | <=2M -> 0,0050 | <=2,6M -> 0,0056 |
     # <=3,2M -> 0,0063. Con 3.000.000 ya se esta en el tramo de 3,2M.

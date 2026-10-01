@@ -45,11 +45,36 @@ no un numero unico. Primeros tramos, identicos para BTCUSDT y ETHUSDT:
 
 El supuesto anterior era 0,0050, que es el SEGUNDO tramo. Este sistema
 opera con 15-200 USD de nocional, muy por debajo del primer umbral, asi
-que le corresponde 0,0033. El supuesto era, por suerte, MAS estricto que
-la realidad (0,0050 > 0,0033 acorta la distancia a liquidacion y aprieta el
-clamp), asi que ningun SL quedo mas lejos de la liquidacion de lo que
-permitia el dato real. Aun asi, de ahora en adelante el valor por defecto
-es el LEIDO.
+que la tabla le asigna 0,0033.
+
+CORRECCION 2026-10-01, MEDIDA contra la cuenta REAL (no contra la tabla).
+La tabla de arriba NO basta, y el comentario queetitleaba aquí.decía
+justo lo contrario de lo cierto. Con dos capturas de una posicion real
+de Leonardo, mismo tramo de nocional (15-200 USD):
+
+    BTCUSDT   nocional 83,3849   mantenimiento 0,3207   ->  MMR 0,003846
+    ENAUSDT   nocional 25,8883   mantenimiento 0,2728   ->  MMR 0,010538
+
+Dos conclusiones, y las dos importan:
+
+1) El valor por defecto era OPTIMISTA, no estricto. 0,0033 es MENOR que
+   el 0,003846 real de BTC, luego la distancia a liquidacion que
+   calculaba era DEMASIADO AMPLIA en 0,0546 puntos de precio (medido):
+   1,6700% en vez de 1,6154% a 50x. El texto anterior afirmaba que
+   ningun SL quedaba mas lejos de la liquidacion de lo que permitia el
+   dato real. Falso: quedaba mas lejos de lo permitido.
+
+2) EL MMR ES POR ACTIVO, NO SOLO POR NOCIONAL. BTC da 0,003846 y ENA
+   0,010538 con nocionales EN EL MISMO TRAMO: ENA es 2,7 veces mayor.
+   La tabla por nocional no captura esa dimension, y el valor por defecto
+   se cambia a la MEDIDA de BTC (la mas restrictiva de las dos) en vez
+   de al supuesto de la tabla.
+
+Consecuencia honesta: para activos de MMR alto como ENA, un SL calculado
+con el valor por defecto queda mas cerca de la liquidacion de lo que
+deberia. Es un fallo del que hay que ser consciente, no un detalle: el
+clamp del SL se apoya en esta cifra para decidir cuanto se puede acercar
+el stop a la liquidacion.
 
 Ojo al crecer: si el nocional sube de 300.000 USD el MMR sube y la
 distancia a liquidacion se ACORTA, asi que el clamp se aprieta solo. Para
@@ -77,7 +102,7 @@ VALID_MODES: Tuple[str, ...] = tuple(MODE_ROE_TARGETS)
 #: MMR LEIDO de Bybit el 2026-09-30 (endpoint publico /v5/market/risk-limit),
 #: primer tramo, que es el que corresponde a un nocional de 15-200 USD.
 #: Antes era 0.005, un SUPUESTO tomado del punto medio de un barrido propio.
-DEFAULT_MAINTENANCE_MARGIN_RATE: float = 0.0033
+DEFAULT_MAINTENANCE_MARGIN_RATE: float = 0.003846
 
 #: Tabla REAL de maintenance margin de Bybit (2026-09-30), como
 #: (nocional_maximo_usd, mmr, apalancamiento_maximo). Fuente: endpoint publico
