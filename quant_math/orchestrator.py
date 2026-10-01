@@ -1028,8 +1028,29 @@ class Orchestrator:
                     amount = 0.0
                 local_rows = local_by_symbol.get(symbol, [])
                 local_qty = sum(r["quantity"] for r in local_rows)
+                # MEDIDO el 2026-09-30: esto era un fallo SILENCIOSO de
+                # tres eslabones, y por eso los fantasmas vivian para
+                # siempre. La deteccion de phantom exigia
+                # `local_qty > 0`, pero `local_qty` sale de
+                # `engine._last_entry_sizing(key)`, que devuelve 0 cuando
+                # no encuentra el relleno en el ledger. Con la cantidad a
+                # 0, la condicion NUNCA se cumplia y la reconciliacion
+                # informaba "0 phantom local(es)" con 5 entradas abiertas
+                # en el libro. Medido: el log de 00:24:35 dice
+                # `0 phantom` mientras el motor tenia 5 posiciones en
+                # memoria.
+                #
+                # Que la clave exista en `open_positions` YA es prueba de
+                # que hay posicion local: no hace falta que ademas se sepa
+                # el tamano. Una posicion que existe pero no se puede
+                # VALORAR no es "no existe", es "no medida", y para eso
+                # esta `unpriced`, que falla cerrado ante el guard. Usar
+                # la cantidad como criterio de EXISTENCIA confundia
+                # "no lo se" con "no hay", y hacia que un estado
+                # desconocido se tratara como si el libro estuviera limpio.
+                local_open = bool(local_rows)
 
-                if amount > 0 and local_qty <= 0:
+                if amount > 0 and not local_open:
                     # La grave: hay dinero en el exchange que nadie vigila.
                     orphan = {
                         "symbol": symbol,
@@ -1065,7 +1086,7 @@ class Orchestrator:
                             logger.error(
                                 "[reconcile] no se pudo cerrar la huerfana "
                                 "%s: %s", symbol, exc)
-                elif local_qty > 0 and amount <= 0:
+                elif local_open and amount <= 0:
                     phantom = {
                         "symbol": symbol,
                         "local_quantity": local_qty,
@@ -2400,7 +2421,31 @@ class Orchestrator:
         equity = (self.config.initial_capital + realized_total
                   + mark["total"])
         self._last_equity = equity
-        open_count = len(getattr(self.engine, "open_positions", {}) or {})
+        # MEDIDO el 2026-09-30: se contaba el numero de ENTRADAS, no el de
+        # posiciones reales. Bybit funciona en modo NET y FUSIONA por
+        # simbolo: N entradas del mismo activo = 1 posicion en el
+        # exchange. Medido con el brazo corriendo en testnet: 5 entradas
+        # de XRP (5 hipotesis) -> 1 sola posicion de 33 XRP. El tope
+        # global contaba 5, daba `open positions 5 >= max 5` y el brazo
+        # quedaba BLOQUEADO sin poder operar nunca mas, cuando en
+        # realidad solo habia 1 posicion y el exchange la habia cerrado.
+        #
+        # Lo que limita el riesgo de verdad es el numero de SIMBOLOS
+        # expuestos, no el de entradas: por eso se cuentan simbolos
+        # distintos. Con esto, 5 entradas fusionadas de un simbolo valen
+        # 1, que es lo que el exchange tiene, y el tope global vuelve a
+        # medir la exposicion real. La garantia de "una posicion por
+        # simbolo" la da `one_position_per_symbol` en el motor
+        # (`symbols_with_open_positions`), que ya impedia abrir una
+        # segunda en el mismo activo.
+        _engine_open = getattr(self.engine, "open_positions", {}) or {}
+        _simbolos_expuestos = {
+            (p or {}).get("symbol") or str(k).split(":", 1)[-1]
+            for k, p in _engine_open.items()
+        }
+        _simbolos_expuestos.discard(None)
+        _simbolos_expuestos.discard("")
+        open_count = len(_simbolos_expuestos)
         risk_ok, risk_reason = self.guard.check(
             realized_today, equity, open_count,
             unrealized_today=mark["today"],
