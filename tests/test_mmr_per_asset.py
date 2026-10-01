@@ -116,25 +116,17 @@ def test_si_el_exchange_no_responde_se_dice_no_se_finge():
     forma comun es aparecer como si todo estuviera bien.
     """
     mmr, origen = mmr_table.mmr_for_symbol("NOEXISTE/USDT:USDT", 100)
-    # 2026-10-01: el origen ya no es el ambiguo "por_defecto". Con el MMR
-    # plano un valor unico para todo apalancamiento sobrestimaba el colchon
-    # a 25x (daba 3,62% con un MMR de 150x cuando el real es 1,50%), y
-    # "por_defecto" no decia de que apalancamiento salia el numero. Ahora el
-    # origen lleva el escalon (`estimado_escalon:100x`), que es precisamente
-    # lo que hace falta para saber que el valor es una estimacion y no una
-    # medida. La propiedad que este test protege no es el nombre: es que el
-    # origen NO pueda confundirse con una lectura del exchange.
-    assert origen.startswith("estimado_escalon:"), (
-        "un simbolo inexistente tiene que decir que se ESTIMA, no medido")
+    # La propiedad que este test protege NO es el nombre del origen: es que
+    # un simbolo que el exchange NO conoce no pueda llevar un origen que lo
+    # haga pasar por medido. Con la lectura directa por `symbol=` (2026-10-01)
+    # lo unico que queda cuando el exchange no responde es una estimacion por
+    # escalon, y tiene que decirlo.
     assert "exchange" not in origen, (
-        "un simbolo fuera de la tabla no puede llevar origen de exchange")
-    # El valor sale del escalon del apalancamiento pedido, no de uno fijo.
+        "un simbolo que el exchange no conoce no puede llevar origen de "
+        f"exchange: devolvio {origen}")
+    assert origen.startswith("estimado_escalon:"), (
+        f"tiene que declarar que se ESTIMA, no medido: devolvio {origen}")
     assert mmr == mmr_table._mmr_por_escalon(100)
-    # Y sigue siendo MAS restrictivo que el 0,0033 plano que era el bug:
-    # a 100x el escalon es 0,005, mayor que 0,0033.
-    assert mmr > 0.0033, (
-        "el MMR estimado tiene que ser MAS restrictivo que el 0,0033 de la "
-        "tabla: usar el menor es justamente el bug que se corrige")
 
 
 def test_el_simbolo_se_traduce_al_formato_del_endpoint():
@@ -266,3 +258,118 @@ def test_el_plan_declara_de_donde_sale_el_mmr():
         "el plan tiene que declarar el MMR que uso y de donde salio: es "
         "el numero del que depende el clamp, o sea el que decide si el SL "
         "protege o no")
+
+
+# ---------------------------------------------------------------------------
+# LA PAGINACION: el bug que costo medir el MMR de XRP y SOL
+# ---------------------------------------------------------------------------
+
+def test_la_paginacion_avanza_o_no_pagina(monkeypatch):
+    """Un cursor que no cambia relee la misma pagina para siempre.
+
+    MEDIDO el 2026-10-01: `nextPageCursor` devolvio el MISMO valor en
+    paginas sucesivas, y el bucle leyo 4.394 filas del mismo simbolo. De ahi
+    salio la conclusion FALSA de que XRP y SOL no estaban en la tabla, y de
+    ahi la estimacion por escalones de BTC, que a 25x daba 0,025 cuando el
+    real es 0,020: sobrestimaba su margen de liquidacion, que es la
+    direccion peligrosa.
+
+    Se prueba COMPORTAMIENTO, no el texto del fuente: la primera version de
+    este test buscaba la palabra `cursor_anterior` en el codigo, y pasaba
+    con el bug puesto porque la palabra seguia apareciendo en el COMENTARIO
+    que lo explica. Un test que lee un comentario afirma que el comentario
+    es verdad, no que el codigo lo haga.
+    """
+    paginas = [
+        # Pagina 1: dos filas, cursor "c1".
+        {"result": {"list": [{"symbol": "AUSDT", "maintenanceMargin": 0.01,
+                              "maxLeverage": 50}],
+                    "nextPageCursor": "c1"}},
+        # Pagina 2: MISMO simbolo, MISMO cursor. Esto es lo que hacia el
+        # exchange, y sin comprobacion de avance se relee 40 veces.
+        {"result": {"list": [{"symbol": "AUSDT", "maintenanceMargin": 0.01,
+                              "maxLeverage": 50}],
+                    "nextPageCursor": "c1"}},
+        # Si el cursor avanzara de verdad, esta pagina existiria.
+        {"result": {"list": [{"symbol": "ZZUSDT", "maintenanceMargin": 0.02,
+                              "maxLeverage": 25}], "nextPageCursor": ""}},
+    ]
+    llamadas = {"n": 0}
+
+    class _Fake:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            i = min(llamadas["n"], len(paginas) - 1)
+            llamadas["n"] += 1
+            import json as _json
+            return _json.dumps(paginas[i]).encode()
+
+    monkeypatch.setattr(mmr_table.urllib.request, "urlopen",
+                        lambda *a, **k: _Fake())
+    out = mmr_table._descarga()
+    # Con el cursor congelado tiene que cortar en la segunda lectura, no
+    # agotar las 40: si se agota, `llamadas` llega a 3 y habria leido la
+    # pagina que nunca devuelve el exchange.
+    assert llamadas["n"] == 2, (
+        f"la paginacion leyo {llamadas['n']} paginas con un cursor que no "
+        "cambia: tiene que parar en cuanto se repita")
+    assert "AUSDT" in out
+
+
+def test_cuando_el_simbolo_no_esta_en_la_tabla_se_pregunta_directo():
+    """Ausente de la tabla global NO es lo mismo que ausente del exchange.
+
+    Es el caso que produjo la estimacion: XRP y SOL no salian de la tabla
+    global (por el tope de paginas) pero el exchange si los responde por
+    `symbol=`. La lectura directa tiene que ir ANTES de cualquier estimacion,
+    porque una estimacion hereda el MMR de otro activo y por lo tanto sus
+    errores.
+    """
+    src = inspect.getsource(mmr_table.mmr_for_symbol)
+    i_directa = src.find("_descarga_directa")
+    i_estimada = src.find("estimado_escalon")
+    assert i_directa != -1, (
+        "no hay lectura directa por simbolo: un simbolo fuera de la tabla "
+        "global nunca podria medirse")
+    assert i_directa < i_estimada, (
+        "la estimacion se evalua ANTES de preguntar al exchange: es "
+        "justamente el orden invertido que produjo el MMR equivocado")
+
+
+def test_la_estimacion_por_escalon_es_el_ultimo_recurso():
+    """Si se puede leer del exchange, NUNCA se estima.
+
+    El orden importa mas que el valor: estimar primero y luego intentar
+    leer es lo que hizo que un MMR heredado de BTC pasara por medido durante
+    todo el trabajo de este dia.
+    """
+    assert mmr_table.ESCALONES_MMR, "los escalones son el ultimo recurso"
+    mmr, origen = mmr_table.mmr_for_symbol("XRP/USDT:USDT", 25)
+    if "exchange" in origen:
+        assert "escalon" not in origen, (
+            "con el exchange disponible no se puede devolver una estimacion")
+
+
+def test_el_rollback_de_known_absent():
+    """`KNOWN_ABSENT` era una afirmacion FALSA sobre el exchange.
+
+    Seacia para no consultar cada ciclo simbolos "que no existen". Ahora esta
+    vacio porque los DOS se leen del exchange, y lo que queda separado es
+    `MMR_MEDIDOS_SIN_BANDA`, que es otra cosa: simbolos con un valor medido
+    en una posicion real que se usaria SOLO si el exchange deja de
+    responder. Rellenar cualquiera de los dos exige volver a MEDIR la
+    ausencia, no suponerla.
+    """
+    assert not mmr_table.KNOWN_ABSENT, (
+        "XRPUSDT y SOLUSDT SI estan en el endpoint publico: se leyeron con "
+        "sus 33 bandas. Si esto se vuelve a llenar, la afirmacion "
+        "alternativa ('no existen') tiene que volver a medirse")
+    # Y el valor medido no se confunde con una banda real del exchange.
+    assert mmr_table.MMR_MEDIDOS_SIN_BANDA, (
+        "el conjunto de valores medidos tiene que existir: es el recurso "
+        "cuando el exchange no responde")

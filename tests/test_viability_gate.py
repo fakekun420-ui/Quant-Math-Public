@@ -112,17 +112,25 @@ def test_la_liquidacion_usa_el_mmr_real_y_no_el_de_otro_apalancamiento():
 
 
 def test_un_simbolo_fuera_de_la_tabla_no_hereda_el_mmr_de_otro_apalancamiento():
-    """XRP y SOL no estan en la tabla: su MMR NO puede ser el de 150x.
+    """XRP y SOL se leen del exchange: su MMR NO puede ser el de BTC.
 
-    MEDIDO: XRP a 25x con MMR plano (0,3846%, el de 150x) daba liquidacion al
-    3,62%, cuando la estimacion por escalon la deja en 1,50%. Sobrestimar el
-    colchon es lo que hace que un stop imposible parezca colocable.
+    MEDIDO el 2026-10-01 contra el endpoint: BTC a 25x tiene MMR 0,025 y XRP
+    y SOL tienen 0,020. Con los escalones de BTC, que era lo que se usaba
+    cuando se creia que no estaban en la tabla, la liquidacion de XRP a 25x
+    salia al 1,50% en vez del 2,00% real. Sobrestimar el colchon es la
+    direccion peligrosa: hace que un stop imposible parezca colocable.
     """
-    liq = distancia_liquidacion_pct("XRP/USDT:USDT", 25)
-    assert liq is not None
-    assert liq < 2.0, (
-        "a 25x el colchon estimado es 1,50%: si sale mayor, se esta "
-        "heredando un MMR de un apalancamiento que no es este")
+    liq_xrp = distancia_liquidacion_pct("XRP/USDT:USDT", 25)
+    liq_btc = distancia_liquidacion_pct("BTC/USDT:USDT", 25)
+    assert liq_xrp is not None and liq_btc is not None
+    # El real de XRP a 25x: MMR 0,020 -> 4,00% - 2,00% = 2,00%.
+    assert liq_xrp == pytest.approx(2.0, abs=0.05), (
+        "XRP a 25x tiene MMR 0,020 en el endpoint de Bybit: si sale otra "
+        f"cosa, se esta heredando el MMR de otro simbolo (salio {liq_xrp})")
+    # Y BTC a 25x tiene MMR 0,025, o sea un colchon MENOR: los dos no pueden
+    # tener el mismo MMR si uno se lee del exchange y el otro no.
+    assert liq_btc == pytest.approx(1.5, abs=0.05)
+    assert liq_xrp != liq_btc
 
 
 def test_a_1x_la_liquidacion_no_deja_colchon_util():

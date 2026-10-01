@@ -147,11 +147,15 @@ def _mmr_por_escalon(leverage) -> float:
         elegido = valor
     return elegido
 
-#: Simbolos que se saben ausentes de la tabla publica (medido: no
-#: aparecen en las 40 paginas, 600 simbolos). Sin esto se consultaria y
-#: se devolveria "no encontrado" cada ciclo, para cada uno, en cada
-#: arranque.
-KNOWN_ABSENT = frozenset({"SOLUSDT", "XRPUSDT"})
+#: Simbolos para los que hay un MMR MEDIDO en una posicion real pero cuya
+#: banda exacta no se ha podido leer. Se declara VACIO a proposito: XRP y SOL
+#: estaban aqui porque se afirmaba que no estaban en la tabla publica, y era
+#: FALSO. Preguntando por `symbol=` ambos responden con sus 33 bandas y su
+#: MMR real: a 25x, 0,020 en vez del 0,025 heredado de BTC, o sea que la
+#: estimacion sobrestimaba su margen de liquidacion. Rellenar este conjunto
+#: exige volver a MEDIR la ausencia, no suponerla.
+KNOWN_ABSENT = frozenset()
+MMR_MEDIDOS_SIN_BANDA = frozenset({"XRPUSDT", "SOLUSDT"})
 
 
 def _normaliza(simbolo: str) -> str:
@@ -207,9 +211,50 @@ def _descarga() -> Dict[str, Dict[int, float]]:
             if mmr <= 0 or lev <= 0:
                 continue
             out.setdefault(str(x["symbol"]).upper(), {})[lev] = mmr
-        cursor = result.get("nextPageCursor")
-        if not cursor:
+        cursor_anterior, cursor = cursor, result.get("nextPageCursor")
+        # El cursor tiene que CAMBIAR para que la paginacion avance. Medido
+        # el 2026-10-01: `nextPageCursor` devuelve el MISMO valor en paginas
+        # sucesivas, y sin esta comprobacion el bucle releia la misma pagina
+        # 40 veces: 4.394 filas, todas del mismo simbolo, y BTCUSDT, XRPUSDT
+        # y SOLUSDT nunca aparecian. De ahi salio la conclusion FALSA de que
+        # esos dos no estaban en la tabla, y de ahi la estimacion por
+        # escalones de BTC que a 25x daba 0,025 con un real de 0,020.
+        if not cursor or cursor == cursor_anterior:
             break
+    return out
+
+
+def _descarga_directa(sym: str) -> Dict[int, float]:
+    """Lee las 33 bandas de UN simbolo directamente, por su nombre.
+
+    Por que existe aunque la descarga global funcione: la global esta TOPADA
+    a 40 paginas de 500 filas, y con el tope los simbolos del final del
+    abecedario no salen. El fallo es INVISIBLE: el parser no lanza nada,
+    simplemente no encuentra la fila y se pasa al valor por defecto.
+
+    Verificado el 2026-10-01: XRPUSDT y SOLUSDT SI estan, con banda maxima de
+    100x (BTC llega a 150x), y su MMR a 25x es 0,020, no el 0,025 de BTC. Es
+    decir: la estimacion por escalones sobrestimaba su margen de
+    liquidacion, que es la direccion peligrosa.
+    """
+    url = f"{RISK_LIMIT_URL}&symbol={sym}"
+    out: Dict[int, float] = {}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "qmp/1"})
+        with urllib.request.urlopen(req, timeout=25) as fh:
+            data = json.loads(fh.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError,
+            json.JSONDecodeError) as exc:
+        logger.debug("[mmr] no se pudo leer %s directo: %s", sym, exc)
+        return out
+    for x in ((data.get("result") or {}).get("list") or []):
+        try:
+            mmr = float(x["maintenanceMargin"])
+            lev = int(float(x["maxLeverage"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if mmr > 0 and lev > 0:
+            out[lev] = mmr
     return out
 
 
@@ -304,11 +349,6 @@ def mmr_for_symbol(simbolo: Optional[str], leverage) -> Tuple[float, str]:
     lev = max(1, int(float(leverage or 1)))
     sym = _normaliza(simbolo or "")
     cargar_tabla()
-    if not _CACHE:
-        est = _mmr_por_escalon(lev)
-        logger.debug("[mmr] la tabla de riesgo no esta disponible: se estima "
-                     "por escalon %.4f%% (NO es medida)", est * 100)
-        return est, f"estimado_escalon:{lev}x"
     if sym in _CACHE:
         filas = _CACHE[sym]
         if lev in filas:
@@ -322,28 +362,42 @@ def mmr_for_symbol(simbolo: Optional[str], leverage) -> Tuple[float, str]:
         # el mas restrictivo de los que hay).
         elegido = max(filas)
         return filas[elegido], f"exchange:{sym}@{elegido}x"
-    if sym in KNOWN_ABSENT:
-        # MEDIDO el 2026-10-01: para estos dos simbolos la tabla publica no
-        # existe, pero el MMR REAL se midio en sus posiciones vivas. Se usa
-        # ese en vez del valor por defecto de otro activo: medido, es un
-        # 44% mas alto, y la liquidacion calculada con el supuesto estaba
-        # mas lejos de la real de lo que esta.
-        medido = MMR_MEDIDOS.get((sym, int(leverage)))
+
+    # No esta en la tabla global. ANTES de estimar nada se PREGUNTA AL
+    # EXCHANGE por este simbolo concreto. El orden importa: una estimacion
+    # hereda el MMR de otro activo y por lo tanto sus errores, y preguntar es
+    # una llamada que ya se hacia para el resto de simbolos.
+    #
+    # Esto cubre tambien el caso de la tabla global vacia: si Bybit no
+    # devolvio el listado, el `symbol=` individual suele responder igual.
+    directo = _descarga_directa(sym)
+    if directo:
+        _CACHE[sym] = directo
+        _escribe_cache_disco({sym: directo})
+        logger.info("[mmr] %s leido directo del exchange: %d bandas "
+                    "(no estaba en la tabla global)", sym, len(directo))
+        if lev in directo:
+            return directo[lev], f"exchange:{sym}@{lev}x"
+        superiores = [l for l in directo if l >= lev]
+        elegido = min(superiores) if superiores else max(directo)
+        return directo[elegido], f"exchange:{sym}@{elegido}x"
+
+    # Ultimo recurso, y solo si el exchange no responde ni en global ni en
+    # individual. Se alcanzaba antes para XRP y SOL, y era incorrecto: a 25x
+    # estimaba 0,025 con los escalones de BTC cuando el real es 0,020, o sea
+    # sobrestimaba su margen de liquidacion.
+    if sym in MMR_MEDIDOS_SIN_BANDA:
+        medido = MMR_MEDIDOS.get((sym, int(lev)))
         if medido is not None:
-            logger.debug("[mmr] %s a %sx no esta en la tabla de Bybit; se usa "
-                         "el MEDIDO en su posicion real: %.4f%%", sym,
-                         leverage, medido * 100)
-            return medido, f"medido:{sym}@{leverage}x"
-        logger.debug("[mmr] %s a %sx no esta en la tabla publica de Bybit ni "
-                     "hay medida a ESE apalancamiento: se estima por escalon "
-                     "%.4f%% (escalones de BTC, NO es medida).", sym,
-                     leverage, _mmr_por_escalon(leverage) * 100)
-        return _mmr_por_escalon(leverage), f"estimado_escalon:{leverage}x"
-    est = _mmr_por_escalon(leverage)
-    logger.debug("[mmr] %s a %sx: la tabla no esta disponible; se estima por "
+            logger.debug("[mmr] %s a %sx: el exchange no respondio; se usa el "
+                         "MEDIDO en su posicion real a 100x: %.4f%%", sym,
+                         lev, medido * 100)
+            return medido, f"medido:{sym}@100x"
+    est = _mmr_por_escalon(lev)
+    logger.debug("[mmr] %s a %sx: sin lectura del exchange; se estima por "
                  "escalon %.4f%% (escalones de BTC, NO es medida).", sym,
-                 leverage, est * 100)
-    return est, f"estimado_escalon:{leverage}x"
+                 lev, est * 100)
+    return est, f"estimado_escalon:{lev}x"
 
 
 def mmr_from_live_position(simbolo: Optional[str], api=None) -> Tuple[
