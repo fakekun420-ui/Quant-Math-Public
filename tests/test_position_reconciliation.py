@@ -51,6 +51,34 @@ class FakeAPI:
                             "amount": amount, "params": params or {}})
         return {"id": f"ORD-{len(self.orders)}"}
 
+    @property
+    def exchange(self):
+        """El cliente ccxt crudo.
+
+        MEDIDO el 2026-10-01: la ruta de cierre carga los mercados antes
+        de construir la orden, porque ccxt lanza `markets not loaded` si
+        no y entonces el cierre NO llega al exchange. Este doble tiene que
+        exponer lo mismo que el codigo usa.
+
+        Setter incluido porque `__init__` ya hacia `self.exchange = self`:
+        una property de solo lectura revienta en ese `__init__` con
+        "can't set attribute", que es como se manifesto (9 tests en rojo
+        de golpe, y no por el cambio de produccion).
+        """
+        return self
+
+    @exchange.setter
+    def exchange(self, value):
+        # `__init__` asigna `self.exchange = self`; se acepta y se ignora
+        # porque el cliente ccxt de este doble ES el propio doble.
+        self._exchange_cliente = value
+
+    def load_markets(self, reload=False, params=None):
+        if FakeAPI.load_markets_error:
+            raise RuntimeError(FakeAPI.load_markets_error)
+        FakeAPI.load_markets_calls += 1
+        return {}
+
     def close(self):
         self.closed = True
 
@@ -59,6 +87,8 @@ class FakeAPI:
 def fake_api(monkeypatch):
     FakeAPI.instances = []
     FakeAPI.POSITIONS = {}
+    FakeAPI.load_markets_error = None
+    FakeAPI.load_markets_calls = 0
     import data_acquisition.data_sources.exchanges as ex
     monkeypatch.setattr(ex, "ExchangeAPI", FakeAPI)
     monkeypatch.setenv("BYBIT_API_KEY", "CLAVE_DE_TEST")

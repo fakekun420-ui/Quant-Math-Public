@@ -472,6 +472,54 @@ class ExchangeAPI:
         swaps = [self._to_swap_symbol(s) for s in symbols] if symbols else None
         return list(self.exchange.fetch_positions(swaps) or [])
 
+    def read_back_stops(self, symbol: str) -> Dict[str, Optional[float]]:
+        """SL y TP REALES de la posicion abierta, leidos del exchange.
+
+        MEDIDO el 2026-10-01: el SL se mandaba en la orden de entrada y
+        se daba por puesto. No lo estaba. Una posicion quedo DESPROTEGIDA
+        en el exchange y se liquido al 127,2% del margen cuando el SL
+        pedia 27,5%: el sistema lo etiquetaba `motivo=sl` aunque nadie
+        lo habia ejecutado.
+
+        Por eso esto lee lo que el exchange TENIA, en vez de fiarse de
+        lo que le pedimos. Igual que `read_back_leverage`: que devuelva
+        None significa "no se pudo comprobar", nunca "esta todo bien".
+        Quien llama tiene que fallar cerrado.
+
+        El `triggerBy` tambien se lee, porque no es decorativo:
+        Bybit liquida por MarkPrice y pone el SL por LastPrice si no se
+        le dice otra cosa, de modo que un mark que se adelanta cruza la
+        liquidacion antes de tocar el SL.
+        """
+        out: Dict[str, Optional[float]] = {"stopLoss": None,
+                                           "takeProfit": None,
+                                           "stopLoss_triggerBy": None,
+                                           "takeProfit_triggerBy": None}
+        self._require_auth()
+        swap = self._to_swap_symbol(symbol)
+        for pos in self.fetch_positions([swap]):
+            if not pos.get("contracts"):
+                continue
+            info = pos.get("info") or {}
+            for destino, clave in (("stopLoss", "stopLoss"),
+                                   ("takeProfit", "takeProfit")):
+                nodo = info.get(clave) or {}
+                if isinstance(nodo, dict):
+                    precio = nodo.get("stopLossPrice" if destino == "stopLoss"
+                                      else "takeProfitPrice")
+                    if precio in (None, "", "0", 0):
+                        precio = nodo.get("triggerPrice")
+                    try:
+                        if precio not in (None, "", "0", 0):
+                            out[destino] = float(precio)
+                    except (TypeError, ValueError):
+                        pass
+                    tb = nodo.get("triggerBy")
+                    if tb:
+                        out[f"{destino}_triggerBy"] = str(tb)
+            return out
+        return out
+
     def read_back_leverage(self, symbol: str) -> Optional[float]:
         """Apalancamiento REAL de la posicion abierta, leido del exchange.
 

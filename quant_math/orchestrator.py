@@ -828,21 +828,44 @@ class Orchestrator:
         `reduceOnly` es lo que impide que un cierre abra una posicion
         INVERSA por error: si la posicion ya no existe en el exchange, la
         orden se rechaza en vez de abrir otra cosa.
+
+        MEDIDO el 2026-10-01: al cerrar fallaba con `bybit markets not
+        loaded`. ccxt necesita los mercados cargados para construir la
+        orden; sin ellos lanza antes de llegar al exchange. El resultado
+        era que la posicion se quedaba ABIERTA mientras el motor la
+        daba por cerrada, y sin avisar de nada: el cierre no habia
+        ocurrido. Es especialmente grave aqui porque, con el SL sin
+        cumplirse (ver la comprobacion post-entrada), esta era la otra
+        via de salida.
         """
         from data_acquisition.data_sources.exchanges import ExchangeAPI
         api = self._exchange()
         try:
+            swap = symbol if ":" in symbol else (
+                symbol + "/USDT:USDT" if symbol.endswith("/USDT") else symbol)
+            # Cargar los mercados ANTES de construir la orden. `load_markets`
+            # es idempotente: si ya estan cargados no vuelve a pedir nada,
+            # y si falla se dice POR QUE en vez de dejar que reviente
+            # despues con un error que no nombra la causa.
+            try:
+                api.exchange.load_markets()  # el cliente ccxt crudo
+            except Exception as exc:
+                logger.error("[live] no se pudieron cargar los mercados "
+                             "para cerrar %s: %s; el cierre NO se ha "
+                             "ejecutado y la posicion sigue abierta",
+                             symbol, exc)
+                return {"ok": False, "error": f"mercados no cargados: {exc}",
+                        "ejecutado": False, "symbol": symbol}
             # Al cerrar se compra para tapar una larga y se vende para tapar
             # una corta: el lado es el contrario al de la entrada.
             exit_side = "sell" if side == "buy" else "buy"
-            swap = symbol if ":" in symbol else (
-                symbol + ":USDT" if symbol.endswith("/USDT") else symbol)
             order = api.create_order(swap, exit_side, abs(qty),
                                      order_type="market",
                                      params={"reduceOnly": True})
             return {"ok": True, "order_id": order.get("id"),
                     "exchange_order_id": order.get("id"),
-                    "reduce_only": True, "side": exit_side}
+                    "reduce_only": True, "side": exit_side,
+                    "ejecutado": True}
         finally:
             try:
                 api.close()
@@ -2069,9 +2092,20 @@ class Orchestrator:
             # El exchange guarda la orden de proteccion: aunque el bot se
             # caiga, el SL sigue puesta. Es lo que hace esto operable con
             # dinero real y no solo un papel con buena intencion.
+            # MEDIDO el 2026-10-01: el SL se mandaba sin `triggerBy` y no
+            # se cumplia. Bybit liquida por MARK price pero pone el SL por
+            # LAST price si no se le dice otra cosa, asi que un mark que se
+            # adelanta cruza la liquidacion antes de tocar el SL. Medido:
+            # entrada 1,4916, SL pedido 1,4996 (26,8% ROE), liquidacion
+            # 1,5138 (74,4%) y salida real 1,529552 (127,2%) — es decir,
+            # se perdio mas del margen y el sistema lo etiqueto
+            # `motivo=sl`. El SL va en MarkPrice para que ambas cosas
+            # midan sobre lo mismo.
             order_params: Dict[str, Any] = {
-                "stopLoss": {"triggerPrice": float(sl_px)},
-                "takeProfit": {"triggerPrice": float(tp_px)},
+                "stopLoss": {"triggerPrice": float(sl_px),
+                             "triggerBy": "MarkPrice"},
+                "takeProfit": {"triggerPrice": float(tp_px),
+                               "triggerBy": "MarkPrice"},
             }
             order = api.create_order(signal["symbol"], side, qty,
                                      order_type="market", params=order_params)
@@ -2127,6 +2161,67 @@ class Orchestrator:
                         "reason": "apalancamiento distinto del pedido"}
             logger.info("[live] apalancamiento VERIFICADO en el exchange: "
                         "%sx (era lo pedido)", real)
+
+            # --- EL SL Y EL TP TIENEN QUE ESTAR EN EL EXCHANGE ----------
+            #
+            # MEDIDO el 2026-10-01: esto NO se comprobaba. Se mandaba el SL
+            # dentro de la orden de entrada y se daba por puesto, pero una
+            # posicion acabo DESPROTEGIDA y se liquido al 127,2% del margen
+            # con el SL pedido al 27,5%. El sistema lo registro como
+            # `motivo=sl`: una etiqueta de proteccion para algo que no
+            # llego a existir.
+            #
+            # El patron ya existe para el apalancamiento y el modo de
+            # margen: se COMPRUEBA y se cierra si no cuadra. Aqui faltaba
+            # la tercera pieza, y es la mas grave de las tres: sin SL en el
+            # exchange, lo unico que protege es que el proceso siga vivo.
+            #
+            # Fallo cerrado: si no se puede LEER, no se fia. Preferimos
+            # perder el spread de una entrada a quedarnos con una posicion
+            # cuya proteccion nadie ha medido.
+            try:
+                _stops = api.read_back_stops(signal["symbol"])
+            except Exception as exc:
+                logger.warning("[live] no se pudieron leer los stops reales: "
+                               "%s", exc)
+                _stops = {}
+            _sl_real = _stops.get("stopLoss") if isinstance(_stops, dict) else None
+            _tp_real = (_stops.get("takeProfit")
+                        if isinstance(_stops, dict) else None)
+            # Tolerancia: el exchange redondea al tick del simbolo. Un tick
+            # de XRP es 0,0001, que es 0,0067% a este precio: comparar
+            # con igualdad de float daria falsos negativos que SIEMPRE
+            # acabarian cerrando una posicion bien protegida.
+            _tol = max(abs(float(price)) * 0.0005, 1e-9)
+            _motivo = None
+            if _sl_real is None:
+                _motivo = "el exchange NO tiene SL puesto"
+            elif abs(_sl_real - float(sl_px)) > _tol:
+                _motivo = (f"SL real {_sl_real} != SL pedido {float(sl_px):.6f}")
+            if _motivo is None and _tp_real is not None \
+                    and abs(_tp_real - float(tp_px)) > _tol:
+                _motivo = (f"TP real {_tp_real} != TP pedido {float(tp_px):.6f}")
+            if _motivo:
+                logger.error("[live] PROTECCION AUSENTE O INCORRECTA: %s; "
+                             "se cierra la posicion", _motivo)
+                _cerrado = self._cerrar_si_no_verifica(
+                    api, signal["symbol"], side, qty, _motivo)
+                try:
+                    api.close()
+                except Exception:
+                    pass
+                return {"action": "live_failed",
+                        "symbol": signal["symbol"],
+                        "error": _motivo,
+                        "stop_loss_pedido": float(sl_px),
+                        "stop_loss_real": _sl_real,
+                        "take_profit_pedido": float(tp_px),
+                        "take_profit_real": _tp_real,
+                        "auto_closed": _cerrado,
+                        "reason": "proteccion no verificable en el exchange"}
+            logger.info("[live] SL/TP VERIFICADOS en el exchange: SL=%s TP=%s "
+                        "(triggerBy SL=%s)", _sl_real, _tp_real,
+                        _stops.get("stopLoss_triggerBy"))
 
             # --- MODO DE MARGEN: tambien se COMPRUEBA -----------------
             #

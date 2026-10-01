@@ -81,6 +81,24 @@ class FakeAPI:
     def read_back_leverage(self, symbol):
         return self.leverage_real
 
+    def read_back_stops(self, symbol):
+        """SL/TP que el exchange DECLARA tener.
+
+        MEDIDO el 2026-10-01: el SL se mandaba en la orden y se daba por
+        puesto sin comprobarlo. Una posicion quedo desprotegida y se
+        liquido al 127,2% del margen con el SL pedido al 27,5%. Ahora se
+        lee, y este doble devuelve lo que el pedido guardo, para poder
+        comparar.
+
+        `stops_real = None` simula un exchange que NO expone los stops
+        (o una llamada que falla): el orquestador tiene que fallar
+        cerrado y cerrar la posicion, no darla por buena.
+        """
+        if FakeAPI.stops_real is None:
+            return {"stopLoss": None, "takeProfit": None,
+                    "stopLoss_triggerBy": None, "takeProfit_triggerBy": None}
+        return dict(FakeAPI.stops_real)
+
     def fetch_order_book(self, symbol, limit=5):
         """Libro del venue de EJECUCION (lo usa la comprobacion de rango)."""
         if FakeAPI.book_error:
@@ -94,6 +112,12 @@ class FakeAPI:
         valida el TP/SL contra `LastPrice`, no contra el libro."""
         return self
 
+    def load_markets(self, reload=False, params=None):
+        if FakeAPI.load_markets_error:
+            raise RuntimeError(FakeAPI.load_markets_error)
+        FakeAPI.load_markets_calls += 1
+        return {}
+
     def read_back_margin_mode(self, symbol):
         return self.margin_mode_real
 
@@ -106,6 +130,22 @@ class FakeAPI:
             "symbol": symbol, "side": side, "amount": amount,
             "order_type": order_type, "params": params or {},
         })
+        # Un exchange que ACEPTA la orden guarda lo que se le pidio. Se
+        # registra aqui para que `read_back_stops` tenga algo que devolver:
+        # es lo que hace que la comprobacion post-entrada sea real en vez
+        # de un adorno. `FakeAPI.stops_drop` simula al exchange que se
+        # come el SL sin avisar, que es el fallo que hay que cazar.
+        if FakeAPI.stops_drop:
+            FakeAPI.stops_real = {"stopLoss": None, "takeProfit": None,
+                                  "stopLoss_triggerBy": None,
+                                  "takeProfit_triggerBy": None}
+        elif isinstance(params, dict) and params.get("stopLoss"):
+            FakeAPI.stops_real = {
+                "stopLoss": (params.get("stopLoss") or {}).get("triggerPrice"),
+                "takeProfit": (params.get("takeProfit") or {}).get("triggerPrice"),
+                "stopLoss_triggerBy": (params.get("stopLoss") or {}).get("triggerBy"),
+                "takeProfit_triggerBy": (params.get("takeProfit") or {}).get("triggerBy"),
+            }
         # El relleno de un marketable sale en el libro, no en el medio.
         _fill = FakeAPI.book_price
         return {"id": f"ORD-{len(self.orders)}", "amount": amount,
@@ -125,6 +165,15 @@ def fake_api(monkeypatch):
     FakeAPI.margin_available = 100000.0
     FakeAPI.margin_mode_real = "isolated"
     FakeAPI.margin_mode_error = None
+    # Por defecto el doble NO sabe de stops (como un exchange que no los
+    # expone). Cada test que SI espera una operacion viva tiene que
+    # declararlos en su `create_order`, que es donde se sabe lo que se
+    # pidio. Asi el contrato queda explicito: no se da por buena ninguna
+    # proteccion que no se pueda leer.
+    FakeAPI.stops_real = None
+    FakeAPI.stops_drop = False
+    FakeAPI.load_markets_error = None
+    FakeAPI.load_markets_calls = 0
     FakeAPI.book_price = 100.0
     FakeAPI.book_error = None
     import data_acquisition.data_sources.exchanges as ex
@@ -937,3 +986,143 @@ def test_si_no_se_puede_comprobar_no_se_inventa_la_veredicto(fake_api):
     assert r["posicion_sin_cerrar"] is None, "desconocido != cerrado"
     assert r["ok"] is False
     assert "aviso" in r
+
+
+# ---------------------------------------------------------------------------
+# EL SL SE COMPRUEBA, NO SE SUPONE (2026-10-01)
+#
+# MEDIDO con el brazo corriendo en testnet: una posicion quedo
+# DESPROTEGIDA y se liquido al 127,2% del margen con el SL pedido al
+# 27,5%. El sistema lo registro como `motivo=sl`: una etiqueta de
+# proteccion para algo que nunca llego a ponerse.
+#
+# Estos tests son COMPORTAMIENTO, no codigo: montan el doble para que el
+# exchange acepte la orden y luego se coma el SL, que es lo que hacia
+# falta. Un test de codigo ("esta read_back_stops en el fuente") verifica
+# que la comprobacion este escrita, no que haga algo.
+
+def _orch_live(**cfg_over):
+    """Orchestrator real (no doble) para llamar a `_execute_live_order`.
+
+    Los tests de proteccion necesitan el ORQUESTADOR de verdad: el doble
+    solo verifica como se construye la llamada, no que la comprobacion
+    exista. Un test que verifica un doble no verifica nada.
+    """
+    from quant_math.orchestrator import Orchestrator
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.config = _orch(**cfg_over)
+    orch.cycle_count = 1
+    return orch
+
+
+def _senal():
+    return {"symbol": "BTC/USDT:USDT", "side": "buy", "price": 100.0,
+            "hypothesis_id": "h1", "expectancy": 0.01,
+            "timestamp": 1790000000000}
+
+
+def test_si_el_exchange_se_traga_el_sl_la_posicion_se_cierra(fake_api):
+    """El caso real: la orden entra, pero el exchange no pone el SL.
+
+    Con el codigo viejo la operacion se daba por buena: el bot creia que
+    tenia un SL al 27,5% cuando en realidad la posicion no tenia NADA, y
+    el unico motivo por el que no se perdia mas era que la cuenta se
+    liquidara antes. El SL era un numero en un diccionario local.
+    """
+    fake_api.stops_drop = True          # el exchange acepta y NO protege
+    orch = _orch_live(dry_run=False)
+    trade = orch._execute_live_order(_senal(), 100.0, "buy", 500.0, 10, 50.0)
+
+    assert trade.get("action") == "live_failed", (
+        "una posicion sin SL en el exchange NO puede darse por buena: "
+        "tiene que cerrarse. Con el codigo viejo, trade['action'] era "
+        "'entry' y el bot operaba sin proteccion ninguna")
+    assert "SL" in str(trade.get("error", ""))
+    assert trade.get("auto_closed") is not None, (
+        "el cierre tiene que ocurrir, no solo anotarse como fallo: si no, "
+        "la posicion se queda viva sin proteccion y sin nadie que la vigile")
+
+
+def test_si_no_se_puede_leer_el_sl_tambien_se_cierra(fake_api):
+    """Un None es 'no lo se', no 'esta bien'.
+
+    Es la distincion que faltaba. Con el codigo viejo, no leer nada se
+    confundia con que no hubiera nada que proteger.
+    """
+    # El exchange no DEJA leer los stops. Se simula con una excepcion, que
+    # es como se manifiesta de verdad una llamada que falla por red: no
+    # con un None. Poner `stops_real = None` NO servia, porque `create_order`
+    # lo rellena con lo que se le pidio y a la hora de leer ya no era None.
+    original = FakeAPI.read_back_stops
+
+    def _no_se_puede_leer(self, symbol):
+        raise RuntimeError("timeout leyendo la posicion")
+
+    FakeAPI.read_back_stops = _no_se_puede_leer
+    try:
+        orch = _orch_live(dry_run=False)
+        trade = orch._execute_live_order(_senal(), 100.0, "buy",
+                                         500.0, 10, 50.0)
+    finally:
+        FakeAPI.read_back_stops = original
+
+    assert trade.get("action") == "live_failed", (
+        "no poder LEER la proteccion tiene que fallar cerrado: el riesgo "
+        "de seguir operando sin saber si hay SL es mayor que el spread de "
+        "cerrar y volver a abrir")
+
+
+def test_si_el_sl_esta_presente_y_correcto_la_operacion_se_acepta(fake_api):
+    """El camino bueno: el exchange pone el SL y se opera.
+
+    Se comprueba para que el arreglo del SL no se convierta en 'no se
+    opera nunca': cerrando de mas tampoco se gana.
+    """
+    orch = _orch_live(dry_run=False)
+    trade = orch._execute_live_order(_senal(), 100.0, "buy", 500.0, 10, 50.0)
+
+    assert trade.get("action") != "live_failed", (
+        f"el exchange puso el SL correcto: la operacion tiene que "
+        f"aceptarse, no cerrarse. Cerrar de mas tampoco se gana: {trade}")
+    assert trade.get("exchange_order_id"), "no se registro la orden en vivo"
+    enviados = [o for api in fake_api.instances for o in api.orders]
+    params = enviados[0]["params"]
+    entrada = fake_api.instances[-1].book_price
+    assert params["stopLoss"]["triggerPrice"] == pytest.approx(entrada * 0.95), (
+        "el SL se calcula sobre el ASK de entrada (el precio que se paga), "
+        "no sobre el precio rancio de la senal: en una compra se paga el "
+        "ask y Bybit valida base_price contra ese mismo lado")
+    assert params["stopLoss"]["triggerBy"] == "MarkPrice", (
+        "el SL tiene que dispararse por MarkPrice, que es la misma base "
+        "que usa la liquidacion. Con LastPrice, un mark que se adelanta "
+        "cruza la liquidacion ANTES de que el stop llegue a dispararse: "
+        "medido, salida al 127,2% del margen con un SL pedido al 27,5%")
+
+
+def test_un_sl_que_no_cuadra_tambien_cierra(fake_api):
+    """No basta con que HAYA SL: tiene que ser el pedido.
+
+    Un exchange que pone el SL en otro sitio (o con otro redondeo grande)
+    deja la posicion expuesta igual. Aqui el exchange devuelve un SL
+    deliberadamente equivocado.
+    """
+    orch = _orch_live(dry_run=False)
+
+    # Intercepta la lectura: el exchange "pone" un SL que no es el pedido.
+    original = FakeAPI.read_back_stops
+
+    def _sl_malo(self, symbol):
+        d = original(self, symbol)
+        d["stopLoss"] = 99.0            # muy por debajo: no protege
+        return d
+    FakeAPI.read_back_stops = _sl_malo
+    try:
+        trade = orch._execute_live_order(_senal(), 100.0, "buy",
+                                         500.0, 10, 50.0)
+    finally:
+        FakeAPI.read_back_stops = original
+
+    assert trade.get("action") == "live_failed", (
+        "un SL presente pero INCORRECTO deja la posicion expuesta: "
+        "tiene queClosing la operacion")
+    assert trade.get("stop_loss_real") == 99.0
