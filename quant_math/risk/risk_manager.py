@@ -10,10 +10,13 @@ from datetime import datetime, timedelta
 
 from quant_math.core.types import StrategyResult
 from quant_math.risk.position_sizing import PositionSizer
-from quant_math.risk.stop_loss import StopLoss
 from quant_math.risk.kelly import KellyCriterion
 from quant_math.risk.var import ValueAtRisk, ExpectedShortfall
-from quant_math.expectation import DrawdownAnalyzer, SharpeMetrics
+# `DrawdownAnalyzer` se importaba aqui y NO se usaba: se instanciaba en
+# `__init__` y no se llamaba a ningun metodo. Ademas duplica
+# `circuit_breaker.DailyGuard`, que ya bloquea con la serie real. Se retiro
+# con el modulo el 2026-10-01. `SharpeMetrics` si se usa.
+from quant_math.expectation import SharpeMetrics
 
 
 class RiskManager:
@@ -71,12 +74,17 @@ class RiskManager:
         self.drawdown_limit = drawdown_limit
 
         # Initialize Quant-Math components
+        #
+        # `self.stop_loss` y `self.drawdown_analyzer` se instanciaban aqui y
+        # no se llamaba a NINGUN metodo suyo en todo el repo (medido con
+        # grep: 0 llamadas). Se retiraron con sus modulos el 2026-10-01.
+        # Los sustitutos vivos son `roe_targets.build_roe_plan` para el stop,
+        # que tiene el clamp de liquidacion medido, y
+        # `circuit_breaker.DailyGuard` para el drawdown, que ya bloquea.
         self.position_sizer = PositionSizer()
-        self.stop_loss = StopLoss()
         self.kelly = KellyCriterion()
         self.var_calculator = ValueAtRisk()
         self.es_calculator = ExpectedShortfall()
-        self.drawdown_analyzer = DrawdownAnalyzer()
         self.sharpe_metrics = SharpeMetrics()
 
         # Risk monitoring state

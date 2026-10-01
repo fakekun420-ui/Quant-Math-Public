@@ -4,12 +4,12 @@ Risk Management Module Exports
 
 from .sizing import KellyCriterion, kelly_fraction, PositionSizer
 from .risk_manager import RiskManager, create_risk_manager
-from .stop_loss import StopLoss
 from .var import ValueAtRisk, ExpectedShortfall
-try:
-    from .portfolio_risk import PortfolioRisk, RiskBudget, StressTesting
-except ImportError:  # scipy optional
-    PortfolioRisk = RiskBudget = StressTesting = None  # type: ignore
+# `StopLoss` y `PortfolioRisk`/`RiskBudget`/`StressTesting` se exportaban
+# aqui y se retiraron con sus modulos el 2026-10-01. No eran placeholders:
+# los modulos existian, se instanciaban y no se llamaban. El `except
+# ImportError` que habia ya era una pista de que la cadena se estaba
+# sosteniendo a mano; ahora no hace falta sostenerla.
 from .circuit_breaker import DailyGuard, utc_today, utc_day_start_ts
 from .roe_targets import (
     DEFAULT_MAINTENANCE_MARGIN_RATE,
@@ -33,12 +33,8 @@ __all__ = [
     "RiskManager",
     "create_risk_manager",
     "PositionSizer",
-    "StopLoss",
     "ValueAtRisk",
     "ExpectedShortfall",
-    "PortfolioRisk",
-    "RiskBudget",
-    "StressTesting",
     "DailyGuard",
     "utc_today",
     "utc_day_start_ts",

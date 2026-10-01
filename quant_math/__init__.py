@@ -40,8 +40,6 @@ from quant_math.core.protocols import (
 
 # Expectation Calculation (Module 8)
 from quant_math.expectation import (
-    ReturnCalculator,
-    DrawdownAnalyzer,
     SharpeMetrics,
     StatisticalTests,
     one_sample_ttest,
@@ -58,17 +56,14 @@ from quant_math.risk import (
     ValueAtRisk,
     ExpectedShortfall,
     PositionSizer,
-    StopLoss,
 )
 
 # Monte Carlo Simulation
-from quant_math.monte_carlo import (
-    MonteCarloSimulator,
-    MonteCarloConfig,
-    bootstrap_simulation,
-    parametric_simulation,
-    calculate_var_es,
-)
+# RETIRADO el 2026-10-01: `monte_carlo.simulator` era duplicado de
+# `adapter.simulate_distribution`, que es el que se usa. El duplicado
+# devolvia PnL en USD donde el vivo devuelve fraccion de capital, y al
+# compartir el pondero 0,3 del score habria mezclado dos unidades.
+# Ver la nota completa en `quant_math/monte_carlo/__init__.py`.
 
 # Optimization — legacy/research (ver legacy/optimization/). No re-export fantasma.
 # Usar: from legacy.optimization import KellyCriterion, MeanVarianceOptimizer, AdaptiveSizer
@@ -105,8 +100,6 @@ __all__ = [
     "AgentRegistry",
 
     # Expectation (Module 8)
-    "ReturnCalculator",
-    "DrawdownAnalyzer",
     "SharpeMetrics",
     "StatisticalTests",
     "one_sample_ttest",
@@ -121,14 +114,8 @@ __all__ = [
     "ValueAtRisk",
     "ExpectedShortfall",
     "PositionSizer",
-    "StopLoss",
 
     # Monte Carlo
-    "MonteCarloSimulator",
-    "MonteCarloConfig",
-    "bootstrap_simulation",
-    "parametric_simulation",
-    "calculate_var_es",
 
     # Autonomous Research
     "ResearchManager",

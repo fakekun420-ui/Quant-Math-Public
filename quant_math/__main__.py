@@ -100,8 +100,8 @@ def list_modules() -> int:
     print("-" * 60)
     modules = {
         "expectation": "Statistical tests and performance metrics",
-        "risk": "Risk management (VaR, ES, Position Sizing, Kelly, PortfolioRisk)",
-        "monte_carlo": "Monte Carlo simulation engine",
+        "risk": "Risk management (VaR, ES, Position Sizing, Kelly)",
+        "monte_carlo": "Monte Carlo (su motor vive en quant_math.adapter)",
         "pca_analysis": "PCA decomposition, risk factors, covariance shrinkage",
         "ml": "Machine learning for quantitative finance",
         "decision_engine": "Expectancy gate, TP/SL, burst sizing",

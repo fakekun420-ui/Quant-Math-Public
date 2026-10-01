@@ -74,7 +74,16 @@ class OrchestratorConfig:
     # Infrastructure
     kb_path: str                            # JSONL shared with DecisionEngine
     state_dir: str                          # DecisionEngine state directory
-    interval_seconds: int = 3600            # period between continuous cycles
+    # Un ciclo por minuto, que es lo que escribe el wizard (cli/main.py:925).
+    #
+    # MEDIDO el 2026-10-01: este default era 3600, o sea UNA HORA entre
+    # ciclos, y no se registraba en ningun sitio. Una config que omite el
+    # campo (que es lo normal, porque nadie lo escribe a mano) se
+    # quedaba a una hora, 60 veces mas lento de lo que el wizard acaba de
+    # configurar, sin que nada lo dijera. Un valor silencioso que se lee
+    # como error es peor que un default equivocado: el equivocado se ve al
+    # arrancar, el silencioso se descubre un dia por la falta de señales.
+    interval_seconds: int = 60              # period between continuous cycles
     exchange_id: str = "bybit"              # REAL data source, always
     market: str = "crypto"                  # "crypto" (ccxt) or "forex" (Yahoo)
     dry_run: bool = True                    # True=paper trading ONLY (no live path yet)
@@ -3010,6 +3019,21 @@ class Orchestrator:
         # para mirar lo mismo. Activar con reconcile_every_n_cycles>0.
         if self.config.reconcile_every_n_cycles > 0 and not self.config.dry_run:
             self._run_reconcile(dry=not self.config.reconcile_auto_close)
+        # MEDIDO el 2026-10-01: el intervalo de ciclo no se registraba en
+        # ningun sitio, y su default (3600) no era el que escribe el wizard
+        # (60). Una config sin el campo se quedaba a una hora sin decir nada.
+        # Se anuncia al arrancar, con el ritmo real en ciclos por hora, para
+        # que un intervalo heredado sea visible en el log y no algo que se
+        # descubre por la falta de señales tres dias despues.
+        logger.info(
+            "[cadencia] intervalo de ciclo: %ss (%.0f ciclos/hora, %.1f/dia) "
+            "| simbolos: %s | apalancamiento: %sx | %s",
+            self.config.interval_seconds,
+            3600.0 / max(1, self.config.interval_seconds),
+            86400.0 / max(1, self.config.interval_seconds),
+            ",".join(self.config.symbols),
+            getattr(self.config, "leverage", "?"),
+            "PAPER" if self.config.dry_run else "LIVE")
         while max_cycles is None or cycles < max_cycles:
             if self._stop_requested:
                 break
