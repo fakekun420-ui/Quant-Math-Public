@@ -456,6 +456,16 @@ class PerformanceMetrics:
         if std_return == 0:
             return 0.0
 
+        # CORREGIDO el 2026-10-01: `risk_free_rate` se restaba de una media
+        # YA ANUALIZADA, o sea 0,02 (que es un 2% POR DIA) contra un numero
+        # multiplicado por 252. Mezcla de unidades: el riesgo sin riesgo
+        # quedaba multiplicado por 252 veces menos de lo que es, y en una
+        # serie con media anualizada alta desaparecia.
+        #
+        # `risk_free_rate` es ANUAL (0,02 = 2% al año), asi que la media
+        # anualizada y el riesgo sin riesgo estan en la misma unidad. Se
+        # documenta aqui porque el nombre del parametro es el que induce el
+        # error: parece un tasa por periodo.
         sharpe = (mean_return - risk_free_rate) / std_return
 
         return sharpe
@@ -526,7 +536,17 @@ class PerformanceMetrics:
         prices_array = np.array(prices)
         cumulative = np.maximum.accumulate(prices_array)
         drawdowns = (prices_array - cumulative) / cumulative * 100
-        max_drawdown = np.max(drawdowns)
+        # CORREGIDO el 2026-10-01. Aqui estaba `np.max(drawdowns)`, y eso
+        # devolvia 0.0 SIEMPRE, no "casi siempre": por construccion
+        # `prices <= maximo_acumulado`, luego todos los drawdowns son <= 0, y
+        # el maximo de una serie no positiva es el MAS CERCANO a cero.
+        # Demostrado: [100, 90, 80, 85, 90, 110] cae un 20% y devolvia 0,0.
+        #
+        # Un drawdown es una PERDIDA, asi que el peor es el mas negativo y se
+        # reporta en positivo. Con `np.max` el motor de riesgo recibia "no he
+        #endido ninguna perdida" en cada operacion perdedora que tuviera,
+        # que es justo cuando tiene que verla.
+        max_drawdown = abs(float(np.min(drawdowns)))
 
         return max_drawdown
 
