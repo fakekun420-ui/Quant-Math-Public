@@ -225,6 +225,40 @@ class ResearchManager:
         if not hypothesis:
             raise ValueError(f"Hypothesis not found: {hypothesis_id}")
 
+        # Los OHLCV REALES del simbolo se piden aqui si no vienen dados.
+        # MEDIDO el 2026-10-01: sin esto, `run_backtest` del adapter caia a
+        # `generate_synthetic_data`, un random walk con precio inicial de
+        # 50.000 y BTC como simbolo POR DEFECTO. Las hipotesis de BTC se
+        # median contra una serie INVENTADA y devolvian 0 operaciones, lo
+        # que acababa en `[skip] sin resultado de backtest utilizable` y
+        # dejaba a BTC con 0 hipotesis en la base (medido: 0 frente a 501
+        # de XRP).
+        #
+        # El fallo era silencioso porque un backtest sobre datos falsos
+        # devuelve un numero normal, sin ninguna marca que diga que es
+        # falso. El unico sintoma era un 0 que no explicaba nada.
+        if not backtest_kwargs.get("data"):
+            _sym = (getattr(hypothesis, "symbol", None)
+                    or (hypothesis.get("symbol") if isinstance(hypothesis, dict)
+                        else None))
+            _tf = "1m"
+            if isinstance(hypothesis, dict):
+                _tf = (hypothesis.get("parameters") or {}).get(
+                    "timeframe", hypothesis.get("timeframe", "1m"))
+            if _sym and hasattr(self.backtest_engine, "fetch_market_data"):
+                try:
+                    from datetime import datetime, timedelta, timezone
+                    _fin = datetime.now(timezone.utc)
+                    _ini = _fin - timedelta(days=7)
+                    backtest_kwargs["data"] = (
+                        self.backtest_engine.fetch_market_data(
+                            _sym, _ini, _fin, timeframe=_tf))
+                except Exception as exc:
+                    # Si no hay datos, NO se inventa: se deja que el
+                    # adapter falle con su mensaje, que explica el motivo.
+                    print(f"[ResearchManager] sin datos reales para {_sym} "
+                          f"({_tf}): {exc}")
+
         # Execute backtest
         result = self.backtest_engine.run_backtest(hypothesis, **backtest_kwargs)
 

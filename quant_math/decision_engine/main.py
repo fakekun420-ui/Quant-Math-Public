@@ -1373,11 +1373,28 @@ class DecisionEngine:
                     "reason": "posicion_abierta",
                     "signal": None,
                 }
-            logger.info("[no_entry] %s — %s", symbol, NO_ENTRY_REASON)
+            # MEDIDO el 2026-10-01: aqui se devolvia SIEMPRE
+            # NO_ENTRY_REASON = "sin hipotesis de expectativa positiva
+            # disponible". Con `learn_mode` activo el gate de expectativa
+            # esta DESACTIVADO y ese texto es falso: el motivo real suele
+            # ser que no hay NINGUNA hipotesis en la base para ese simbolo,
+            # o que sus backtests dieron 0 operaciones.
+            #
+            # No es cosmetico. Ese mensaje hizo creer que el gate
+            # seguía puesto cuando llevaba horas apagado, y se perdio
+            # tiempo buscando un problema que no existia mientras el
+            # problema de verdad (0 hipotesis para BTC) pasaba
+            # inadvertido. Un motivo de rechazo equivocado es peor que
+            # ninguno: manda al operador a la causa equivocada.
+            _razon = ("candidatos_sin_resultado_utilizable"
+                      if not candidates else NO_ENTRY_REASON)
+            logger.info("[no_entry] %s — %s (candidatos evaluados: %d)",
+                        symbol, _razon, len(candidates))
             return {
                 "action": "no_entry",
                 "symbol": symbol,
-                "reason": NO_ENTRY_REASON,
+                "reason": _razon,
+                "candidates_evaluated": len(candidates),
                 "signal": None,
             }
 

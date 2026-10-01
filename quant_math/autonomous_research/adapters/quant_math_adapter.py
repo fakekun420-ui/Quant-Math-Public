@@ -401,7 +401,8 @@ class QuantMathAdapter:
     # BacktestEngine Implementation
 
     def run_backtest(self, hypothesis, data: Dict[str, Any] = None,
-                    initial_capital: float = 100000.0) -> Any:
+                    initial_capital: float = 100000.0,
+                synthetic: bool = False) -> Any:
         """
         Run backtest using quant-math backtester.
 
@@ -418,6 +419,29 @@ class QuantMathAdapter:
             raise ValueError("Backtester not available")
 
         if data is None:
+            # MEDIDO el 2026-10-01: aqui se generaba un random walk y se
+            # pasaba por backtest como si fuera el mercado. Es la razon de
+            # que el backtest de BTC diera 0 operaciones: BTC era el
+            # simbolo por DEFECTO de `generate_synthetic_data`, luego sus
+            # hipotesis se median contra una serie inventada y no tenian
+            # nada que ver con BTC.
+            #
+            # Un backtest sobre datos sinteticos no es un backtest: es una
+            # medida de la moneda ficticia. Y como devuelve numeros, nadie
+            # lo detecta leyendo el resultado.
+            #
+            # Ahora se falla CLARO y se dice por que. Los datos sinteticos
+            # se siguen pudiendo pedir de forma explicita con
+            # `synthetic=True`, para tests, y en ese caso el resultado lo
+            # dice para que no se pueda confundir con una medida real.
+            if not synthetic:
+                raise ValueError(
+                    "run_backtest sin `data`: no se puede medir una "
+                    "hipotesis sobre datos inventados. Pasa los OHLCV "
+                    "reales del simbolo, o pide `synthetic=True` si lo que "
+                    "quieres es una prueba de humo. Convierte esto en un "
+                    "resultado silencioso era como BTC prototypo medians"
+                    " datos que no eran de BTC.")
             symbol = "BTC/USDT"
             if isinstance(hypothesis, dict):
                 symbol = hypothesis.get('symbol', hypothesis.get('asset', symbol))
