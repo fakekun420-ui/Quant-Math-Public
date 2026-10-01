@@ -321,12 +321,28 @@ def build_roe_plan(
     leverage,
     take_profit_roe: Optional[float] = None,
     stop_loss_roe: Optional[float] = None,
-    maintenance_margin_rate: float = DEFAULT_MAINTENANCE_MARGIN_RATE,
+    maintenance_margin_rate: Optional[float] = None,
     sl_liquidation_safety_frac: float = DEFAULT_SL_LIQUIDATION_SAFETY_FRAC,
     market: str = "crypto",
     max_tp_price_distance: Optional[float] = None,
+    symbol: Optional[str] = None,
 ) -> RoePlan:
     """Construye el plan ROE de un modo+apalancamiento.
+
+    `symbol` es lo que hace que el MMR sea el de VERDAD. Sin el, el MMR
+    es un unico numero por defecto y el clamp del SL opera con una cifra
+    que puede estar un 34-41% por debajo de la real (medido el
+    2026-10-01): el MMR de 100x es 0,0050 y el de 150x es 0,0033, y el
+    codigo usaba el de 150x para todos. Como la liquidacion es
+    `1/L - mmr`, un MMR pequeno la aleja, y el clamp dejaba pasar un SL
+    mas apretado del debido. Ese clamp es lo unico que impide que el
+    stop llegue a la liquidacion, asi que el error iba en la peor
+    direccion posible.
+
+    Con `symbol` se consulta la tabla real del exchange
+    (`risk/mmr_table.py`, endpoint publico, sin clave ni posicion).
+    Si `maintenance_margin_rate` viene dado, manda el explicito: quien
+    lo pasa sabe algo que la tabla no dice.
 
     No lanza por problemas de *alcanzabilidad*: esos van en `plan.errors` /
     `plan.warnings`, para que el wizard pueda mostrarlos. Si lanza
@@ -335,14 +351,27 @@ def build_roe_plan(
     m = (mode or "").strip().lower()
     default_tp, default_sl = roe_targets_for_mode(m)
     lev = normalize_leverage(leverage)
+    # MMR: el explicito si lo hay; si no, el REAL del simbolo a este
+    # apalancamiento. Es el dato que decide cuanto puede acercarse el SL
+    # a la liquidacion, asi que se deja de donde viene anotado en el
+    # plan y no como un numeroAnonimo.
+    mmr_origen = "explicito"
+    if maintenance_margin_rate is not None:
+        mmr = float(maintenance_margin_rate)
+    elif symbol:
+        from quant_math.risk.mmr_table import mmr_for_symbol
+        mmr, mmr_origen = mmr_for_symbol(symbol, lev)
+    else:
+        mmr = DEFAULT_MAINTENANCE_MARGIN_RATE
+        mmr_origen = "por_defecto_sin_simbolo"
     tp_roe = default_tp if take_profit_roe is None else abs(float(take_profit_roe))
     sl_roe_req = default_sl if stop_loss_roe is None else abs(float(stop_loss_roe))
     if tp_roe <= 0 or sl_roe_req <= 0:
         raise LeverageRiskError(
             f"objetivos ROE deben ser > 0 (tp={tp_roe}, sl={sl_roe_req})")
 
-    liq = liquidation_price_distance(lev, maintenance_margin_rate)
-    ceiling = max_sl_price_distance(lev, maintenance_margin_rate,
+    liq = liquidation_price_distance(lev, mmr)
+    ceiling = max_sl_price_distance(lev, mmr,
                                     sl_liquidation_safety_frac)
     max_dist = (MAX_TP_PRICE_DISTANCE.get((market or "crypto").lower(),
                                           DEFAULT_MAX_TP_PRICE_DISTANCE)
@@ -365,6 +394,9 @@ def build_roe_plan(
             f"({ceiling * lev:.2%} ROE). Motivo: apalancamiento alto para un SL "
             f"de {sl_roe_req:.0%} ROE — el SL habria llegado demasiado cerca de "
             f"la liquidacion. El ratio 2:1 es objetivo, la seguridad es ley.")
+        warnings.append(
+            f"MMR usado: {mmr:.4%} (origen: {mmr_origen}). El clamp depende "
+            f"de este numero, asi que se declara de donde sale.")
         sl_dist = ceiling
 
     # --- Aviso por apalancamiento demasiado bajo (caso L=1) --------------
@@ -379,7 +411,7 @@ def build_roe_plan(
         errors.append(
             f"SL ({sl_dist:.3%} de precio) >= TP ({tp_dist:.3%} de precio): "
             f"no hay configuracion coherente de TP/SL.")
-    if not sl_is_reachable(sl_roe_req, lev, maintenance_margin_rate,
+    if not sl_is_reachable(sl_roe_req, lev, mmr,
                             sl_liquidation_safety_frac) and not sl_clamped:
         errors.append(
             f"SL {sl_roe_req:.2%} ROE inalcanzable antes de la liquidacion "
@@ -394,7 +426,7 @@ def build_roe_plan(
         sl_price_distance=sl_dist,
         sl_roe_requested=sl_roe_req,
         liquidation_price_distance=liq,
-        maintenance_margin_rate=float(maintenance_margin_rate),
+        maintenance_margin_rate=float(mmr),
         sl_liquidation_safety_frac=float(sl_liquidation_safety_frac),
         max_tp_price_distance=max_dist,
         sl_clamped=sl_clamped,

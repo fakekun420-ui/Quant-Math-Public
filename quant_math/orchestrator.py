@@ -333,12 +333,41 @@ class OrchestratorConfig:
                          or self.stop_loss_roe is not None)
         self.roe_plan = None
         if self.roe_mode:
+            # MMR REAL y POR SIMBOLO. MEDIDO el 2026-10-01: el MMR de
+            # Bybit depende del apalancamiento (100x = 0,0050 y 150x =
+            # 0,0033) y del activo (ENA a 50x = 0,0100). El codigo usaba
+            # 0,0033 para todo, que es el de 150x, y con eso el clamp del
+            # SL se abria a 100x con un SL que el MMR real prohibe.
+            #
+            # Aqui se pide el MMR del simbolo MAS CONSERVADOR de los que
+            # se van a operar, no el del primero: con cuatro simbolos y
+            # un solo plan, el plan tiene que valer para el peor, o el
+            # clamp protegeria a uno y dejaria descubierto a otro. Es el
+            # criterio que hace que "operar con lo que hay" signifique
+            # "operar con lo que el mas arriesgado permite".
+            from quant_math.risk.mmr_table import mmr_for_symbol
+            _mmrs = []
+            for _sym in (self.symbols or []):
+                try:
+                    _mmrs.append(mmr_for_symbol(_sym, self.effective_leverage))
+                except Exception:
+                    continue
+            if _mmrs:
+                _peor = max(_mmrs, key=lambda t: t[0])
+                _mmr_arg = _peor[0]
+                logger.info(
+                    "[roe] MMR mas conservador de %d simbolo(s) a %sx: "
+                    "%.4f%% (%s) -> se usa ese para el clamp del SL",
+                    len(_mmrs), self.effective_leverage, _peor[0] * 100,
+                    _peor[1])
+            else:
+                _mmr_arg = None
             plan = build_roe_plan(
                 mode=self.mode,
                 leverage=self.effective_leverage,
                 take_profit_roe=self.take_profit_roe,
                 stop_loss_roe=self.stop_loss_roe,
-                maintenance_margin_rate=self.maintenance_margin_rate,
+                maintenance_margin_rate=_mmr_arg,
                 sl_liquidation_safety_frac=self.sl_liquidation_safety_frac,
                 market=self.market,
                 max_tp_price_distance=self.max_tp_price_distance,

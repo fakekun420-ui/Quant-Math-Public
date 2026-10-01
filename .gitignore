@@ -31,3 +31,6 @@ graphify-out/
 node_modules/
 webui/frontend/dist/
 webui/frontend/.vite/
+
+# Cache descargada del exchange: se regenera sola en <1 min.
+quant_math/risk/.bybit_risk_limit.json

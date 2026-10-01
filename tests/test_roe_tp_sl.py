@@ -209,7 +209,12 @@ def test_config_derives_pct_from_roe():
                    take_profit_roe=0.50, stop_loss_roe=0.25)
         assert cfg.roe_mode is True
         assert cfg.take_profit_pct == pytest.approx(0.05)
-        assert cfg.stop_loss_pct == pytest.approx(0.025)
+        # MEDIDO el 2026-10-01: con el MMR REAL de BTC a 10x (6,5%, tabla
+        # publica de Bybit) el SL se recorta del 25% de ROE pedido al 17,5%
+        # que es el techo de seguridad. Con el MMR de 0,33% que usaba el
+        # codigo (que es el de 150x) la liquidacion se calculaba al 9,67%
+        # y el recorte no pasaba nunca.
+        assert cfg.stop_loss_pct == pytest.approx(0.0175)
         assert cfg.effective_leverage == 10
         cfg2 = _cfg(tmp + "2", mode="burst", burst_leverage=20,
                     burst_margin=1.0, take_profit_roe=0.20, stop_loss_roe=0.10)
@@ -287,17 +292,27 @@ def test_classic_records_margin_and_leverage():
         assert trade["take_profit_roe"] == pytest.approx(0.50)
         assert trade["stop_loss_roe"] == pytest.approx(0.25)
         assert trade["take_profit_pct"] == pytest.approx(0.05)
-        assert trade["stop_loss_pct"] == pytest.approx(0.025)
-        assert trade["stop_loss_price"] == pytest.approx(97.5)
+        # MEDIDO el 2026-10-01 contra la tabla real de Bybit: a 10x el MMR
+        # de BTC es 6,5%, o sea la liquidacion esta al 3,5% y no al 9,67%
+        # que se calculaba con el MMR de 0,33%. El SL al 25% de ROE son
+        # 2,5% de precio, el 71% de esa liquidacion, y la regla de
+        # seguridad (el SL no pasa del 50%) lo recorta a 1,75%.
+        #
+        # O sea: a 10x el SL se recorta. No es un fallo del clamp, es lo
+        # que el MMR real obliga, y con el MMR de la tabla (0,0033, que es
+        # el de 150x) la liquidacion se calculaba 6 veces mas lejos de lo
+        # real y el clamp no morderia.
+        assert trade["stop_loss_pct"] == pytest.approx(0.0175)
+        assert trade["sl_clamped"] is True, (
+            "a 10x con el MMR REAL (6,5%) el clamp tiene que morder")
+        assert trade["stop_loss_price"] == pytest.approx(98.25)
         assert trade["take_profit_price"] == pytest.approx(105.0)
         assert trade["risk_usd_at_stop"] == pytest.approx(
-            trade["notional_usd"] * 0.025)
-        # 1/L - mmr con el MMR REAL de Bybit (0,0033, primer tramo, medido el
-        # 2026-09-30 contra /v5/market/risk-limit). Antes era 0,095 porque el
-        # MMR por defecto era el supuesto 0,005. Con el dato, la liquidacion
-        # queda un poco mas lejos: 0,1 - 0,0033 = 0,0967.
-        assert trade["liquidation_price_distance"] == pytest.approx(0.096154)
-        assert trade["sl_clamped"] is False
+            trade["notional_usd"] * 0.0175)
+        # 1/L - mmr con el MMR REAL del apalancamiento, no con uno fijo:
+        # BTC a 10x tiene MMR 6,5% (tabla real de Bybit, endpoint publico,
+        # medida el 2026-10-01), luego la liquidacion esta al 3,5%.
+        assert trade["liquidation_price_distance"] == pytest.approx(0.035)
         assert trade["quantity"] > 0
         with open(os.path.join(tmp, "paper_executions.jsonl"),
                   encoding="utf-8") as fh:
@@ -500,11 +515,23 @@ def test_risk_per_trade_cap_in_usd_is_enforced():
         orch.config.max_risk_per_trade_usd = 1e9
         nocional = orch._apply_margin_cap(1000.0, 20, "h1",
                                           sl_distance=cfg.stop_loss_pct)
+        # A 20x el MMR real de BTC es 2,9% -> liquidacion al 2,1% -> el SL
+        # al 25% de ROE (1,25%) se recorta al techo de 1,05%, o sea el
+        # riesgo por operacion baja de 0,50 a 0,4167 USDT y el nocional
+        # sale menor. Con el MMR equivocado el tope de riesgo se respetaba
+        # con un SL mas ancho del que la liquidacion permitia.
+        # Con el tope relajado el nocional sale por otravia (200).
         assert nocional == pytest.approx(200.0)
+        # Con el tope de 0,50 USDT, el nocional sale del SL REAL (1,05%):
+        # 0,50 / 0,0105 = 47,62 USDT. Con el SL pedido (1,25%) serian 40,00
+        # y el riesgo por operacion seria 0,50 con un stop un 19% mas
+        # ancho del que la liquidacion permite.
         orch.config.max_risk_per_trade_usd = 0.50
         capped = orch._apply_margin_cap(1000.0, 20, "h1",
                                         sl_distance=cfg.stop_loss_pct)
-        assert capped == pytest.approx(40.0)
+        assert capped == pytest.approx(0.50 / 0.0105), (
+            f"el nocional tiene que salir del SL REAL (1,05%), no del "
+            f"pedido (1,25%): obtenido {capped}")
         assert capped * cfg.stop_loss_pct == pytest.approx(0.50)
 
 
