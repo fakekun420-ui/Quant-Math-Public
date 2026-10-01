@@ -110,10 +110,46 @@ class JSONLKnowledgeBase:
     # Record-level API (DecisionEngine semantics)
     # ------------------------------------------------------------------
 
+    def _save_reject(self, record: Dict[str, Any], reason: str):
+        """Guarda en cuarentena una hipotesis descartada si no tiene trades."""
+        hid = record.get("hypothesis_id")
+        rejects_path = os.path.join(os.path.dirname(self.jsonl_path) or ".", "hypotheses_rejects.jsonl")
+        try:
+            os.makedirs(os.path.dirname(rejects_path) or ".", exist_ok=True)
+            if os.path.exists(rejects_path):
+                with open(rejects_path, "r", encoding="utf-8") as rf:
+                    for line in rf:
+                        if not line.strip():
+                            continue
+                        try:
+                            item = json.loads(line)
+                            if item.get("hypothesis_id") == hid:
+                                return
+                        except json.JSONDecodeError:
+                            continue
+            quarantine_record = dict(record)
+            quarantine_record["quarantine_reason"] = reason
+            quarantine_record["quarantined_at"] = time.time()
+            with open(rejects_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(quarantine_record, ensure_ascii=False, default=str) + "\n")
+            logger.info("[quarantine] hipotesis %s enviada a %s (motivo: %s)", hid, rejects_path, reason)
+        except OSError as exc:
+            logger.warning("[quarantine] fallo al registrar en cuarentena %s: %s", hid, exc)
+
     def register_hypothesis(self, record: Dict[str, Any]) -> str:
-        """Atomic upsert: load → merge → save."""
+        """Atomic upsert: load → merge → save.
+        
+        Requisito de calidad: Las hipotesis sin trades (n_trades <= 0 o None)
+        no se escriben en la KB operativa; se archivan en cuarentena.
+        """
         hid = record.get("hypothesis_id") or f"hyp_{int(time.time() * 1000)}"
         record = dict(record, hypothesis_id=hid)
+        
+        n_trades = record.get("n_trades")
+        if n_trades is None or int(n_trades) <= 0:
+            self._save_reject(record, reason="no_trades")
+            return hid
+
         record["updated_at"] = time.time()
         if "created_at" not in record:
             record["created_at"] = time.time()

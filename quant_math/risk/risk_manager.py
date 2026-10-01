@@ -72,6 +72,7 @@ class RiskManager:
         win_rate: Optional[float] = None,
         avg_win: Optional[float] = None,
         avg_loss: Optional[float] = None,
+        n_closures: Optional[int] = None,
         **risk_params
     ) -> Dict[str, Any]:
         """
@@ -84,18 +85,29 @@ class RiskManager:
             win_rate: Win rate for Kelly calculation (optional)
             avg_win: Average win for Kelly calculation (optional)
             avg_loss: Average loss for Kelly calculation (optional)
+            n_closures: Numero de cierres de los que salen esas medidas.
+                Si viene y es menor que MIN_CLOSURES_FOR_KELLY, NO se
+                calcula Kelly: una muestra chica lo mueve una sola
+                operacion y el tamano resultante seria una invencion.
             **risk_params: Additional risk parameters
 
         Returns:
-            Dictionary with risk check results
+            Dictionary with risk check results. El registro incluye
+            `kelly_status` + `kelly_note` (por que hay o no hay Kelly) y
+            `kelly_advisory` (aviso si el pedido supera el Kelly medido).
         """
         # Apply position limits
         max_position = account_value * self.max_position_size_pct
 
-        # Calculate Kelly optimal position size
-        kelly_size = self._calculate_kelly_position_size(
-            hypothesis_id, account_value, win_rate, avg_win, avg_loss
+        # Kelly con la formula canonica del modulo y datos medidos, o con
+        # un estado EXPLICITO de por que no lo hay. Antes esto devolia un
+        # 0.0 silencioso con los defaults (wr=0.5, aw=1, al=1), y ese cero
+        # desactivaba el aviso de Kelly sin que nadie supiera que no habia
+        # medida que lo sustentara.
+        kelly = self._kelly_assessment(
+            account_value, win_rate, avg_win, avg_loss, n_closures
         )
+        kelly_size = kelly["size"]  # float | None: nunca un 0 sin explicar
 
         # Check constraints
         approved = True
@@ -108,10 +120,21 @@ class RiskManager:
             reasons.append(f"Position size {requested_size:.2f} exceeds max {max_position:.2f}")
             actual_size = min(requested_size, max_position)
 
-        # Check Kelly criterion
-        if kelly_size > 0 and requested_size > kelly_size:
-            warning = f"Position size exceeds Kelly optimal (Kelly={kelly_size:.2f})"
-            reasons.append(warning)
+        # Aviso de Kelly: supera el tamano recomendado, pero NO cambia la
+        # aprobacion.
+        #
+        # Por que NO va en `reasons`: el orquestador lee `reasons` para
+        # decidir entre RECORTAR el margen (si todo razon es "exceeds max")
+        # y RECHAZAR la entrada (si hay cualquier otra razon). Con Kelly
+        # medido su fraccion va SIEMPRE por debajo de max_position_pct
+        # (0.03-0.17 medido frente a 0.20), asi que meter aqui el aviso
+        # haria que cada tope de margen se convirtiera en un rechazo
+        # cerrado: el dimensionamiento en vivo cambiaria sin medirse.
+        # El aviso se expone aparte, en `kelly_advisory`.
+        kelly_advisory = None
+        if kelly_size is not None and kelly_size > 0 and requested_size > kelly_size:
+            kelly_advisory = (f"Position size exceeds Kelly optimal "
+                              f"(Kelly={kelly_size:.2f})")
 
         # Check overall loss limit
         current_loss = self.overall_pnl.get(hypothesis_id, 0.0)
@@ -131,6 +154,10 @@ class RiskManager:
             "reasons": reasons,
             "max_position": max_position,
             "kelly_size": kelly_size,
+            "kelly_status": kelly["status"],
+            "kelly_note": kelly["note"],
+            "kelly_fraction_applied": kelly["fraction"],
+            "kelly_advisory": kelly_advisory,
             "account_value": account_value
         }
 
@@ -145,46 +172,134 @@ class RiskManager:
 
         return check_record
 
-    def _calculate_kelly_position_size(
+    # Muestra minima de cierres para dar por bueno un win_rate medido del
+    # libro de operaciones. No es un capricho: con N=20 un solo cierre
+    # mueve el win_rate 5 puntos porcentuales (1/N), y por debajo de eso
+    # el Kelly se dispara o se anula por el ruido de UNA operacion — el
+    # tamano resultante dejaria de ser una medida para ser una invencion.
+    MIN_CLOSURES_FOR_KELLY = 20
+
+    def _kelly_assessment(
         self,
-        hypothesis_id: str,
         account_value: float,
         win_rate: Optional[float] = None,
         avg_win: Optional[float] = None,
-        avg_loss: Optional[float] = None
-    ) -> float:
+        avg_loss: Optional[float] = None,
+        n_closures: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """
-        Calculate Kelly optimal position size.
+        Kelly con la formula CANONICA del modulo (`KellyCriterion.calculate`).
 
-        Args:
-            hypothesis_id: Hypothesis ID
-            account_value: Total account value
-            win_rate: Win rate (0-1)
-            avg_win: Average win amount
-            avg_loss: Average loss amount
+        Antes estaba reimplementada a mano en este mismo fichero
+        (`f = wr - (1 - wr) / win_loss_ratio`, con defaults wr=0.5,
+        aw=1.0, al=1.0 que daban exactamente 0.0), y ese 0.0 silencioso
+        desactivaba el aviso de Kelly pareciendo una medida. Por eso el
+        resultado ahora es un estado explicito:
 
-        Returns:
-            Kelly optimal position size
+          - "sin_datos"       -> size=None: faltan win_rate/avg_win/avg_loss
+          - "insuficiente"    -> size=None: hay muestra pero < piso
+          - "datos_invalidos" -> size=None: valores fuera de dominio
+          - "no_viable"       -> size=0.0: el Kelly MEDIDO no compensa
+          - "ok"              -> size=float: Kelly medido
+
+        Un 0.0 numerico solo puede salir de "no_viable", que lo explica.
+        Los cuatro estados no-"ok" declaran ademas en que metodo se cae
+        el dimensionado (el tope declarado max_position_size_pct).
+
+        Si `n_closures` no se informa, las estadisticas se dan por buenas:
+        quien las pasa se responsabiliza de su muestra. El orquestador
+        pasa siempre la n medido del ledger.
         """
-        # Use provided values or defaults
-        wr = win_rate if win_rate is not None else 0.5
-        aw = avg_win if avg_win is not None else 1.0
-        al = avg_loss if avg_loss is not None else 1.0
+        faltantes = [nombre for nombre, valor in
+                     (("win_rate", win_rate), ("avg_win", avg_win),
+                      ("avg_loss", avg_loss)) if valor is None]
+        if faltantes:
+            return {
+                "status": "sin_datos",
+                "size": None,
+                "fraction": None,
+                "note": (
+                    f"sin {', '.join(faltantes)} medidos: NO se dimensiona "
+                    "con Kelly. Manda el metodo declarado "
+                    f"max_position_size_pct={self.max_position_size_pct:.0%} "
+                    f"(= {account_value * self.max_position_size_pct:.2f} "
+                    f"USD de margen sobre cuenta {account_value:.2f})"
+                ),
+            }
 
-        # Kelly formula: f = p - q/b where p=win_rate, q=1-p, b=win_loss_ratio
-        if aw <= 0:
-            return 0.0
+        if n_closures is not None and n_closures < self.MIN_CLOSURES_FOR_KELLY:
+            return {
+                "status": "insuficiente",
+                "size": None,
+                "fraction": None,
+                "note": (
+                    f"solo {n_closures} cierres medidos (piso "
+                    f"{self.MIN_CLOSURES_FOR_KELLY}): una sola operacion "
+                    "mueve el win_rate mas de "
+                    f"{100.0 / max(1, int(n_closures)):.1f} pp. NO se "
+                    "dimensiona con Kelly. Manda el metodo declarado "
+                    f"max_position_size_pct={self.max_position_size_pct:.0%} "
+                    f"(= {account_value * self.max_position_size_pct:.2f} "
+                    "USD de margen)"
+                ),
+            }
 
-        win_loss_ratio = aw / al if al != 0 else 0.0
-        if win_loss_ratio <= 0:
-            return 0.0
+        try:
+            wr, aw, al = float(win_rate), float(avg_win), float(avg_loss)
+            valido = (0.0 <= wr <= 1.0) and (aw > 0) and (al > 0)
+        except (TypeError, ValueError):
+            valido = False
+        if not valido:
+            return {
+                "status": "datos_invalidos",
+                "size": None,
+                "fraction": None,
+                "note": (
+                    f"datos de Kelly fuera de dominio (win_rate={win_rate}, "
+                    f"avg_win={avg_win}, avg_loss={avg_loss}): se ignora el "
+                    "Kelly. Manda el metodo declarado "
+                    f"max_position_size_pct={self.max_position_size_pct:.0%}"
+                ),
+            }
 
-        f = wr - (1 - wr) / win_loss_ratio
+        # Unico punto de calculo, y es la formula canonica del modulo.
+        # Antes estaba duplicada a mano aqui: dos fuentes de verdad para
+        # la misma formula es como se acaba midiendo una cosa creyendo
+        # que se mide la otra.
+        full = float(self.kelly.calculate(wr, aw, al))
 
-        # Apply fraction
-        kelly_fraction = max(0.0, min(1.0, f * self.kelly_fraction))
+        if full <= 0.0:
+            # El cero MEDIDO: con estos datos no compensa apostar. Se
+            # declara para que sea distinguible de "no hay datos".
+            n_txt = (f"{n_closures} cierres" if n_closures is not None
+                     else "cierres no informados")
+            return {
+                "status": "no_viable",
+                "size": 0.0,
+                "fraction": 0.0,
+                "note": (
+                    f"Kelly medido = {full:.4f} <= 0 con win_rate={wr:.4f}, "
+                    f"avg_win={aw:.6f}, avg_loss={al:.6f} ({n_txt}): no "
+                    "compensa apostar (0.0 es una medida, no la ausencia de "
+                    "ella). Manda el metodo declarado "
+                    f"max_position_size_pct={self.max_position_size_pct:.0%}"
+                ),
+            }
 
-        return account_value * kelly_fraction
+        fraction = max(0.0, min(1.0, full * self.kelly_fraction))
+        n_txt = (f"{n_closures} cierres" if n_closures is not None
+                 else "cierres no informados")
+        return {
+            "status": "ok",
+            "size": account_value * fraction,
+            "fraction": fraction,
+            "note": (
+                f"Kelly medido = {full:.4f} x fraccion "
+                f"{self.kelly_fraction} = {fraction:.4f} -> "
+                f"{account_value * fraction:.2f} USD de margen "
+                f"(win_rate={wr:.4f}, {n_txt})"
+            ),
+        }
 
     def check_drawdown_limit(
         self,

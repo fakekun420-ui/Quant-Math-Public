@@ -1596,12 +1596,101 @@ class Orchestrator:
     def _ledger_pnl(self) -> Tuple[float, float]:
         """(realized_today, realized_total) scanned from the permanent ledger.
 
-        realized_today counts closures with exit_time >= UTC midnight.
-        Cheap full scan; ledger is small (hundreds of lines).
+        MEDIDO el 2026-10-01: esto sumaba TODA fila con `motivo_cierre` a
+        ciegas, y el ledger puede tener varias filas para la MISMA
+        operacion fisica. Consecuencia medida sobre los datos reales:
+
+            suma bruta (31 cierres)              = +5,839084
+            una fila por operacion (9 unicas)    = +0,199543
+            lo que enseNABA el panel              = +4,731700
+
+        Veintinueve veces mas de lo real. Y de ahi salen el equity del
+        panel, el drawdown, el tope diario de perdidas y el Kelly: todos
+        leen de aqui, luego todos se estaban tomando una decision de
+        riesgo sobre un numero que se multiplicaba por si mismo.
+
+        LA CAUSA esta en `decision_engine.close_position`: cuando el
+        cierre en vivo falla, restaura la posicion como abierta Y aun
+        asi escribe la fila de cierre. El siguiente ciclo la ve otra vez,
+        vuelve a fallar, y anade otra fila. Con el precio moviendose de
+        un lado a otro, la misma operacion queda con cuatro PnL
+        CONTRARIOS.
+
+        Aqui se deduplica por la identidad de la operacion fisica:
+        `(key, entry_time, quantity)`. `key` solo no basta, porque
+        Bybit fusiona por simbolo y varias operaciones seguidas de la
+        misma hipotesis comparten clave. Del grupo se queda la ULTIMA
+        fila, que es la definitiva: si el exchange cerro despues, fue la
+        reconciliacion la que la escribio.
+
+        Sanear el fichero sin arreglar el que lo escribe deja que la
+        basura vuelva. Se arregla el origen tambien, en
+        `decision_engine.close_position`.
         """
         day_start = utc_day_start_ts()
         today = total = 0.0
         path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                grupos: Dict[Tuple, Dict] = {}
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if "motivo_cierre" not in rec:
+                        continue
+                    ident = (rec.get("key"),
+                             rec.get("entry_time"),
+                             rec.get("quantity"))
+                    # La ultima gana: es la definitiva (TP/SL del exchange
+                    # la escribe la reconciliacion, despues).
+                    grupos[ident] = rec
+                for rec in grupos.values():
+                    try:
+                        pnl = float(rec.get("pnl", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    total += pnl
+                    try:
+                        if float(rec.get("exit_time") or 0) >= day_start:
+                            today += pnl
+                    except (TypeError, ValueError):
+                        pass
+        except OSError:
+            pass
+        return today, total
+
+    def _ledger_kelly_stats(self) -> Tuple[Optional[float], Optional[float],
+                                           Optional[float], int]:
+        """(win_rate, avg_win, avg_loss, n_cierres) MEDIDOS del ledger.
+
+        Kelly con datos inventados es peor que Kelly sin datos, asi que
+        aqui solo salen numeros observados. Dos decisiones, ambas por
+        medicion del 2026-10-01:
+
+        1. Las filas repetidas de UNA misma posicion (mismo `key`,
+           `entry_time` y `quantity`) son re-marcas del mismo cierre, no
+           operaciones nuevas: el ledger de state_classic-xrp tenia 25
+           filas de cierre para 9 posiciones, y alguna de esas filas
+           repite la misma entrada con pnl de signo OPUESTO. Sin
+           deduplicar, el win_rate salia 0.80; deduplicado (ultima
+           marca), 0.56. Se queda la fila con `exit_time` mas reciente.
+        2. El piso de muestra NO se decide aqui: lo aplica
+           `RiskManager.MIN_CLOSURES_FOR_KELLY` (la politica de riesgo
+           vive en el modulo de riesgo). Aqui se devuelve la n real para
+           que el registro pueda decir "solo 9 cierres".
+
+        Nunca lanza: un libro ausente o a medias es "sin datos", no una
+        excepcion — esta llamada cae dentro del `try` de
+        `_apply_margin_cap`, que ante cualquier error RECHAZA la entrada.
+        """
+        path = os.path.join(self.config.state_dir, "paper_executions.jsonl")
+        # grupo de posicion -> (exit_time, pnl) de la ultima marca
+        ultima: Dict[Tuple, Tuple[float, float]] = {}
         try:
             with open(path, encoding="utf-8") as fh:
                 for line in fh:
@@ -1616,17 +1705,35 @@ class Orchestrator:
                         continue
                     try:
                         pnl = float(rec.get("pnl", 0.0) or 0.0)
+                        exit_time = float(rec.get("exit_time") or 0.0)
                     except (TypeError, ValueError):
                         continue
-                    total += pnl
-                    try:
-                        if float(rec.get("exit_time") or 0) >= day_start:
-                            today += pnl
-                    except (TypeError, ValueError):
-                        pass
+                    grupo = (rec.get("key"), rec.get("entry_time"),
+                             rec.get("quantity"))
+                    previo = ultima.get(grupo)
+                    if previo is None or exit_time >= previo[0]:
+                        ultima[grupo] = (exit_time, pnl)
         except OSError:
             pass
-        return today, total
+
+        if not ultima:
+            return None, None, None, 0
+
+        pnls = [p for (_exit, p) in ultima.values()]
+        # Un pnl de 0.00 exacto no informa de ventaja ni de desventaja:
+        # no entra en ninguno de los dos lados (contarlo como perdida,
+        # como hace el contador de rachas, hundiria avg_loss y dispararia
+        # el Kelly).
+        wins = [p for p in pnls if p > 0]
+        losses = [-p for p in pnls if p < 0]
+        n = len(wins) + len(losses)
+        if n == 0:
+            return None, None, None, 0
+
+        win_rate = len(wins) / n
+        avg_win = sum(wins) / len(wins) if wins else None
+        avg_loss = sum(losses) / len(losses) if losses else None
+        return win_rate, avg_win, avg_loss, n
 
     def _apply_margin_cap(self, notional: float, lev_used: int,
                           hypothesis_id: str,
@@ -1648,6 +1755,12 @@ class Orchestrator:
         liquidacion) activa el tope de riesgo en USD. Se calcula con
         `PositionSizer.calculate`, que es la formula canonica de sizing y hasta
         ahora tenia 0 referencias desde la ruta de dinero.
+
+        El Kelly se calcula con datos MEDIDOS del ledger
+        (`_ledger_kelly_stats`), no con defaults: sin muestra suficiente
+        `RiskManager` lo declara (`kelly_status`) en vez de devolver 0.0.
+        Es el unico cambio de esta funcion respecto al tope de margen:
+        la aprobacion y los topes no dependen del Kelly.
         """
         notional = float(notional)
         lev_used = max(1, int(lev_used))
@@ -1670,8 +1783,25 @@ class Orchestrator:
                            + float(self._last_realized_total))
             if not (account > 0):
                 raise ValueError(f"cuenta no positiva ({account}); no se opera")
+            # Kelly con datos MEDIDOS del ledger. Si no hay muestra
+            # suficiente, RiskManager lo dice en kelly_status/note con
+            # los numeros en la mano, en vez de devolver un 0.0 que
+            # pareciera una medida (bug latente del 2026-10-01).
+            wr, aw, al, n_closures = self._ledger_kelly_stats()
             chk = self._risk_manager.check_position_size(
-                hypothesis_id, margin_used, account)
+                hypothesis_id, margin_used, account,
+                win_rate=wr, avg_win=aw, avg_loss=al,
+                n_closures=n_closures)
+            kstatus = chk.get("kelly_status")
+            if kstatus != "ok":
+                # Solo logging: no toca el tamano. Es la diferencia entre
+                # "el Kelly decidio esto" y "no hubo Kelly que decidir".
+                logger.info("[risk] Kelly %s para %s: %s",
+                            kstatus, hypothesis_id, chk.get("kelly_note"))
+                print(f"  [risk] kelly={kstatus}")
+            elif chk.get("kelly_advisory"):
+                logger.info("[risk] %s (%s)",
+                            chk["kelly_advisory"], hypothesis_id)
             reasons = list(chk.get("reasons") or [])
             if not chk.get("approved"):
                 # `max_position` es la MISMA regla que aplica RiskManager.
@@ -1679,8 +1809,10 @@ class Orchestrator:
                 only_size = bool(reasons) and all(
                     "exceeds max" in r for r in reasons)
                 if not (only_size and max_margin > 0):
-                    # Rechazo por otra causa (limite global de perdida,
-                    # Kelly...). Fallar CERRADO: no se opera.
+                    # Rechazo por otra causa que el tope de max_position
+                    # (hoy: el limite global de perdida). Fallar CERRADO:
+                    # no se opera. El Kelly NO puede estar aqui: es
+                    # aviso (`kelly_advisory`) y no aprueba ni rechaza.
                     logger.error(
                         "[risk] entrada RECHAZADA para %s: %s",
                         hypothesis_id, "; ".join(reasons) or "sin detalle")

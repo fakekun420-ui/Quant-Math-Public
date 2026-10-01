@@ -230,6 +230,7 @@ class DecisionEngine:
 
         self.graduated = False
         self.graduation_path = os.path.join(state_dir, "graduation.json")
+        self.rejects_path = os.path.join(os.path.dirname(kb_path) or ".", "hypotheses_rejects.jsonl")
         _ag = (os.environ.get("QUANTMATH_AUTO_GRADUATE", "1") != "0"
                if auto_graduate is None else bool(auto_graduate))
         _gw = (graduate_window if graduate_window is not None
@@ -357,10 +358,49 @@ class DecisionEngine:
             fh.write(json.dumps(record, ensure_ascii=False,
                                 default=str) + "\n")
 
+    def _save_reject(self, record: Dict[str, Any], reason: str):
+        """Guarda una hipotesis descartada en el fichero de cuarentena.
+        
+        Se verifica si ya existe para asegurar idempotencia (no duplicar).
+        """
+        hid = record.get("hypothesis_id")
+        try:
+            os.makedirs(os.path.dirname(self.rejects_path) or ".", exist_ok=True)
+            if os.path.exists(self.rejects_path):
+                with open(self.rejects_path, "r", encoding="utf-8") as rf:
+                    for line in rf:
+                        if not line.strip():
+                            continue
+                        try:
+                            item = json.loads(line)
+                            if item.get("hypothesis_id") == hid:
+                                return  # ya registrado previamente en cuarentena
+                        except json.JSONDecodeError:
+                            continue
+            quarantine_record = dict(record)
+            quarantine_record["quarantine_reason"] = reason
+            quarantine_record["quarantined_at"] = time.time()
+            with open(self.rejects_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(quarantine_record, ensure_ascii=False, default=str) + "\n")
+            logger.info("[quarantine] hipotesis %s enviada a %s (motivo: %s)", hid, self.rejects_path, reason)
+        except OSError as exc:
+            logger.warning("[quarantine] fallo al escribir en cuarentena para %s: %s", hid, exc)
+
     def register_hypothesis(self, record: Dict[str, Any]) -> str:
-        """Register/overwrite a hypothesis record in the JSONL KB."""
+        """Register/overwrite a hypothesis record in the JSONL KB.
+        
+        Requisito de calidad: Hipotesis sin trades (n_trades == 0 o None)
+        NO se escriben en la KB operativa; se envian a cuarentena.
+        """
         hid = record.get("hypothesis_id") or f"hyp_{int(time.time() * 1000)}"
         record = dict(record, hypothesis_id=hid)
+        
+        # Filtro estricto de n_trades: debe tener trades positivos para entrar a la KB operativa
+        n_trades = record.get("n_trades")
+        if n_trades is None or int(n_trades) <= 0:
+            self._save_reject(record, reason="no_trades")
+            return hid
+
         self._save_hypothesis(record)
         return hid
 
@@ -604,6 +644,64 @@ class DecisionEngine:
                 live_result = {"ok": False, "error": str(exc)}
                 self.open_positions[key] = pos
                 self._persist_positions()
+        if live_result is not None and not live_result.get("ok") \
+                and key not in self.open_positions:
+            # MEDIDO el 2026-10-01: la restauracion de la posicion estaba
+            # SOLO dentro del `except`. O sea: si `closer` devolvia
+            # `ok=False` sin lanzar excepcion —que es lo normal: ccxt
+            # devuelve un dict de error, no revienta— la posicion se
+            # quedaba FUERA de `open_positions` sin haberse cerrado. Y
+            # como el ledger decia que si, el resultado era una posicion
+            # huerfana: viva en el exchange y desconocida aqui.
+            #
+            # El `except` de arriba cubre el caso de excepcion; este
+            # cubre el caso de error devuelto. Los dos dejan la posicion
+            # como estaba, que es lo unico honesto: si el exchange no la
+            # cerro, sigue abierta.
+            self.open_positions[key] = pos
+            self._persist_positions()
+        # MEDIDO el 2026-10-01: se escribia la fila de cierre INCLUSO
+        # cuando el cierre en vivo habia fallado. Ahi esta el bug de raiz
+        # de que el ledger llegara a tener CUATRO filas —con PnL de signo
+        # CONTRARIO— para una sola operacion fisica:
+        #
+        #   1. el exchange rechaza el cierre
+        #   2. el codigo restaura la posicion como ABIERTA (arriba)
+        #   3. y aun asi escribia el cierre en el ledger
+        #   4. el siguiente ciclo ve la posicion otra vez, el precio toca
+        #      el otro extremo, falla otra vez, y escribe OTRA fila
+        #
+        # Medido sobre los datos reales: 31 filas de cierre para 9
+        # operaciones fisicas, y el PnL que enseNaba el panel era +4,73
+        # cuando el ledger real era +0,20. Veintinueve veces mas.
+        #
+        # Un cierre que no ocurrio no se escribe como si hubiera ocurrido.
+        # Se registra como INTENTO fallido, que es lo que es, y asi el
+        # ledger sigue siendo la verdad del exchange.
+        if live_result is not None and not live_result.get("ok"):
+            intento = {
+                "type": "close_attempt_failed",
+                "key": key,
+                "symbol": symbol,
+                "hypothesis_id": hypothesis_id,
+                "side": side,
+                "quantity": qty,
+                "entry_price": entry_price,
+                "exit_price": exit_px,
+                "motivo": motivo,
+                "error": str((live_result or {}).get("error") or ""),
+                "exit_time": time.time(),
+            }
+            try:
+                self._append_state(self.ledger_path, intento)
+            except Exception:
+                pass
+            logger.error("[cierre] NO se registro como cierre: el exchange "
+                         "no lo ejecuto (%s). La posicion sigue abierta y la "
+                         "reconciliacion la recogera.",
+                         (live_result or {}).get("error") or "motivo")
+            bus.publish("close_attempt_failed", intento)
+            return None
         pnl = qty * (exit_px - entry_price) * direction
         pnl_pct = (pnl / notional * 100.0) if notional else 0.0
         closure = {
