@@ -267,3 +267,75 @@ def test_run_backtest_usa_la_temporalidad_que_le_pasan():
     assert r_15m.sharpe_ratio > r_1d.sharpe_ratio, (
         "con la misma media y sigma, mas periodos al año da un Sharpe mayor")
 
+
+
+# ---------------------------------------------------------------------------
+# 6. La curva tiene DOS regimenes, y por eso dos reglas
+# ---------------------------------------------------------------------------
+
+def test_una_posicion_abierta_no_hace_caer_el_equity_a_cero():
+    """El bug: el margen entraba y salia de la curva como si fuera perdida.
+
+    MEDIDO el 2026-10-01 en BTC 15m: la curva alternaba 10.164, 93.697,
+    9.713, 94.249 y `max_drawdown` reportaba 90,3%. Con una posicion viva y
+    un equity que solo sube, eso no puede pasar.
+
+    Este test falla contra el codigo anterior, con un drawdown de ~90%.
+    """
+    from backtesting import Backtester
+    precios = 100.0 * np.cumprod(1 + np.full(100, 0.002))
+    r = Backtester(initial_capital=10_000.0).run_backtest(
+        lambda _d: [{'symbol': 'X', 'side': 'buy' if i == 0 else 'hold',
+                     'quantity': 1 if i == 0 else 0} for i in range(100)],
+        {'X': precios}, timeframe="15m")
+    valores = np.array([p[1] for p in r.equity_curve], dtype=float)
+    # Punto INTERMEDIO (todos menos el final, que es liquidado): el equity no
+    # puede caer por debajo del inicial en una cuenta que solo gana.
+    assert valores[:-1].min() > 10_000.0 * 0.99, (
+        f"un equity que solo sube tiene un minimo de {valores[:-1].min():.2f}: "
+        "el margen esta entrando en la curva como perdida")
+    assert r.max_drawdown < 5.0, (
+        f"drawdown de {r.max_drawdown:.1f}% en una cuenta que solo sube")
+
+
+def test_el_punto_final_sigue_siendo_liquidado():
+    """El otro lado del diseno: el FINAL reconcilia con los PnL cerrados.
+
+    Es el contrato de `tests/test_backtester_equity.py`. Si alguien aplica
+    mark-to-market tambien aqui, el capital final deja de cuadrar y se
+    rompe ese test. Este test lo dice en el sitio donde importa.
+    """
+    from backtesting import Backtester
+    precios = 100.0 * np.cumprod(1 + np.concatenate([
+        np.full(50, 0.004), np.full(50, -0.004)]))
+    r = Backtester(initial_capital=10_000.0).run_backtest(
+        lambda _d: ([{'symbol': 'X', 'side': 'buy', 'quantity': 1}]
+                    + [{'symbol': 'X', 'side': 'hold', 'quantity': 0}] * 98
+                    + [{'symbol': 'X', 'side': 'sell', 'quantity': 1}]),
+        {'X': precios}, timeframe="15m")
+    esperado = 10_000.0 + sum(t.pnl for t in r.trades)
+    assert r.final_capital == pytest.approx(esperado, abs=0.5), (
+        f"el capital final ({r.final_capital:.2f}) tiene que ser el inicial "
+        f"mas el PnL cerrado ({esperado:.2f})")
+
+
+def test_mark_to_market_para_riesgo_y_liquidado_para_resultado():
+    """Las DOS mitades del contrato, juntas.
+
+    Es el test que habria faltado en el intento anterior: no basta con que
+    el drawdown sea sano (mark-to-market) ni con que el capital final cuadre
+    (liquidado). Hay que cumplir los dos a la vez.
+    """
+    from backtesting import Backtester
+    # Cuenta que gana y cierra: drawdown pequeno Y final exacto.
+    precios = 100.0 * np.cumprod(1 + np.concatenate([
+        np.full(60, 0.003), np.full(40, -0.001)]))
+    r = Backtester(initial_capital=10_000.0).run_backtest(
+        lambda _d: ([{'symbol': 'X', 'side': 'buy', 'quantity': 1}]
+                    + [{'symbol': 'X', 'side': 'hold', 'quantity': 0}] * 98
+                    + [{'symbol': 'X', 'side': 'sell', 'quantity': 1}]),
+        {'X': precios}, timeframe="15m")
+    esperado = 10_000.0 + sum(t.pnl for t in r.trades)
+    assert r.max_drawdown < 10.0, f"drawdown de {r.max_drawdown:.1f}%"
+    assert r.final_capital == pytest.approx(esperado, abs=0.5), (
+        f"final {r.final_capital:.2f} contra {esperado:.2f}")

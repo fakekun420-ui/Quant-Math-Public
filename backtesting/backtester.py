@@ -806,15 +806,83 @@ class Backtester:
         # Track positions for proper trade pairing
         open_positions = {}  # symbol -> {side, quantity, entry_price, entry_commission, entry_index}
 
+        def equity_mtm(_precios):
+            """EQUITY mark-to-market, para los PUNTOS INTERMEDIOS de la curva.
+
+            MEDIDO el 2026-10-01: la curva guardaba `current_capital`, que es
+            EFECTIVO. Al abrir una posicion se le descuenta el margen y no se
+            acredita el valor de la posicion, luego con 100.000 de cuenta y
+            86.000 de nocional la curva caia a ~10.000 y al cerrar volvia a
+            ~94.000. En BTC 15m real alternaba
+
+                10.164 -> 93.697 -> 9.713 -> 94.249
+
+            que no es ninguna serie de equity. De ahi dos numeros falsos:
+
+              * max_drawdown 90,3%: era el margen en custodia, no una perdida
+              * sharpe_ratio +22,84 con la estrategia PERDIENDO 5.493 USDT:
+                cada apertura y cierre metia y sacaba el nocional entero de
+                la cuenta, y eso parecia rentabilidad
+
+            Y el segundo no es cosmético: `sharpe_ratio` pesa 0,3 en el
+            `scientific_score` (orchestrator.py:1497), y ese score decide si
+            la hipotesis queda `backtested` o degrada a `failed`.
+
+            LA FORMULA, y por que esa:
+
+                equity = efectivo + margen + (precio - entrada) * cantidad
+
+            El margen va porque el motor lo descuenta al abrir y lo devuelve
+            al cerrar (`current_capital += margin + pnl`): esta EN CUSTODIA,
+            no perdido. Sumar solo `(precio - entrada)` daria el doble de
+            error, porque a la entrada esa diferencia es cero mientras la
+            posicion vale su nocional entero.
+
+            POR QUE SOLO LOS PUNTOS INTERMEDIOS. El ultimo punto de la curva
+            NO usa esta funcion: sigue siendo el efectivo liquidado, y por
+            eso `final_capital` reconcilia al centimo con la suma de los PnL
+            cerrados, que es el contrato de
+            `tests/test_backtester_equity.py`. Mark-to-market y liquidado son
+            dos magnitudes distintas y cada metrica necesita la suya:
+
+              * expectancy, ranking y gate  ->  liquidado (sin cambios aqui)
+              * sharpe y max_drawdown       ->  mark-to-market (esta funcion)
+
+            Un intento anterior aplico mark-to-market a TODO, incluido el
+            punto final, y rompio tres tests: el capital final dejaba de
+            cuadrar con los trades cerrados. Ese error es el queobliga a separar
+            las dos curvas.
+            """
+            total = current_capital
+            for _sym, pos in open_positions.items():
+                _px = _precios.get(_sym)
+                if _px is None:
+                    _serie = data.get(_sym)
+                    _px = (float(_serie[min(i, len(_serie) - 1)])
+                           if _serie is not None else pos['entry_price'])
+                _dir = 1 if pos['side'] == 'long' else -1
+                total += (float(pos.get('margin', 0.0))
+                          + _dir * (float(_px) - pos['entry_price'])
+                          * pos['quantity'])
+            return total
+
 
         for i, order in enumerate(orders):
             symbol = order['symbol']
             side = order['side']
             quantity = order['quantity']
 
+            # Precio de mercado de CADA posicion viva, no solo de la que
+            # toca en esta orden: el equity depende de todas a la vez.
+            _precios = {}
+            for _s in open_positions:
+                _serie = data.get(_s)
+                if _serie is not None and i < len(_serie):
+                    _precios[_s] = float(_serie[i])
+
 
             if symbol not in data:
-                equity_curve.append(current_capital)
+                equity_curve.append(equity_mtm(_precios))
                 continue
 
             price = data[symbol][i]
@@ -834,7 +902,7 @@ class Backtester:
                         'entry_commission': entry_fee,
                         'entry_index': i
                     }
-                equity_curve.append(current_capital)
+                equity_curve.append(equity_mtm(_precios))
 
             elif side == 'sell' and quantity > 0:
                 fill = self._adverse_fill(price, 'sell')
@@ -883,10 +951,10 @@ class Backtester:
                     )
                     trades.append(trade)
                     del open_positions[symbol]
-                equity_curve.append(current_capital)
+                equity_curve.append(equity_mtm(_precios))
 
             else:  # hold
-                equity_curve.append(current_capital)
+                equity_curve.append(equity_mtm(_precios))
 
         # Cerrar las posiciones vivas al precio de la ultima vela.
         # El PnL se suma al capital, no es solo registro: si el Trade
@@ -937,44 +1005,28 @@ class Backtester:
             )
             trades.append(trade)
 
-        # MEDIDO el 2026-10-01: este punto extra y la curva del bucle siguen
-        # guardando `current_capital`, que es EFECTIVO, no EQUITY. Es un bug
-        # abierto y NO se ha arreglado. Se deja escrito aqui porque el sitio
-        # donde tocar es justo este.
+        # Punto final: LIQUIDADO, no mark-to-market. Y la diferencia es
+        # deliberada.
         #
-        # Lo que pasa, medido en BTC 15m real: al abrir una posicion se le
-        # descuenta el margen del efectivo y no se acredita el valor de la
-        # posicion, luego con 100.000 de cuenta y 86.000 de nocional la curva
-        # cae a ~10.000 y al cerrar vuelve a ~94.000. La serie alterna
-        # 10.164, 93.697, 9.713, 94.249, y `max_drawdown` reporta 90,3%:
-        # eso no es una perdida, es el margen en custodia.
+        # Los puntos intermedios usan `equity_mtm` (efectivo + margen en
+        # custodia + no realizado) porque de ellos salen `sharpe_ratio` y
+        # `max_drawdown`, que son magnitudes de RIESGO y necesitan el valor de
+        # mercado en cada instante.
         #
-        # POR QUE NO ESTA ARREGLADO, y es lo que hace falta saber. La
-        # formule correcta seria
+        # Este ultimo punto NO usa mark-to-market, y es a proposito: de el
+        # salen `final_capital` y `total_return_pct`, y esos tienen que
+        # reconciliar con la suma de los PnL CERRADOS, que es el contrato de
+        # `tests/test_backtester_equity.py`:
         #
-        #     equity = efectivo + margen + (precio - entrada) * cantidad
+        #     final_capital - initial == sum(pnl de los trades), al centimo
         #
-        # porque el margen se descuenta al abrir y se devuelve al cerrar
-        # (`current_capital += margin + pnl`), luego esta en custodia y no
-        # perdido. Con ella, el drawdown de BTC baja de 90,3% a 7,2% y el
-        # Sharpe de +22,84 a -8,77, que es el signo que corresponde a una
-        # estrategia que pierde. O sea: la cuenta cuadra, la curva ya no se
-        # desploma y el Sharpe deja de mentir.
+        # Con mark-to-market aqui, una posicion que sigue abierta meteria su
+        # no realizado y el capital final dejaria de cuadrar. Un intento
+        # anterior aplico mark-to-market a toda la curva, incluido este punto,
+        # y rompio tres tests por eso.
         #
-        # Y aun asi se ha REVERTIDO, porque rompe el contrato que el propio
-        # proyecto ya tiene escrito en `tests/test_backtester_equity.py`:
-        #
-        #   1) `final_capital - initial == suma(pnl de los trades)`, al
-        #      centimo. Con equity incluyendo el no realizado, una posicion
-        #      abierta hace que el capital final no reconcile con los trades
-        #      CERRADOS, y el test lo detecta.
-        #   2) la curva tiene `n + 2` puntos: uno por vela mas este.
-        #
-        # Los dos contratos son correctos y no se rompen: el punto final tiene
-        # que ser un valor LIQUIDADO, no un equity con una posicion viva. El
-        # arreglo tiene que hacer las dos cosas a la vez, y eso no cabe en una
-        # linea. Medir antes de escribir, que es lo que falto en el intento
-        # anterior.
+        # O sea: mark-to-market para riesgo, liquidado para resultado. Son dos
+        # preguntas distintas y por eso son dos curvas distintas.
         if open_positions:
             equity_curve.append(current_capital)
 
