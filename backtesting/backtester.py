@@ -87,11 +87,66 @@ class ModeloCoste:
         return base
 
 
-#: Por defecto, taker con el spread MEDIDO, no ejecucion perfecta. Antes el
-#: motor venia con deslizamiento 0 y funding 0, y todo backtest del proyecto
-#: salia favorecido sin que constara por que.
-COSTE_TAKER = ModeloCoste()
-COSTE_MAKER = ModeloCoste(comision_por_lado=0.000134)
+#: Suelo de COMISION, sin deslizamiento y sin funding. NO es un modelo de
+#: coste: es lo que se paga en el mejor caso y sirve para comparar estrategias
+#: entre si, porque todas pagan lo mismo.
+#:
+#: MEDIDO el 2026-10-02: `COSTE_TAKER` llevaba dentro el deslizamiento de
+#: 0,2135% que despues se Retiro por RETRACTADO, y el adaptador lo usaba como
+#: valor por defecto. O sea que la ruta de produccion estaba cobrando 4,4 veces
+#: de mas, y solo se vio al mirar que valor llevaba la constante. Por eso
+#: `COSTE_COMISION` no lleva ningun otro componente: un suelo no puede
+#: convertirse sin querer en un coste.
+#:
+#: La comision es la de Bybit VIP 0 publicada (taker 0,0550% por lado) y la
+#: MEDIDA contra el exchange (0,0634% por lado, que es un 15% mas alta). Se usa
+#: la medida, por ser la propia, y la diferencia queda anotada aqui.
+COSTE_TAKER = ModeloCoste(comision_por_lado=0.000634,
+                           deslizamiento_por_llenado=0.0,
+                           funding_por_8h=0.0)
+COSTE_MAKER = ModeloCoste(comision_por_lado=0.000134,
+                           deslizamiento_por_llenado=0.0,
+                           funding_por_8h=0.0)
+#: Alias con el nombre que dice lo que es. `COSTE_TAKER` se conserva por
+#: compatibilidad, y este es el nombre que hay que usar.
+COSTE_COMISION = COSTE_TAKER
+
+#: COTES DE FUNDING. MEDIDO el 2026-10-02 sobre 3.800 periodos por simbolo:
+#: los cuatro liquidan CADA 8 HORAS, sin excepcion, y siempre a las 00:00,
+#: 08:00 y 16:00 UTC. Se comprueba porque algunos pares de otros exchanges
+#: liquidan cada hora, y con un modelo de 8 horas un par de 1 hora estaria 8
+#: veces mal.
+FUNDING_HORAS = (0, 8, 16)
+FUNDING_CADA_HORAS = 8
+
+
+def periodo_para(ts) -> Optional[str]:
+    """Que regimen de funding le toca a una fecha, o None si no hay ninguno.
+
+    Se deduce de la FECHA DE LA VELA, no se pide. Antes habia que pasar el
+    periodo a mano y quien no lo pasara se llevaba un coste de un regimen
+    equivocado sin enterarse, que es la forma de error mas comun: un valor por
+    defecto que nadie mira.
+    """
+    import datetime as _dt
+    if ts is None:
+        return None
+    if hasattr(ts, "year"):
+        anio = ts.year
+    elif hasattr(ts, "timestamp"):
+        anio = _dt.datetime.utcfromtimestamp(ts / 1000.0).year
+    else:
+        return None
+    for nombre, (desde, hasta) in CORTE_PERIODO_FUNDING.items():
+        if desde <= anio <= hasta:
+            return nombre
+    return None
+
+
+#: De que año a que año cubre cada regimen medido. El corte de 2025-01-01 es
+#: el mismo que usan los backtests, para que la comparacion sea entre las dos
+#: cosas medidas con el mismo corte.
+CORTE_PERIODO_FUNDING = {"2023-2024": (2023, 2024), "2025-2026": (2025, 2026)}
 
 #: SPREAD POR SIMBOLO, MEDIDO. 25 muestras del libro de ordenes separadas
 #: ~0,35 s el 2026-10-02, y se guarda la mediana y no un punto suelto.

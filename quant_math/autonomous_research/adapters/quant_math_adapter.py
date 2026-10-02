@@ -29,6 +29,8 @@ except ImportError:
 try:
     from backtesting import (Backtester, BacktestResult, PerformanceMetrics,
                             Trade, COSTE_TAKER)
+    from backtesting.backtester import (coste_para, periodo_para,
+                                   slippage_para, simbolo_medido)
     from order_management import OrderManager
     import numpy as np
     import pandas as pd
@@ -744,29 +746,61 @@ class QuantMathAdapter:
             _tf = data.get("timeframe")
 
         # COSTE. MEDIDO el 2026-10-02: aqui se construia el motor sin pasarle
-        # ni comision ni deslizamiento ni funding, o sea que TODOS los
-        # backtests del proyecto asumian ejecucion perfecta y mantenimiento
-        # gratis. No era un error de cuentas, era un supuesto favorable que no
-        # estaba escrito en ninguna parte, que es la forma de error de la que
-        # no te enteras.
+        # ni comision ni deslizamiento ni funding, y luego se le puso un
+        # `COSTE_TAKER` que llevaba dentro el deslizamiento de 0,2135%, que
+        # despues se RETRACTO por estar 65 veces medido. O sea que la ruta de
+        # produccion estuvo cobrando 4,4 veces de mas sin que nada lo dijera.
         #
-        # El coste entra por parametro (`coste`), no por constante dentro, para
-        # que comparar dos estrategias con taker y con maker sea una llamada y
-        # no una reescritura. Y `ModeloCoste` lleva la FECHA de la medicion:
-        # las comisiones de un exchange cambian y un numero sin fecha no es un
-        # dato.
+        # AHORA SE CALCULA, NO SE HEREDA:
+        #   * el deslizamiento, con la tabla medida POR SIMBOLO. Un numero
+        #     unico obliga a que BTC pague el spread de SOL, y BTC se
+        #     ejecutaba entero en el primer nivel a 25.000 USDT.
+        #   * el funding, con la tasa del REGIMEN que le toca a los datos, deducido
+        #     de la fecha de la primera vela. El funding de 2025-2026 es entre
+        #     3 y 10 veces mas barato que el de 2023-2024, asi que un valor por
+        #     defecto cobraba un regimen equivocado a la mitad de los
+        #     backtests.
+        #   * el slippage de PROFUNDIDAD, con la fila medida del nocional.
+        #
+        # Todo eso vive en `coste_para` y `slippage_para`, y hay tests que
+        # comprueban que este metodo los usa. Si se vuelve a poner una
+        # constante aqui, los tests no lo ven, asi que el chequeo tambien es de
+        # que la funcion llama a las medidas.
         if coste is None:
-            coste = COSTE_TAKER
+            _simbolo = data.get("symbol") if isinstance(data, dict) else None
+            _periodo = None
+            _marco = data.get("data") if isinstance(data, dict) else None
+            if _marco is not None and hasattr(_marco, "columns"):
+                try:
+                    _periodo = periodo_para(_marco["ts"].iloc[0])
+                except Exception:
+                    _periodo = None
+            if _simbolo:
+                try:
+                    coste = coste_para(_simbolo, periodo=_periodo)
+                except ValueError:
+                    coste = COSTE_TAKER
+            else:
+                coste = COSTE_TAKER
+        # El deslizamiento de profundidad se AÑADE al de primer nivel, porque son
+        # dos cosas distintas: uno es cuanto te comes del spread al cruzar, y
+        # el otro cuanto pierdes al tener que bajar niveles por notional.
+        _desl = getattr(coste, "deslizamiento_por_llenado", 0.0)
+        _prof = 0.0
+        if isinstance(data, dict) and data.get("symbol"):
+            _notional = notional_objetivo
+            if _notional > 0 and simbolo_medido(data["symbol"], _notional):
+                _prof = slippage_para(data["symbol"], _notional) / 2.0
         # `timeframe` va TAMBIEN al constructor, no solo a `run_backtest`.
         # MEDIDO: solo se le pasaba a `run_backtest`, asi que el motor
-        # conversaba barras a horas con su valor por defecto de 1h. Con
-        # funding en cero eso no se notaba; en cuanto se activa, el funding de
-        # una estrategia de 15m se calculaba como si fuese de 1h, o sea 4
-        # veces mas barato de lo que es.
+        # convertia barras a horas con su valor por defecto de 1h. Con funding
+        # en cero no se notaba; en cuanto se activa, el funding de una
+        # estrategia de 15m se calculaba como si fuese de 1h, o sea 4 veces
+        # mas barato de lo que es.
         bt = Backtester(
             initial_capital=initial_capital, leverage=lev,
             commission_rate=coste.comision_por_lado,
-            slippage_pct=coste.deslizamiento_por_llenado,
+            slippage_pct=coste.deslizamiento_por_llenado + _prof,
             funding_rate_8h=coste.funding_por_8h,
             timeframe=_tf or "1h")
         result = bt.run_backtest(strategy_func, price_dict,

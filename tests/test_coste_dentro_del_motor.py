@@ -66,10 +66,15 @@ def test_el_funding_escala_con_las_horas_y_el_resto_no():
     de funding. Si el funding no escalara, mantener una posicion abierta seria
     gratis, que es justo el supuesto que se acaba de quitar.
     """
-    from backtesting import COSTE_TAKER
-    corto = COSTE_TAKER.coste_por_operacion_pct(horas_mantenido=8.0)
-    largo = COSTE_TAKER.coste_por_operacion_pct(horas_mantenido=80.0)
-    fijo = COSTE_TAKER.ida_y_vuelta_pct()
+    import backtesting.backtester as BT
+    # Se usa `coste_para` y no `COSTE_TAKER`: el suelo de comision lleva el
+    # funding a cero A PROPOSITO, porque un suelo no puede convertirse sin
+    # querer en un coste. La serie que se quiere comprobar es la que lleva
+    # funding, que es la que construye la ruta de produccion.
+    m = BT.coste_para("BTC/USDT:USDT", periodo="2025-2026")
+    corto = m.coste_por_operacion_pct(horas_mantenido=8.0)
+    largo = m.coste_por_operacion_pct(horas_mantenido=80.0)
+    fijo = m.ida_y_vuelta_pct()
     # 10x mas tiempo = 10x mas cobros de funding, y el resto igual.
     assert abs(largo - fijo - (corto - fijo) * 10.0) < 1e-6
     assert largo > corto > fijo
@@ -333,3 +338,73 @@ def test_una_fila_no_medida_no_se_confunde_con_cero():
         "sabe, no devolver 0")
     assert BT.slippage_para("DOGE/USDT:USDT", 25000.0) == 0.0
     assert BT.simbolo_medido("SOL/USDT:USDT", 25000.0), "SOL si esta medido"
+
+
+# ---------------------------------------------------------------------------
+# El bug de PRODUCCION: el adaptador cobrando 4,4 veces de mas.
+# MEDIDO y arreglado el 2026-10-02.
+# ---------------------------------------------------------------------------
+
+def test_el_suelo_de_comision_no_lleva_deslizamiento_ni_funding():
+    """`COSTE_TAKER` es un SUELO, no un modelo de coste.
+
+    MEDIDO el 2026-10-02: `COSTE_TAKER` llevaba dentro el deslizamiento de
+    0,2135%, que despues se retracto por estar 65 veces medido, y el adaptador
+    lo usaba como valor por defecto. La ruta de produccion cobraba 4,4 veces
+    de mas. Que ahora no lleve nada mas es lo que evita que se repita.
+    """
+    from backtesting import COSTE_TAKER
+    assert COSTE_TAKER.deslizamiento_por_llenado == 0.0, (
+        "el suelo de comision lleva deslizamiento. Si lo lleva, es un modelo "
+        "de coste disfrazado de suelo y vuelve a poder quedar retractado")
+    assert COSTE_TAKER.funding_por_8h == 0.0, (
+        "el suelo de comision lleva funding, y el funding depende del regimen")
+    assert abs(COSTE_TAKER.ida_y_vuelta_pct() - 0.1268) < 1e-6
+
+
+def test_el_adaptador_calcula_el_coste_y_no_hereda_una_constante():
+    """El adaptador tiene que LLAMAR a las medidas, no usar un valor fijo.
+
+    Se lee el fuente porque lo que hay que comprobar es que llame a
+    `coste_para`: un motor que sabe cobrar y un adaptador que no le pide el
+    coste dan el mismo numero en un test de resultado, y el numero es
+    justamente el que falla.
+    """
+    import inspect
+    from quant_math.autonomous_research.adapters.quant_math_adapter import (
+        QuantMathAdapter)
+    src = inspect.getsource(QuantMathAdapter.run_backtest)
+    for llamada in ("coste_para(", "periodo_para(", "slippage_para("):
+        assert llamada in src, (
+            f"el adaptador no llama a {llamada}: entonces vuelve a usar un "
+            f"coste fijo, y eso fue exactamente el bug")
+
+
+def test_el_periodo_se_deduce_de_la_fecha_y_no_se_pide():
+    """Que el regimen se deduzca de la vela es lo que evita el cobro equivocado.
+
+    Si hubiera que pasar el periodo a mano, el valor por defecto seria el de un
+    regimen cualquiera y la mitad de los backtest cobrarian el funding del
+    tramo equivocado, que es entre 3 y 10 veces mas barato.
+    """
+    import backtesting.backtester as BT
+    import pandas as pd
+    assert BT.periodo_para(pd.Timestamp("2023-06-15", tz="UTC")) == "2023-2024"
+    assert BT.periodo_para(pd.Timestamp("2025-06-15", tz="UTC")) == "2025-2026"
+    assert BT.periodo_para(None) is None
+    assert BT.periodo_para(pd.Timestamp("2022-06-15", tz="UTC")) is None, (
+        "una fecha fuera de todo lo medido tiene que decir que no se sabe, no "
+        "devolver un regimen por defecto")
+
+
+def test_el_funding_liquida_cada_8_horas_y_no_cada_hora():
+    """Los cuatro pares de este proyecto cobran cada 8 horas a las 0, 8 y 16.
+
+    MEDIDO sobre las 3.800 descargas por simbolo: el intervalo es de 8 horas
+    exactas en las 3.800, sin una sola excepcion. Se comprueba porque algunos
+    pares de otros exchanges cobran cada hora, y con un modelo fijo de 8 horas
+    un par de 1 hora estaria 8 veces mal.
+    """
+    import backtesting.backtester as BT
+    assert BT.FUNDING_CADA_HORAS == 8
+    assert BT.FUNDING_HORAS == (0, 8, 16)

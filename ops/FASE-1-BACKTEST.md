@@ -639,3 +639,86 @@ a que la serie suba a cada paso sería exigir algo que el dato no tiene.
 - Los tres tests que fijaban la tabla anterior se han reescrito: afirmaban
   cosas que eran consecuencias del error, y un test que afirma una consecuencia
   del bug no mide el bug.
+
+---
+
+# FASE 1h: el bug que quedaba vivo en producción
+
+## Lo que se encontró al mirar qué valor llevaba la constante
+
+`COSTE_TAKER` seguía teniendo dentro el deslizamiento de **0,2135%** — el
+número que se retractó en la fase anterior. Y el adaptador lo usaba como
+**valor por defecto**.
+
+**La ruta de producción estaba cobrando 4,4 veces de más** (0,5538% contra
+0,1268% de comisión sola), y no lo decía en ninguna parte. Un backtest hecho
+por el sistema llevaba tres fases usando un número que ya se sabía falso.
+
+Esto no se detectó mirando los resultados: se detectó mirando **qué valor
+llevaba la constante** que se acababa de corregir en otro sitio. Dos medidas
+del mismo número, en sitios distintos, y el arreglo se aplicó a uno solo.
+
+## Qué hace ahora la ruta de producción
+
+Nada de constantes heredadas. El coste se **calcula**:
+
+| Componente | De dónde sale |
+|---|---|
+| Comisión por lado | 0,000634 taker / 0,000134 maker |
+| Deslizamiento de primer nivel | tabla medida **por símbolo** |
+| Deslizamiento de profundidad | fila medida del **nocional**, si la hay |
+| Funding | tasa del **régimen que le toca a los datos**, deducido de la fecha de la primera vela |
+
+Que el régimen se **deduzca** de la vela y no se pase a mano es lo importante:
+el funding de 2025-2026 es entre 3 y 10 veces más barato que el de 2023-2024,
+así que un valor por defecto cobraba el régimen equivocado a la mitad de los
+backtests.
+
+## Efecto medido sobre ATI
+
+Retorno de la cuenta por operación, ya con el coste dentro del motor:
+
+| Símbolo | Tramo | **antes** | **ahora** | cambio |
+|---|---|---:|---:|---:|
+| BTC | 2023-2024 | +0,3695 | +0,4259 | +0,0565 |
+| BTC | 2025-2026 | −0,0100 | +0,0819 | +0,0920 |
+| ETH | 2025-2026 | −0,0097 | +0,0828 | +0,0926 |
+| XRP | 2025-2026 | −0,1743 | −0,0860 | +0,0882 |
+| SOL | 2023-2024 | +1,8216 | +1,7965 | **−0,0251** |
+| SOL | 2025-2026 | +0,0054 | +0,1043 | +0,0989 |
+
+```
+Tramos con expectativa negativa antes:  3 de 8
+Tramos con expectativa negativa ahora: 1 de 8
+```
+
+**El arreglo no es uniformemente favorable, y conviene decirlo.** SOL
+2023-2024 empeora: se le saves 0,42% de deslizamiento inflado pero se le cobra
+el funding que antes era cero, y en el régimen de 2023-2024 ese funding es de
+0,01079% cada 8 horas sobre 8,5 días: 0,277%. Cobrar lo que no existía pesa
+más que ahorrar lo que sobraba.
+
+## Respaldo en investigación, 2026-10-02
+
+Tres cosas confirmadas contra fuentes externas y **medidas** en los datos:
+
+1. **Comisiones Bybit VIP 0 publicadas: taker 0,0550%, maker 0,0200%** por
+   lado. Las medidas aquí dan 0,0634% y 0,0134%: la de taker es un 15% más
+   alta que la publicada y la de maker más baja. Se usa la medida por ser la
+   propia, y la diferencia queda anotada en el código en vez de escondida.
+2. **El signo del funding es exactamente el que se asumía**: positivo →
+   los largos pagan; negativo → los cortos pagan. Confirmado en la literatura,
+   y coincide con la serie descargada, que sale negativa entre el 10% y el 38%
+   de los periodos según símbolo y régimen.
+3. **El funding se cobra en instantes discretos** (00:00, 08:00, 16:00 UTC), no
+   prorrateado. Y **la periodicidad puede ser de 1 hora en otros pares**.
+   Medido aquí: los cuatro liquidan a las 8 horas exactas, 3.800 de 3.800, sin
+   una excepción. Queda comprobado y anotado como invariante.
+
+## Verificación
+
+- **512 tests verdes**.
+- **Control de mutación triple, los tres cazados**:
+  - volver a la constante retractada en el adaptador → 1 fallo
+  - devolver el deslizamiento retractado al suelo → 1 fallo
+  - period，`o por defecto en vez de deducido → 1 fallo
