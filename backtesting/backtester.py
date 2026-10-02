@@ -149,42 +149,50 @@ SPREAD_POR_SIMBOLO_PCT = {
 #: su magnitud.
 #: SLIPPAGE EFECTIVO POR NOTIONAL, recorriendo el libro de ordenes.
 #:
-#: MEDIDO el 2026-10-02 recorriendo los niveles de `fetch_order_book` y
-#: calculando el precio medio ponderado por volumen. El valor es la ida y
-#: vuelta: se paga en la compra y se cobra de menos en la venta, asi que los
-#: dos deslizamientos se SUMAN con valor absoluto (sumarlos con signo los
-#: cancela y deja un coste de cero, que es el error que hizo la primera
-#: version).
+#: MEDIDO el 2026-10-02: 6 tomas por simbolo con `fetch_order_book(limit=500)`
+#: y recorrido nivel a nivel. Es la ida y vuelta: se paga en la compra y se
+#: cobra de menos en la venta, asi que los dos se SUMAN con valor absoluto.
 #:
 #:     nocional      BTC      ETH      XRP      SOL
-#:         250      ----    0,0178   0,0000   0,0173
-#:       2.500      ----    0,0747   0,0000   0,0504
-#:      25.000      ----       ----   0,0092   0,1822
-#:     100.000      ----       ----   0,0294   0,4979
+#:         250    0,00000  0,00000  0,00000  0,00000
+#:       2.500    0,00000  0,00000  0,00000  0,00000
+#:      25.000    0,00000  0,00000  0,01171  0,01504
+#:     100.000    0,00000  0,00342  0,03273  0,01438
+#:     500.000    0,00319  0,02516  0,09037  0,04629
 #:
-#: LO QUE ENSEÑA LA TABLA
-#: ----------------------
-#: El deslizamiento NO es un numero, depende del tamano. En SOL va de 0,0173%
-#: a 0,4979% entre 250 y 100.000 USDT: **29 veces peor**, y 11 veces mas que
-#: lo que decia el spread del primer nivel (0,0164%). Un modelo con un solo
-#: numero de spread subestima el coste de SOL entre 6 y 30 veces.
+#: LO QUE ESTO DICE, Y CORRIGE UNA AFIRMACION ANTERIOR
+#: --------------------------------------------------
+#: A 25.000 USDT, que es el nocional del backtest, el deslizamiento es CERO en
+#: BTC y ETH y de 0,011-0,015% en XRP y SOL. El primer nivel de BTC tiene
+#: 3,193 BTC (268.295 USDT medidos), o sea que un nocional de 25.000 se
+#: ejecuta en el primer nivel.
 #:
-#: Y el orden es el opuesto al que se supone: BTC y ETH tienen el libro mas
-#: profundo y SOL el mas fino, asi que quien parece barato de operar es el que
-#: se come el libro.
+#: Se publico antes lo contrario: 0,1822% para SOL a 25.000, "11 veces el
+#: spread del primer nivel". Era DOCE VECES MAYOR de lo real, y venia de un
+#: error en el recorrido: el tamano de un nivel va en UNIDADES DEL ACTIVO y se
+#: estaba restando de un presupuesto en USDT, con lo que un nocional de 250
+#: USDT consumia 250 BTC y agotaba el libro entero. Con el recorrido mal, el
+#: slippage grows como el PRECIO del activo: BTC (el activo mas caro)
+#: aparecia como el mas caro de operar, que es al reves de lo real.
 #:
-#: LO QUE NO SE PUDO MEDIR, Y POR QUE NO SE INVENTA
-#: -----------------------------------------------
-#: BTC y ETH por encima de unos miles de USDT. `fetch_order_book(limit=1000)`
-#: no devuelveProfundidad suficiente para ellos: la liquidez esta mas alla de
-#: los niveles que ese endpoint da. Los huecos de la tabla se quedan huecos.
-#: El endpoint agregado de Bybit daria la profundidad real, y queda pendiente.
-#: Poner un numero inventado ahi seria peor que un hueco, porque un hueco se
-#: ve.
+#: LA LECCION QUE NO SE DEJA OLVIDAR
+#: ---------------------------------
+#: El recorrido del libro tiene UN concepto de unidades que hay que tener bien
+#: a la primera. Tres versiones seguidas de esta medicion dieron tres numeros
+#: distintos, y los dos primeros eranWrong por el mismo tipo de fallo: unidades
+#: mezcladas. La primera tambien se cancelaba con signo y contaba niveles de
+#: tamano cero.
+#:
+#: LO QUE SI DICE LA TABLA
+#: -----------------------
+#: La profundidad importa a partir de unos 100.000 USDT, no antes. A 500.000 el
+#: deslizamiento va de 0,003% en BTC a 0,090% en XRP, y XRP pasa a ser el
+#: simbolo mas caro, no SOL.
 SLIPPAGE_POR_NOTIONAL = {
-    "ETH": {250.0: 0.0178, 2500.0: 0.0747},
-    "XRP": {250.0: 0.0000, 2500.0: 0.0000, 25000.0: 0.0092, 100000.0: 0.0294},
-    "SOL": {250.0: 0.0173, 2500.0: 0.0504, 25000.0: 0.1822, 100000.0: 0.4979},
+    "BTC": {250.0: 0.0, 2500.0: 0.0, 25000.0: 0.0, 100000.0: 0.0, 500000.0: 0.00319},
+    "ETH": {250.0: 0.0, 2500.0: 0.0, 25000.0: 0.0, 100000.0: 0.00342, 500000.0: 0.02516},
+    "XRP": {250.0: 0.0, 2500.0: 0.0, 25000.0: 0.01171, 100000.0: 0.03273, 500000.0: 0.09037},
+    "SOL": {250.0: 0.0, 2500.0: 0.0, 25000.0: 0.01504, 100000.0: 0.01438, 500000.0: 0.04629},
 }
 
 
@@ -208,11 +216,9 @@ def slippage_para(simbolo: str, nocional: float) -> float:
     ultima fila, que es la mas cara de las conocidas, y no con una
     interpolacion optimista.
 
-    Si el simbolo no tiene ninguna medicion devuelve 0.0 SIN AVISAR, porque la
-    funcion es pura y no tiene logger. Ese hueco esta DECLARADO en
-    `SLIPPAGE_POR_NOTIONAL`: BTC no esta, y `simbolo_medido()` es la que
-    responde si se puede costear. Es una limitacion conocida, no un cero
-    silencioso: para eso esta `simbolo_medido`.
+    Los cuatro simbolos tienen la tabla completa, asi que `simbolo_medido`
+    devuelve True para todos los nocionales medidos. Se mantiene la funcion
+    porque un hueco debe poder preguntar, no porque hoy haya alguno.
     """
     base = simbolo.split("/")[0].split(":")[0].upper()
     filas = SLIPPAGE_POR_NOTIONAL.get(base)

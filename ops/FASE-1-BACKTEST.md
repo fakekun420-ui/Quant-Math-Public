@@ -564,3 +564,78 @@ de 8 sobreviven a quitar las 3 mejores operaciones.**
   - usar el spread del primer nivel como si fuera el real → 4 fallos
   - devolver la fila más barata para un nocional sin medir → 3 fallos
   - `simbolo_medido()` diciendo "medido" cuando no lo está → 1 fallo
+
+---
+
+# FASE 1g: RETRACTACIÓN — la tabla de deslizamiento estaba mal
+
+**Lo publicado en `f85507b9` era falso. Se retira aquí.**
+
+## Qué se publicó
+
+> «En SOL va de 0,0173% a 0,4979%: **29 veces peor**, y a 25.000 USDT es
+> 0,1822%, que es **11 veces** lo que decía el spread del primer nivel.»
+
+## Qué es verdad
+
+| Nocional | BTC | ETH | XRP | SOL |
+|---:|---:|---:|---:|---:|
+| 250 | 0,00000% | 0,00000% | 0,00000% | 0,00000% |
+| 2.500 | 0,00000% | 0,00000% | 0,00000% | 0,00000% |
+| 25.000 | 0,00000% | 0,00000% | 0,01171% | 0,01504% |
+| 100.000 | 0,00000% | 0,00342% | 0,03273% | 0,01438% |
+| 500.000 | 0,00319% | 0,02516% | 0,09037% | 0,04629% |
+
+**El número de SOL a 25.000 era 12 veces mayor de lo real.** Y BTC, que se
+publicó como el libro más caro del mundo, tiene deslizamiento **cero** hasta
+100.000 USDT: su primer nivel tiene 3,193 BTC (268.295 USDT medidos), así que
+25.000 se ejecuta entero en el primer nivel.
+
+## De dónde salió el error
+
+**El tamaño de un nivel va en unidades del activo, y se estaba restando de un
+presupuesto en USDT.** Con `t = min(q, rest)` un nocional de 250 USDT
+consumía 250 BTC — unos 21 millones de dólares — y agotaba el libro entero.
+
+La firma del error era que **el deslizamiento grows como el precio del
+activo**: BTC, el más caro, salía como el más caro de operar. Eso estaba en la
+tabla publicada y era la pista de que el recorrido estaba mal, y se leyó como
+un hallazgo en vez de como una alarma.
+
+**Y tres versiones seguidas de esta medición dieron tres números distintos,
+los dos primeros por el mismo tipo de fallo: unidades mezcladas.** La primera
+también se cancelaba al sumar los dos lados con signo, y contaba niveles de
+tamaño cero.
+
+## Qué pasa con el veredicto
+
+**No lo cambia, y conviene decirlo claro.** El deslizamiento a 25.000 USDT es
+de orden milésimas, la expectativa neta de ATI es de +0,35% a +1,94%, y el
+coste total sigue dominado por la comisión (0,1270–0,1432%). La conclusión de
+fondo sigue igual:
+
+```
+0 de 8 tramos con significación
+2 de 8 sobreviven a quitar las 3 mejores operaciones (los dos de SOL)
+```
+
+Y la profundidad **sí importa para el dimensionamiento**, pero a partir de
+100.000 USDT, no antes: a 500.000 el deslizamiento va de 0,003% en BTC a
+0,090% en XRP, y **XRP pasa a ser el símbolo más caro, no SOL**.
+
+## Una cosa que el test no puede exigir
+
+La serie de deslizamiento **no es estrictamente monótona**: en SOL se midió
+0,01504% a 25.000 y 0,01438% a 100.000. Cada nocional se midió en una toma
+distinta del libro y el libro se mueve. El test comprueba la tendencia y la
+magnitud, no la monotonia, y el motivo está escrito en el propio test: obligar
+a que la serie suba a cada paso sería exigir algo que el dato no tiene.
+
+## Verificación
+
+- **508 tests verdes** (507 + 1 reformulado).
+- **Control de mutación**: reintroducir el número retractado de SOL
+  (0,18220) → 2 fallos.
+- Los tres tests que fijaban la tabla anterior se han reescrito: afirmaban
+  cosas que eran consecuencias del error, y un test que afirma una consecuencia
+  del bug no mide el bug.

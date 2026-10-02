@@ -264,56 +264,72 @@ def test_el_spread_se_aplica_por_simbolo_y_no_a_todos_igual():
 # ---------------------------------------------------------------------------
 
 def test_el_deslizamiento_crece_con_el_nocional():
-    """Un numero unico de spread subestima el coste, y mucho.
+    """A 25.000 USDT el deslizamiento es cero en BTC y ETH, y no lo es a 500.000.
 
-    MEDIDO: en SOL el deslizamiento de ida y vuelta va de 0,0173% con 250 USDT
-    a 0,4979% con 100.000. Son 29 veces, y a 25.000 USDT es 0,1822%, que es
-    11 veces el spread del primer nivel (0,0164%).
+    MEDIDO el 2026-10-02 recorriendo el libro de verdad. El resultado CONTRADICE
+    lo que se publico antes en este repositorio, que decia que en SOL a 25.000
+    el deslizamiento era 0,1822%. Venia de restar unidades del activo de un
+    presupuesto en USDT, con lo que el resultado crecia con el PRECIO del
+    activo y BTC aparecia como el mas caro de operar.
 
-    La razon es que el spread del primer nivel solo dice el precio al que se
-    ejecuta una cantidad MINIMA. Un nocional real se come niveles.
+    Este test existe para que el error no vuelva por el otro lado: si alguien
+    vuelve a mezclar unidades, el recorrido dara un slippage enorme y esto
+    fallara.
     """
     import backtesting.backtester as BT
-    sol = [BT.slippage_para("SOL/USDT:USDT", n)
-           for n in (250.0, 2500.0, 25000.0, 100000.0)]
-    assert sol == sorted(sol), f"el deslizamiento tiene que crecer: {sol}"
-    assert sol[-1] > sol[0] * 20, (
-        f"en SOL el deslizamiento solo se multiplica por {sol[-1]/sol[0]:.1f} "
-        f"entre 250 y 100.000 USDT, y lo medido es 29 veces")
-    assert sol[2] > BT.SPREAD_POR_SIMBOLO_PCT["SOL"] * 2 * 10, (
-        "a 25.000 USDT el deslizamiento real tiene que ser MAS que diez veces "
-        "el spread del primer nivel por los dos lados, no solo un poco mas")
+    for simbolo in ("BTC", "ETH", "XRP", "SOL"):
+        notionales = [250.0, 2500.0, 25000.0, 100000.0, 500000.0]
+        vals = [BT.slippage_para(f"{simbolo}/USDT:USDT", n) for n in notionales]
+        # NO se exige monotonia ESTRICTA. Cada nocional se midio en una toma
+        # distinta del libro y este se mueve, asi que en SOL se midio 0,01504%
+        # a 25.000 y 0,01438% a 100.000. Exigir que la serie suba a cada paso
+        # seria exigir algo que el dato no tiene, y un test que obliga a
+        # deformar el dato para cumplirlo es peor que no tener el test.
+        # Lo que si tiene que cumplirse es la TENDENCIA y la MAGNITUD.
+        assert vals[-1] > vals[0], f"{simbolo}: {vals}"
+        assert all(v < 0.5 for v in vals), (
+            f"{simbolo}: un deslizamiento de {max(vals):.4f}% significa que se "
+            f"estan mezclando unidades del activo con USDT, o que el recorrido "
+            f"del libro se ha roto")
+        assert vals[0] == 0.0, (
+            f"{simbolo}: con 250 USDT tiene que entrar en el primer nivel, que "
+            f"en BTC medido son 268.295 USDT")
 
 
-def test_un_slippage_de_un_tick_no_puede_valer_para_un_nocional_real():
-    """Si el deslizamiento fuera igual al spread del primer nivel, el recorrido
-    del libro no habriaaportado nada. Y el recorrido es justo lo que cambia el
-    numero en SOL."""
+def test_a_25k_el_deslizamiento_es_de_orden_milesimas():
+    """El nocional del backtest (25% de 100.000) entra en el primer nivel."""
     import backtesting.backtester as BT
-    primero_x2 = BT.SPREAD_POR_SIMBOLO_PCT["SOL"] * 2
-    real = BT.slippage_para("SOL/USDT:USDT", 100000.0)
-    assert real > primero_x2 * 10, (
-        f"el recorrido del libro da {real:.4f}% y el primer nivel {primero_x2:.4f}%. "
-        f"Si salieran parecidos, o el recorrido esta mal o el modelo no lo usa")
+    for simbolo in ("BTC", "ETH", "XRP", "SOL"):
+        v = BT.slippage_para(f"{simbolo}/USDT:USDT", 25000.0)
+        assert v <= 0.02, (
+            f"{simbolo} a 25.000 USDT da {v:.4f}%. Lo medido es 0% en BTC y "
+            f"ETH y del orden de 0,012-0,015% en XRP y SOL.")
 
 
-def test_una_fila_no_medida_no_se_confunde_con_cero():
-    """BTC no tiene profundidad medida. Devolver 0,0 sin avisar es lo que hace
-    que un backtest parezca gratis, asi que tiene que existir una forma de
-    preguntar."""
+def test_la_profundidad_solo_empieza_a_importar_a_partir_de_100_000():
+    """Con un nocional de backtest la profundidad no es el problema."""
     import backtesting.backtester as BT
-    assert not BT.simbolo_medido("BTC/USDT:USDT", 25000.0), (
-        "BTC no tiene profundidad medida a 25.000: pedirla tiene que decir que "
-        "no se sabe, no devolver 0")
-    assert BT.slippage_para("BTC/USDT:USDT", 25000.0) == 0.0
-    # Y un simbolo que SI esta medido no puede dar el mismo cero sin que se note
-    assert BT.simbolo_medido("SOL/USDT:USDT", 25000.0), "SOL si esta medido"
+    for simbolo in ("BTC", "ETH", "XRP", "SOL"):
+        pequeno = BT.slippage_para(f"{simbolo}/USDT:USDT", 25000.0)
+        grande = BT.slippage_para(f"{simbolo}/USDT:USDT", 500000.0)
+        assert grande > pequeno, f"{simbolo}: {grande} vs {pequeno}"
 
 
 def test_nunca_interpola_hacia_arriba():
     """Un nocional por encima de lo medido se queda con la fila mas cara."""
     import backtesting.backtester as BT
-    ultima = BT.SLIPPAGE_POR_NOTIONAL["SOL"][100000.0]
-    assert BT.slippage_para("SOL/USDT:USDT", 500000.0) == ultima, (
-        "pedir 500.000 USDT y devolver menos que lo medido a 100.000 seria "
+    ultima = BT.SLIPPAGE_POR_NOTIONAL["SOL"][500000.0]
+    assert BT.slippage_para("SOL/USDT:USDT", 2000000.0) == ultima, (
+        "pedir 2.000.000 USDT y devolver menos que lo medido a 500.000 seria "
         "optimista por construccion")
+
+
+def test_una_fila_no_medida_no_se_confunde_con_cero():
+    """Un simbolo fuera de la tabla devuelve 0.0 sin avisar, y por eso existe
+    `simbolo_medido`: un 0 silencioso hace que un backtest parezca gratis."""
+    import backtesting.backtester as BT
+    assert not BT.simbolo_medido("DOGE/USDT:USDT", 25000.0), (
+        "DOGE no tiene profundidad medida: preguntar tiene que decir que no se "
+        "sabe, no devolver 0")
+    assert BT.slippage_para("DOGE/USDT:USDT", 25000.0) == 0.0
+    assert BT.simbolo_medido("SOL/USDT:USDT", 25000.0), "SOL si esta medido"
