@@ -34,3 +34,10 @@ webui/frontend/.vite/
 
 # Cache descargada del exchange: se regenera sola en <1 min.
 quant_math/risk/.bybit_risk_limit.json
+
+# Velas de mercado descargadas (2026-10-02): 180.000 velas de mainnet,
+# 11 MB por simbolo-temporalidad. Son DATOS, no codigo: se regeneran con
+#   python3 tools/fetch_ohlcv.py 15m 45
+# y versionarlos haria que cada recarga del historico sea un commit de 11 MB.
+# El manifiesto SI se versiona, porque es el que dice que se descargó.
+data/ohlcv/*.csv
