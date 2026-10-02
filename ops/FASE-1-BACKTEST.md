@@ -900,3 +900,81 @@ segunda importa en producción.
 
 Lo que **no** se puede cerrar y está escrito en el código: el spread
 histórico, que el exchange no publica y las velas no contienen.
+
+---
+
+# FASE 1k: revalidación de la KB antigua
+
+## Lo primero: la KB actual no tiene nada que revalidar
+
+`autonomous_research/data/hypotheses.jsonl` tiene **114 líneas y un solo
+campo**: `hypothesis_id`. Los demás campos están a `None` en las 114. Son
+cascarones.
+
+El contenido real está en la cuarentena del 2026-10-01:
+`qmp-limpieza-2026-10-01/01-kb-hypotheses/hypotheses_classic-xrp.jsonl`, con
+**669 hipótesis con contenido** (y 940 en `hypotheses_rejects.jsonl`, de las
+que solo 3 tienen contenido).
+
+## El resultado, y es rotundo
+
+```
+hipotesis con contenido:               669
+estados:                               669 failed
+max_drawdown == 0.0 en                 669 de 669
+sharpe fuera de [-3, +3] en            553 de 669
+```
+
+**Las 669 tenían el drawdown a cero.** No "muchas": *todas*. El bug era
+universal, así que la parte de riesgo de su `scientific_score` valía
+exactamente cero en cada una. Y el 83% tenía un sharpe fuera de cualquier
+rango plausible.
+
+Eso significa que **`scientific_score` nunca midió riesgo en ninguna
+hipótesis**, y el umbral de 0,6 se aplicó sobre un número cuya parte de
+riesgo era constante cero.
+
+## Solo 3 de 13 combinaciones se pueden reconstruir
+
+| | |
+|---|---:|
+| combinaciones (símbolo, estrategia) distintas | 13 |
+| de las cuales el motor **sabe construir hoy** | **3** |
+
+Las otras 10 apuntan a estrategias que el motor ya no tiene. Una hipótesis
+sobre código que no existe no se revalida: **se tira y se vuelve a generar.**
+
+## Las tres que sí, con el motor correcto
+
+| Símbolo | Nombre | n antes | n ahora | esp antes | esp ahora | **dd antes** | **dd ahora** |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ETH | Breakout_15 | 43 | 2.137 | **−22,91%** | −0,0131% | 0,0000 | **32,29%** |
+| SOL | Breakout_15 | 72 | 205 | −0,4582% | −0,3654% | 0,0000 | **75,04%** |
+| XRP | Breakout_15 | 78 | 240 | −0,0232% | −0,3123% | 0,0000 | **74,96%** |
+
+- La expectativa de ETH era **−22,91% por operación**, una cifra imposible.
+  Sale de la serie de 15 minutos completa sobre 2.137 operaciones.
+- Los drawdowns reales son del **32% al 75%**. Los antiguos decían 0,0.
+- Expectativa positiva: **0 antes, 0 ahora**.
+
+## La conclusión
+
+**Las 669 siguen siendo `failed`, y lo estarían igual.** El problema no eran
+las métricas: eran las estrategias. Arreglar el motor no resucita ninguna
+hipótesis, y decirlo es más útil que(이) responsabilidad: si alguien
+reescribiera sus métricas y las hipotesis aparecieran como buenas, sería un
+error.
+
+Y hay un dato estructural que pesa más que el resultado: **10 de 13 familias
+de hipótesis apuntan a código que ya no existe.** La mayor parte de la KB no
+es un registro de estrategias buenas, es un registro de funciones borradas.
+Revalidarla es trabajo perdido; lo que vale es **volver a generar desde cero**
+sobre las 8 familias de producción, que ya están medidas en la Fase 1.
+
+## Lo que queda por decidir
+
+- **`scientific_score = 0,6`** se aplicó sobre un número con la parte de
+  riesgo a cero constante. Sigue sin decidir, y ahora se sabe que el umbral
+  no estaba midiendo lo que parecía.
+- **Si la KB se limpia.** Las 114 líneas actuales son índices sin contenido y
+  no sirven para nada. Las 669 están en cuarentena y no se han tocado.
