@@ -266,3 +266,4 @@ def test_run_backtest_usa_la_temporalidad_que_le_pasan():
         f"({r_15m.sharpe_ratio:.4f}): la temporalidad no llega a las metricas")
     assert r_15m.sharpe_ratio > r_1d.sharpe_ratio, (
         "con la misma media y sigma, mas periodos al año da un Sharpe mayor")
+

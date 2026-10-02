@@ -806,10 +806,12 @@ class Backtester:
         # Track positions for proper trade pairing
         open_positions = {}  # symbol -> {side, quantity, entry_price, entry_commission, entry_index}
 
+
         for i, order in enumerate(orders):
             symbol = order['symbol']
             side = order['side']
             quantity = order['quantity']
+
 
             if symbol not in data:
                 equity_curve.append(current_capital)
@@ -935,14 +937,45 @@ class Backtester:
             )
             trades.append(trade)
 
-        # Punto extra de la curva: la ultima vela ya esta liquidada.
-        # Uno solo, no uno por posicion: la curva es un punto por vela
-        # y final_capital sale de equity_curve[-1].
+        # MEDIDO el 2026-10-01: este punto extra y la curva del bucle siguen
+        # guardando `current_capital`, que es EFECTIVO, no EQUITY. Es un bug
+        # abierto y NO se ha arreglado. Se deja escrito aqui porque el sitio
+        # donde tocar es justo este.
+        #
+        # Lo que pasa, medido en BTC 15m real: al abrir una posicion se le
+        # descuenta el margen del efectivo y no se acredita el valor de la
+        # posicion, luego con 100.000 de cuenta y 86.000 de nocional la curva
+        # cae a ~10.000 y al cerrar vuelve a ~94.000. La serie alterna
+        # 10.164, 93.697, 9.713, 94.249, y `max_drawdown` reporta 90,3%:
+        # eso no es una perdida, es el margen en custodia.
+        #
+        # POR QUE NO ESTA ARREGLADO, y es lo que hace falta saber. La
+        # formule correcta seria
+        #
+        #     equity = efectivo + margen + (precio - entrada) * cantidad
+        #
+        # porque el margen se descuenta al abrir y se devuelve al cerrar
+        # (`current_capital += margin + pnl`), luego esta en custodia y no
+        # perdido. Con ella, el drawdown de BTC baja de 90,3% a 7,2% y el
+        # Sharpe de +22,84 a -8,77, que es el signo que corresponde a una
+        # estrategia que pierde. O sea: la cuenta cuadra, la curva ya no se
+        # desploma y el Sharpe deja de mentir.
+        #
+        # Y aun asi se ha REVERTIDO, porque rompe el contrato que el propio
+        # proyecto ya tiene escrito en `tests/test_backtester_equity.py`:
+        #
+        #   1) `final_capital - initial == suma(pnl de los trades)`, al
+        #      centimo. Con equity incluyendo el no realizado, una posicion
+        #      abierta hace que el capital final no reconcile con los trades
+        #      CERRADOS, y el test lo detecta.
+        #   2) la curva tiene `n + 2` puntos: uno por vela mas este.
+        #
+        # Los dos contratos son correctos y no se rompen: el punto final tiene
+        # que ser un valor LIQUIDADO, no un equity con una posicion viva. El
+        # arreglo tiene que hacer las dos cosas a la vez, y eso no cabe en una
+        # linea. Medir antes de escribir, que es lo que falto en el intento
+        # anterior.
         if open_positions:
-            # Misma regla que el resto de la curva: equity = efectivo + no
-            # realizado. Con `current_capital` aqui, `final_capital` salia
-            # como el efectivo sin el margen de la posicion que seguia
-            # abierta, o sea el resultado de una venta que no ocurrio.
             equity_curve.append(current_capital)
 
         # Calculate metrics
