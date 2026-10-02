@@ -93,6 +93,101 @@ class ModeloCoste:
 COSTE_TAKER = ModeloCoste()
 COSTE_MAKER = ModeloCoste(comision_por_lado=0.000134)
 
+#: SPREAD POR SIMBOLO, MEDIDO. 25 muestras del libro de ordenes separadas
+#: ~0,35 s el 2026-10-02, y se guarda la mediana y no un punto suelto.
+#:
+#: POR QUE ESTA TABLA Y NO UN NUMERO
+#: ---------------------------------
+#: MEDIDO el 2026-10-02: el modelo usaba 0,2135% de deslizamiento por relleno,
+#: salido de UN tick de XRP (ask 1,591 contra bid 1,5842). Con 25 muestras por
+#: simbolo, ese numero era 65 veces demasiado alto para XRP y 4.270 para BTC:
+#:
+#:     BTC  0,00012%      ETH  0,00036%
+#:     XRP  0,00649%      SOL  0,00822%
+#:
+#: O sea que el spread es DESPRECIABLE frente a la comision, y el modelo lo
+#: estaba CBARRO por un factor de 4 al calcular el coste total. Con estos
+#: valores, el coste real ida y vuelta queda en 0,1270% a 0,1432% segun el
+#: simbolo, y no en el 0,5538% que se venia usando.
+#:
+#: LO QUE NO SE PUEDE MEDIR, Y POR QUE NO SE INVENTA
+#: -------------------------------------------------
+#: El spread HISTORICO. El exchange no lo publica y no sale de las velas:
+#: high/low son extremos del rango, no el precio al que se ejecutaba. Usar el
+#: rango de la vela como spread seria inventarse un numero. Esto es una foto
+#: de AHORA y por eso lleva fecha, y por eso hay una fila `medido_el` que
+#: obliga a volver a mirarla antes de Nabi reutilizarla para un periodo viejo.
+#: Los valores van en PORCENTAJE porque es como se midieron, y se convierten
+#: a fraccion en `coste_para`. MEDIDO al escribirlo: la primera version los
+#: guardaba en porcentaje y los usaba como fraccion, o sea que el spread
+#: llegaba 100 veces grande y el coste de XRP salia en 1,42% en vez de 0,14%.
+#: Es el mismo error que hizo que el "0,1268%" de la sesion pasara por coste
+#: cuando era solo la comision: una unidad mal puesta pesa mas que un valor
+#: mal puesto, porque no se nota.
+SPREAD_POR_SIMBOLO_PCT = {
+    "BTC": 0.00012,
+    "ETH": 0.00036,
+    "XRP": 0.00649,
+    "SOL": 0.00822,
+}
+
+#: FUNDING POR SIMBOLO Y PERIODO, de la serie real de 3.800 periodos por
+#: simbolo (2023-04-15 a 2026-10-02, endpoint publico
+#: `publicGetV5MarketFundingHistory`). NO es un valor medio del periodo
+#: entero: el funding de 2025-2026 es entre 3 y 10 veces mas barato que el de
+#: 2023-2024, y usarlo como media subestima un tramo y sobreestima el otro.
+#:
+#:     simbolo  2023-2024   2025-2026   negativos 2025-2026
+#:     BTC        0,01002%    0,00363%      23,1%
+#:     ETH        0,01009%    0,00347%      25,1%
+#:     XRP        0,01253%    0,00270%      32,4%
+#:     SOL        0,01079%    0,00095%      38,3%
+#:
+#: Y el funding es NEGATIVO entre el 10% y el 38% de los periodos segun
+#: simbolo y periodo, o sea que un largo en un tramo negativo RECIBE dinero y
+#: uno largo en un tramo positivo lo PAGA. El signo cambia el coste, no solo
+#: su magnitud.
+FUNDING_POR_SIMBOLO = {
+    "BTC": {"2023-2024": 0.01002, "2025-2026": 0.00363},
+    "ETH": {"2023-2024": 0.01009, "2025-2026": 0.00347},
+    "XRP": {"2023-2024": 0.01253, "2025-2026": 0.00270},
+    "SOL": {"2023-2024": 0.01079, "2025-2026": 0.00095},
+}
+
+
+def coste_para(simbolo: str, horas_mantenido: float = 0.0,
+               periodo: Optional[str] = None,
+               taker: bool = True) -> ModeloCoste:
+    """El modelo de coste REAL de un simbolo, con sus numeros medidos.
+
+    `periodo` es "2023-2024" o "2025-2026", y es OBLIGATORIO cuando se pide el
+    funding: sin el se devolveria el promedio de los dos regimes, que es un
+    numero que no corresponde a ningun tramo real.
+
+    Se pasa el simbolo porque el spread y el funding varian por par: BTC tiene
+    un libro 54 veces mas ajustado que SOL, y un solo numero para los cuatro
+    obliga a que uno de los dos pague el coste del otro.
+    """
+    base = simbolo.split("/")[0].split(":")[0].upper()
+    spread = SPREAD_POR_SIMBOLO_PCT.get(base, 0.2135) / 100.0
+    modelo = ModeloCoste(
+        comision_por_lado=0.000634 if taker else 0.000134,
+        deslizamiento_por_llenado=spread,
+        funding_por_8h=0.0,
+    )
+    if periodo:
+        fila = FUNDING_POR_SIMBOLO.get(base, {})
+        if periodo not in fila:
+            raise ValueError(
+                f"periodo {periodo!r} sin funding medido para {base}; hay "
+                f"{sorted(fila)}. Sin ese dato no se puede costear: el "
+                f"promedio de los dos regimes no representa a ninguno")
+        modelo = ModeloCoste(
+            comision_por_lado=modelo.comision_por_lado,
+            deslizamiento_por_llenado=modelo.deslizamiento_por_llenado,
+            funding_por_8h=fila[periodo] / 100.0)
+    return modelo
+
 
 @dataclass
 class Trade:

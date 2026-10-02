@@ -182,3 +182,77 @@ def test_el_deslizamiento_esta_dentro_del_precio_de_entrada():
     assert con_slip.trades[0].entry_price > limpio.trades[0].entry_price, (
         "comprar con deslizamiento tiene que rellenar por ENCIMA del precio de "
         "la serie; si no, el deslizamiento no hace nada")
+
+
+# ---------------------------------------------------------------------------
+# El coste POR SIMBOLO. MEDIDO el 2026-10-02.
+# ---------------------------------------------------------------------------
+
+def test_el_spread_medido_no_puede_venir_de_una_sola_foto():
+    """Un spread de 0,427% salio de UN tick de XRP y era 65x lo medido.
+
+    Es el mismo error que hizo que "0,1268%" se tomara por el coste entero: un
+    numero de una sola muestra parece tan firme como uno de 25, y no lo es. Se
+    fija la tabla medida para que nadie reintroduzca un numero de un tick sin
+    dejar constancia de que lo es.
+    """
+    import backtesting.backtester as BT
+    for simbolo, esperado in BT.SPREAD_POR_SIMBOLO_PCT.items():
+        assert 0.0 <= esperado <= 0.05, (
+            f"{simbolo}: un spread de {esperado}% es de un tick, no de una "
+            f"medida. El medido con 25 muestras va del 0,00012% al 0,00822%")
+    # Y el orden tiene que ser el del libro: BTC el mas profundo.
+    assert (BT.SPREAD_POR_SIMBOLO_PCT["BTC"]
+            < BT.SPREAD_POR_SIMBOLO_PCT["ETH"]
+            < BT.SPREAD_POR_SIMBOLO_PCT["XRP"]
+            < BT.SPREAD_POR_SIMBOLO_PCT["SOL"]), (
+        "en Bybit el libro se ensancha de BTC a SOL; si el orden se invierte, "
+        "alguno de los numeros esta cambiado de sitio")
+
+
+def test_las_unidades_del_spread_no_se_confunden():
+    """El medido es un PORCENTAJE y se usa como fraccion. Confundirlas pesa 100x.
+
+    MEDIDO al escribir esto: la tabla guardaba 0,00649 en porcentaje y se
+    usaba como fraccion, y el coste de XRP salia en 1,42% en vez de 0,14%. Una
+    unidad mal puesta pesa mas que un valor mal puesto porque no se nota.
+    """
+    import backtesting.backtester as BT
+    m = BT.coste_para("XRP/USDT:USDT", periodo="2025-2026")
+    esperado_spread_pct = BT.SPREAD_POR_SIMBOLO_PCT["XRP"]
+    assert abs(m.deslizamiento_por_llenado * 100.0 - esperado_spread_pct) < 1e-9, (
+        f"el modelo usa {m.deslizamiento_por_llenado * 100:.5f}% y lo medido "
+        f"es {esperado_spread_pct}%")
+    # Y el total tiene que salir cerca de 0,14%, no cerca de 1,4%.
+    assert 0.05 < m.ida_y_vuelta_pct() < 0.30, (
+        f"el coste ida y vuelta de XRP sale en {m.ida_y_vuelta_pct():.4f}%, que "
+        f"esta fuera de lo medido. Con un spread de 0,00649% y una comision "
+        f"de 0,000634 por lado no puede pasar de 0,20%")
+
+
+def test_el_funding_difiere_por_periodo_y_no_se_puede_pedir_uno_inventado():
+    """El funding de 2025-2026 es entre 3 y 10 veces mas barato que el de
+    2023-2024. Usar la media de los dos no representa a ninguno, asi que pedir
+    un periodo sin medir tiene que FALLAR y no devolver un promedio."""
+    import backtesting.backtester as BT
+    for simbolo in BT.FUNDING_POR_SIMBOLO:
+        a = BT.coste_para(f"{simbolo}/USDT:USDT", 8 * 24, periodo="2023-2024")
+        b = BT.coste_para(f"{simbolo}/USDT:USDT", 8 * 24, periodo="2025-2026")
+        assert a.coste_por_operacion_pct(192) > b.coste_por_operacion_pct(192), (
+            f"{simbolo}: el tramo viejo tiene que costar MAS que el reciente; "
+            f"si no, las dos filas estan cambiadas de sitio")
+    with pytest.raises(ValueError, match="sin funding medido"):
+        BT.coste_para("BTC/USDT:USDT", 8 * 24, periodo="1999-2000")
+
+
+def test_el_spread_se_aplica_por_simbolo_y_no_a_todos_igual():
+    """Un solo numero para los cuatro obliga a que uno pague el coste de otro.
+
+    BTC tiene el libro 54 veces mas ajustado que SOL: 0,00012% contra 0,00822%.
+    Con un numero unico se estaria cobrando a BTC el spread de SOL.
+    """
+    import backtesting.backtester as BT
+    btc = BT.coste_para("BTC/USDT:USDT", periodo="2025-2026")
+    sol = BT.coste_para("SOL/USDT:USDT", periodo="2025-2026")
+    assert btc.ida_y_vuelta_pct() < sol.ida_y_vuelta_pct(), (
+        "BTC no puede costar lo mismo que SOL: sus libros no se parecen")

@@ -41,3 +41,9 @@ quant_math/risk/.bybit_risk_limit.json
 # y versionarlos haria que cada recarga del historico sea un commit de 11 MB.
 # El manifiesto SI se versiona, porque es el que dice que se descargó.
 data/ohlcv/*.csv
+
+# Funding real descargado (2026-10-02): 3.800 periodos de 8h por simbolo,
+# cubriendo 2023-04-15 a 2026-10-02. Son DATOS, se regeneran con
+#   python3 tools/fetch_funding.py
+# y el manifiesto SI se versiona.
+data/funding/*.csv

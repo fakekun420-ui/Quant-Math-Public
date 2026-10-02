@@ -364,3 +364,128 @@ del cero.
 - `ModeloCoste` es un número único. Las comisiones de Bybit **varían por par**
   (BTC y XRP no tienen las mismas), así que un solo valor no puede ser
   correcto para los cuatro símbolos.
+
+---
+
+# FASE 1e: el coste por símbolo, y por periodo
+
+## Tres modelos seguidos, tres veredictos distintos
+
+| Medición del coste | Netas positivas | Sin las 3 mejores | Con significación |
+|---|---:|---:|---:|
+| Fase 1 — solo comisión 0,1268% (y contada dos veces) | 0 de 32 | — | 0 |
+| Fase 1d — spread de **un tick** + funding medio | 6 de 8 | 1 de 8 | 0 |
+| **Fase 1e — spread muestreado + funding real por periodo** | **8 de 8** | **2 de 8** | **0** |
+
+**El veredicto cambiaba tres veces y ninguna vez por culpa de la estrategia.**
+Cambiaba por el modelo de coste, es decir por mis propias mediciones. Tres
+números que parecían el mismo concepto —"lo que cuesta operar"— y que en
+realidad eran tres cosas distintas.
+
+## El spread de 0,427% eran 65× lo que es
+
+Salió de **un solo tick** de XRP (ask 1,591 contra bid 1,5842). Con 25
+muestras por símbolo:
+
+| Símbolo | Medido (mediana de 25) | vs 0,427% |
+|---|---:|---:|
+| BTC | 0,00012% | 4.270× |
+| ETH | 0,00036% | 1.186× |
+| XRP | 0,00649% | 65× |
+| SOL | 0,00822% | 52× |
+
+**El spread es despreciable frente a la comisión.** El modelo costaba 4× de más
+por culpa de un tick.
+
+Es el mismo error que el del "0,1268%": un número de una sola muestra parece
+tan firme como uno de 25. Y lo cometí dos veces, en direcciones opuestas — la
+primera took too little, la segunda too much.
+
+## El funding real: 3.800 periodos por símbolo
+
+Endpoint público `publicGetV5MarketFundingHistory`. **Tres caminos y solo uno
+funciona**: el privado no existe en este build de ccxt, el v3 público da 404, y
+el v5 `market/funding/history` responde. Además pagina con `endTime` y **no**
+con `end` — con `end` devuelve siempre la misma página, que es el bucle
+infinito que ya se cueló una vez en el paginador de velas.
+
+| Símbolo | 2023-2024 | 2025-2026 | Negativos 2025-2026 |
+|---|---:|---:|---:|
+| BTC | 0,01002% | 0,00363% | 23,1% |
+| ETH | 0,01009% | 0,00347% | 25,1% |
+| XRP | 0,01253% | 0,00270% | 32,4% |
+| SOL | 0,01079% | 0,00095% | 38,3% |
+
+**El tramo reciente es entre 3 y 10 veces más barato**, así que el promedio de
+los dos no representa a ninguno. Y el funding es **negativo entre el 10% y el
+38% de los periodos**: un largo en tramo negativo recibe dinero. El signo
+cambia el coste, no solo su magnitud.
+
+## El coste real, por símbolo y periodo
+
+Para una posición de 3 a 8 días (el horizonte medido de ATI):
+
+| Símbolo | Periodo | Ida y vuelta | +3 días | +8 días |
+|---|---|---:|---:|---:|
+| BTC | 2023-2024 | 0,1270% | 0,2172% | 0,3675% |
+| BTC | 2025-2026 | 0,1270% | 0,1597% | 0,2142% |
+| ETH | 2025-2026 | 0,1275% | 0,1588% | 0,2108% |
+| XRP | 2025-2026 | 0,1398% | 0,1641% | 0,2046% |
+| SOL | 2025-2026 | 0,1432% | 0,1518% | 0,1660% |
+
+## El número bueno de ATI
+
+| Símbolo | Tramo | Bruta % | Coste % | **Neta %** | **IC95 inf.** | **Neta sin las 3** |
+|---|---|---:|---:|---:|---:|---:|
+| BTC | 2023-2024 | +2,0360 | 0,2470 | **+1,7890** | −0,7625 | −0,1635 |
+| BTC | 2025-2026 | +0,5148 | 0,1679 | **+0,3469** | −0,9538 | −0,4971 |
+| ETH | 2023-2024 | +1,2225 | 0,2565 | **+0,9660** | −0,9121 | −0,2407 |
+| ETH | 2025-2026 | +0,5160 | 0,1594 | **+0,3566** | −1,9246 | −1,1599 |
+| XRP | 2023-2024 | +3,1489 | 0,3516 | **+2,7973** | −5,5341 | −2,8418 |
+| XRP | 2025-2026 | +1,0362 | 0,1732 | **+0,8630** | −2,6614 | −1,8280 |
+| SOL | 2023-2024 | +9,4355 | 0,4197 | **+9,0158** | −3,0789 | **+0,4256** |
+| SOL | 2025-2026 | +2,0998 | 0,1569 | **+1,9429** | −0,7678 | **+0,2317** |
+
+```
+Neta positiva:                   8 de 8
+IC95 entero sobre cero:          0 de 8
+Neta positiva sin las 3 mejores: 2 de 8   (los dos de SOL)
+```
+
+## Veredicto
+
+1. **La expectativa media de ATI es real y positiva** en los ocho tramos, y es
+   de 2 a 3 veces el coste. Eso ya no es un artefacto del coste mal medido.
+2. **Ninguno de los ocho es estadísticamente distinguible de una moneda al
+   azar.** El intervalo contiene el cero en los 8.
+3. **Solo SOL sobrevive** a quitar las 3 mejores operaciones (+0,4256% y
+   +0,2317%). Es la única pista que queda, y es una pista, no una ventaja.
+
+Un punto positivo del proceso: **la conclusión se ha vuelto más pesimista tres
+veces seguidas** al medir mejor, y eso es lo que debería pasar. Cuando afloja
+el instrumento, la estrategia no mejora; aparece que el instrumento estaba
+mintiendo.
+
+## Verificación
+
+- **503 tests verdes** (499 + 4 nuevos).
+- **Control de mutación triple, los tres cazados**:
+  - volver al spread de un tick → 2 fallos
+  - promediar el funding entre los dos periodos → 1 fallo
+  - quitar la conversión de unidades del spread → 1 fallo
+
+## Sigue abierto
+
+- El spread es una **foto de ahora**, no del periodo backtesteado, y no hay
+  forma de reconstruirlo desde las velas (`high`/`low` son extremos del rango,
+  no el precio de ejecución). Los números de 2023-2024 usan el spread de 2026.
+- El funding está **integrado como la tasa de la mediana de horas**, no
+  sumando los periodos reales que caen dentro de cada operación. Con un
+  horizonte de 3 a 8 días y un cutoff cada 8 horas, son de 9 a 24 periodos:
+  sumar los reales daría un número distinto.
+- **No se ha medido el coste de pasar por el libro de profundidad.** Con
+  notional de miles de USDT en XRP o SOL, el precio ejecutado no es el del
+  primer nivel, y ahí el spread efectivo sube.
+- Las **comisiones por par** no se han podido leer: el endpoint público de
+  grupos de comisiones devuelve `retCode 10001`. Sigue usándose 0,000634 por
+  lado para los cuatro, que es el valor taker estándar medido en BTC.
