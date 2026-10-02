@@ -14,6 +14,50 @@ from webui.core.websocket import ws_manager
 
 router = APIRouter()
 
+#: MEDIDO el 2026-10-01: este backend tiene 29 endpoints, 13 con `# TODO` y
+#: 26 con numeros escritos a mano, y NO habia ningun flag de mock.
+#:
+#: El riesgo medido no es que el panel se vea feo. Es que
+#: `/dashboard/active-strategies` devolvia estrategias INVENTADAS con
+#: `sharpe: 1.85`, `win_rate: 58.5` y 42 operaciones que nunca ocurrieron. Para
+#: quien mira el panel eso es indistinguible de una medicion.
+#:
+#: Y en este proyecto la confusion entre "medido" y "parece medido" ya ha
+#: costado una sesion entera: la KB se lleno de 621 hipotesis sobre una
+#: premisa que resulto falsa. Un panel que fabrica numeros reintroduce ese
+#: fallo en la capa de presentacion, que es donde mas dificil de detectar.
+#:
+#: LA REGLA: una metrica que no se ha medido se declara como tal, nunca se
+#: rellena con un numero plausible. Un `None` se ve; un 1,85 se cree.
+#:
+#: Lo que NO se hace aqui: cablear los endpoints al estado real. El estado de
+#: ejecucion se limpio y no hay ledger ni KB que leer, asi que cablearlos
+#: devolveria vacios y ceros que parecerian "el sistema no opera". Un `None`
+#: explicito es mas honesto que un cero que se lee como medida.
+DATOS_MOCK = True
+AVISO_DATOS_MOCK = (
+    "Datos de EJEMPLO, no medidos. Este endpoint no esta conectado al motor: "
+    "los numeros son inventados y no se debe tomar ninguna decision con ellos."
+)
+
+
+def marcar_mock(datos):
+    """Anade `data_source: "mock"` y el aviso a la respuesta.
+
+    Se aplica en el endpoint y no en el cliente porque si no, el proximo
+    endpoint nuevo vuelve a inventar numeros sin avisar: el fallo reaparece
+    en cuanto alguien anade una linea.
+    """
+    if isinstance(datos, list):
+        for d in datos:
+            if isinstance(d, dict):
+                d["data_source"] = "mock"
+                d["aviso"] = AVISO_DATOS_MOCK
+    elif isinstance(datos, dict):
+        datos["data_source"] = "mock"
+        datos["aviso"] = AVISO_DATOS_MOCK
+    return datos
+
 
 # ============================================================
 # Models
@@ -46,6 +90,14 @@ class TradingMetrics(BaseModel):
     max_drawdown: float
     active_strategy: Optional[str] = None
     total_trades: int = 0
+    # MEDIDO el 2026-10-01: estos valores se servian sin decir de donde
+    # salian. `paper_balance=100000.0` con el resto a cero parece un sistema
+    # que no ha operado, y es exactamente lo que dice, pero solo por casualidad:
+    # si alguien sube el balance a 100.000 porque es "lo tipico", el panel
+    # dira que hay 100.000 en la cuenta. Se declara el origen para que la
+    # afirmacion sea comprobable.
+    data_source: str = "mock"
+    aviso: str = ""
 
 
 class Hypothesis(BaseModel):
@@ -147,6 +199,8 @@ async def get_trading_metrics():
         max_drawdown=0.0,
         active_strategy=None,
         total_trades=0,
+        data_source="mock",
+        aviso=AVISO_DATOS_MOCK,
     )
 
 
@@ -168,7 +222,7 @@ async def get_events(limit: int = 50):
 async def get_active_strategies():
     """Get active trading strategies."""
     # TODO: Connect to actual strategy manager
-    return [
+    return marcar_mock([
         {
             "id": "strat_001",
             "name": "EMA Crossover BTC",
@@ -260,7 +314,7 @@ async def get_active_strategies():
                 "volume_threshold": 1.5
             }
         }
-    ]
+    ])
 
 
 # ============================================================
@@ -349,7 +403,7 @@ async def get_config_sections():
 async def get_config_values():
     """Get current configuration values."""
     # TODO: Load from actual config store
-    return {
+    return marcar_mock({
         "trading": {
             "initial_capital": 100000.0,
             "capital_per_trade": 0.1,
@@ -396,7 +450,7 @@ async def get_config_values():
             "test_window": 63,
             "step_size": 63
         }
-    }
+    })
 
 
 @router.post("/config/values")
@@ -414,11 +468,11 @@ async def save_config_values(config: Dict):
 async def get_backtest_hypotheses():
     """Get hypotheses available for backtesting."""
     # TODO: Connect to hypothesis database
-    return [
+    return marcar_mock([
         {"hypothesis_id": "hyp_001", "name": "EMA Crossover BTC", "strategy_type": "ema_crossover"},
         {"hypothesis_id": "hyp_002", "name": "RSI Mean Reversion ETH", "strategy_type": "rsi_mean_reversion"},
         {"hypothesis_id": "hyp_003", "name": "Bollinger Bands Breakout SOL", "strategy_type": "bollinger_breakout"},
-    ]
+    ])
 
 
 @router.post("/backtest/run", response_model=BacktestResponse)
@@ -509,24 +563,24 @@ async def get_monitoring_hypotheses():
 @router.get("/monitoring/strategies")
 async def get_monitoring_strategies():
     """Get strategies by stage."""
-    return {
+    return marcar_mock({
         "generated": [],
         "validating": [],
         "backtesting": [],
         "monte_carlo": [],
         "approved": [],
         "rejected": []
-    }
+    })
 
 
 @router.get("/monitoring/simulations")
 async def get_monitoring_simulations():
     """Get active simulations."""
-    return {
+    return marcar_mock({
         "backtests": [],
         "monte_carlo": [],
         "walk_forward": []
-    }
+    })
 
 
 @router.get("/monitoring/trades")

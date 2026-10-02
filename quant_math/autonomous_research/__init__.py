@@ -37,7 +37,7 @@ from quant_math.autonomous_research.agents.agent_registry import AgentRegistry
 # Adapters
 from quant_math.autonomous_research.adapters import (
     QuantMathAdapter,
-    RiskManagementEngine,
+
     HypothesisKnowledgeBase,
 )
 
@@ -69,6 +69,6 @@ __all__ = [
 
     # Adapters
     "QuantMathAdapter",
-    "RiskManagementEngine",
+
     "HypothesisKnowledgeBase",
 ]
