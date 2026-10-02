@@ -978,3 +978,98 @@ sobre las 8 familias de producción, que ya están medidas en la Fase 1.
   no estaba midiendo lo que parecía.
 - **Si la KB se limpia.** Las 114 líneas actuales son índices sin contenido y
   no sirven para nada. Las 669 están en cuarentena y no se han tocado.
+
+---
+
+# FASE 1l: corregir MI propio análisis — 64 pruebas, ningún ajuste
+
+## El agujero
+
+Hasta aquí el criterio era "el IC95 de la media por operación no toca el cero",
+medido **por separado** en cada combinación. Con **64 pruebas** (4 símbolos ×
+8 familias × 2 regimes) al 95%, si la hipótesis nula fuese cierta en las 64 se
+esperarían **~3,2 falsos positivos por puro azar**.
+
+Es decir: **el método que estaba usando no distingue "no hay ventaja" de "hay 3
+ventajas falsas".** Concluir "0 de 32 significativas" a partir de pruebas sin
+corregir era una conclusión sin base.
+
+Y el riesgo va al revés de lo que parece: el método sin corregir produce falsos
+**positivos** (declara ventaja donde no la hay), no falsos negativos. Es
+permisivo. Pero yo usaba su resultado para decir "no hay ventaja", y con un
+método permisivo un "no" no es concluyente.
+
+## Lo que sale sin corregir
+
+**7 de 64** — y **las siete son de 2023-2024. Ninguna de 2025-2026.**
+
+| Símbolo | Familia | n | neta % | p |
+|---|---|---:|---:|---:|
+| BTC | RSI | 671 | +0,0233 | 0,0026 |
+| XRP | Bollinger | 306 | +0,1926 | 0,0038 |
+| SOL | VWAP | 191 | +0,8217 | 0,0054 |
+| BTC | VWAP | 31 | +3,3852 | 0,0069 |
+| BTC | Bollinger | 661 | +0,0104 | 0,0095 |
+| XRP | RSI | 288 | +0,1332 | 0,0147 |
+| XRP | VWAP | 116 | +1,0538 | 0,0160 |
+
+Si me hubiera quedado aquí, habría **declarado 7 estrategias con ventaja
+demostrada**. Siete falsos positivos de un artefacto estadístico.
+
+## Lo que sale con corrección
+
+```
+SIN CORREGIR (0,05)        7 de 64    |z| > 1,960
+Bonferroni                  0 de 64    |z| > 3,163
+Holm-Bonferroni             0 de 64    paso a paso
+Benjamini-Hochberg (FDR)    0 de 64    ordenado por p
+```
+
+**Ninguna de las tres correcciones deja pasar nada.** Ni la más permisiva
+(FDR, que acepta un 5% de falsos positivos a cambio de potencia).
+
+## El control negativo, que es lo que da valor a lo anterior
+
+64 simulaciones de ruido puro con media 0 y desviación del 3%:
+
+```
+p < 0,05 sin corregir :  2 de 64      <- lo que se espera por azar
+p < 0,00078 (Bonferroni):  0 de 64
+BH-FDR                  :  0 de 64
+```
+
+Esto confirma dos cosas a la vez: que el método **no está inventándose señales**
+(y si las declarara, el hallazgo sería sobre el método, no sobre el mercado), y
+que las **7 de arriba son del mismo tipo de artefacto**.
+
+## Cómo se calcula el p
+
+Sobre el retorno **bruto por operación leído del CSV**, y el coste se resta
+**después**. Así el p es el del mercado y el coste no puede ser lo que infla la
+significación.
+
+Es una **aproximación normal**, no un t-Student exacto con n−1 grados de
+libertad. Con n ≥ 20 es tolerable, y está declarado en el código del script.
+BTC/VWAP con n=31 es el caso más frágil de la lista, y aunque tuviera
+significación no sería concluyente con ese tamaño de muestra.
+
+## El hallazgo de fondo, que es el que vale
+
+**Las 7 significativas sin corregir están todas en 2023-2024. En 2025-2026 no
+sale ninguna.** Con 32 combinaciones por régimen, la tasa esperada de falsos
+positivos es ~1,6 por periodo, así que que en el régimen reciente no salga
+ninguna es un indicio más, no una prueba.
+
+Y eso encaja con todo lo anterior: el régimen de 2023-2024 fue alcista, y en un
+tramo alcista casi cualquier cosa que esté expuesta al precio parece tener
+ventaja. Lo que tiene que sobrevivir a un régimen es la ventaja, y aquí no
+sobrevive.
+
+## Conclusión
+
+**Ninguna de las 8 familias tiene ventaja demostrada, y ahora está demostrado
+con un método que puede declarar ventaja si la hubiera.** Eso no se podía decir
+antes: el método anterior era permisivo, y un "0" de un método permisivo no
+prueba nada.
+
+No se toca ningún umbral, ni `scientific_score`, ni los parámetros de Leonardo.
