@@ -419,9 +419,37 @@ class PerformanceMetrics:
 
         return np.array(cumulative_returns)
 
+    #: Velas por año por temporalidad de Bybit. MEDIDO el 2026-10-01: el
+    #: numero de barras al año es `365,25 dias * velas/dia`, y las velas por
+    #: dia son 1440/horas. Un año tiene 35.040 barras de 15m, no 252.
+    #:
+    #: Se declara aqui y no se calcula con `sqrt(252)` porque el error de
+    #: antes no era de precision: era de UNIDADES. Un Sharpe calculado con
+    #: 252 sobre velas de 15m compara una media de 15 minutos contra una
+    #: desviacion de un dia.
+    PERIODOS_POR_ANIO = {
+        "1m": 525_600, "3m": 175_200, "5m": 105_120, "15m": 35_040,
+        "30m": 17_520, "1h": 8_760, "2h": 4_380, "4h": 2_190, "1d": 365,
+    }
+
+    @classmethod
+    def periodos_por_anio(cls, timeframe: Optional[str]) -> int:
+        """Velas al año de una temporalidad. `None` o desconocida -> diaria.
+
+        Se cae a 365 y no a 252 a proposito: 252 son DIAS DE MERCADO sobre
+        velas diarias, y cualquier otra temporalidad necesita velas. Con
+        `None` el valor es una aproximacion declarada, no una medida, y el
+        llamante puede ver cual es por el propio resultado.
+        """
+        if not timeframe:
+            return cls.PERIODOS_POR_ANIO["1d"]
+        return cls.PERIODOS_POR_ANIO.get(str(timeframe).strip().lower(),
+                                        cls.PERIODOS_POR_ANIO["1d"])
+
     @staticmethod
     def sharpe_ratio(returns: np.ndarray, risk_free_rate: float = 0.02,
-                     period: str = 'daily') -> float:
+                     period: str = 'daily',
+                     periods_per_year: Optional[int] = None) -> float:
         """
         Calculate Sharpe ratio.
 
@@ -442,33 +470,37 @@ class PerformanceMetrics:
         if len(returns) == 0:
             return 0.0
 
-        # Convert to annualized
-        if period == 'daily':
-            periods_per_year = 252
-        elif period == 'weekly':
-            periods_per_year = 52
-        else:
-            periods_per_year = 12
-
-        mean_return = np.mean(returns) * periods_per_year
-        std_return = np.std(returns) * np.sqrt(periods_per_year)
-
-        if std_return == 0:
-            return 0.0
-
-        # CORREGIDO el 2026-10-01: `risk_free_rate` se restaba de una media
-        # YA ANUALIZADA, o sea 0,02 (que es un 2% POR DIA) contra un numero
-        # multiplicado por 252. Mezcla de unidades: el riesgo sin riesgo
-        # quedaba multiplicado por 252 veces menos de lo que es, y en una
-        # serie con media anualizada alta desaparecia.
+        # CORREGIDO el 2026-10-01. Antes el numero de periodos al año estaba
+        # FIJO en 252 sin importar la temporalidad, con lo que un backtest de
+        # 15m se annualizaba como si cada vela fuera un dia. Y el riesgo sin
+        # riesgo, que es ANUAL, se restaba de una media ya multiplicada.
         #
-        # `risk_free_rate` es ANUAL (0,02 = 2% al año), asi que la media
-        # anualizada y el riesgo sin riesgo estan en la misma unidad. Se
-        # documenta aqui porque el nombre del parametro es el que induce el
-        # error: parece un tasa por periodo.
-        sharpe = (mean_return - risk_free_rate) / std_return
+        # Ahora `periods_per_year` se puede pasar explicito (lo hace
+        # `run_backtest` con la temporalidad real) y el riesgo sin riesgo se
+        # escala al periodo ANTES de restar, que es la unica forma de que los
+        # dos terminos sean de la misma unidad:
+        #
+        #     sharpe_anual = (media - rf_anual/P) * sqrt(P) / sigma
+        #
+        # Si se deja `period` y no `periods_per_year`, manda `period` (se
+        # conserva el comportamiento historico para los llamantes viejos).
+        if periods_per_year is None:
+            if period == 'daily':
+                periods_per_year = 252
+            elif period == 'weekly':
+                periods_per_year = 52
+            else:
+                periods_per_year = 12
+        periods_per_year = max(1, int(periods_per_year))
 
-        return sharpe
+        rf_periodo = risk_free_rate / periods_per_year
+        media = np.mean(returns)
+        sigma = np.std(returns)
+        if sigma == 0:
+            return 0.0
+        sharpe = (media - rf_periodo) * np.sqrt(periods_per_year) / sigma
+
+        return float(sharpe)
 
     @staticmethod
     def sortino_ratio(returns: np.ndarray, risk_free_rate: float = 0.02,
@@ -719,7 +751,8 @@ class Backtester:
         return bool(np.min(series[lo:hi]) <= liq_price)
 
     def run_backtest(self, strategy_func: Callable, data: Dict[str, np.ndarray],
-                    initial_capital: Optional[float] = None) -> BacktestResult:
+                    initial_capital: Optional[float] = None,
+                    timeframe: Optional[str] = None) -> BacktestResult:
         """
         Run backtest for a strategy.
 
@@ -906,6 +939,10 @@ class Backtester:
         # Uno solo, no uno por posicion: la curva es un punto por vela
         # y final_capital sale de equity_curve[-1].
         if open_positions:
+            # Misma regla que el resto de la curva: equity = efectivo + no
+            # realizado. Con `current_capital` aqui, `final_capital` salia
+            # como el efectivo sin el margen de la posicion que seguia
+            # abierta, o sea el resultado de una venta que no ocurrio.
             equity_curve.append(current_capital)
 
         # Calculate metrics
@@ -917,8 +954,14 @@ class Backtester:
         price_series = equity_curve
 
         returns = np.diff(price_series) / price_series[:-1] if len(price_series) > 1 else np.array([0.0])
-        annualized_vol = np.std(returns) * np.sqrt(252) if len(returns) > 0 else 0.0
-        sharpe = PerformanceMetrics.sharpe_ratio(returns)
+        # MEDIDO el 2026-10-01: esto iba fijo en 252 velas al año, sin
+        # mirar la temporalidad. Un backtest de 15m tiene 35.040 velas al
+        # año, luego la volatilidad y el Sharpe salian calculados con un
+        # 139x de error en el numerador y un 11,8x en el denominador.
+        _ppa = PerformanceMetrics.periodos_por_anio(timeframe)
+        annualized_vol = (np.std(returns) * np.sqrt(_ppa)
+                          if len(returns) > 0 else 0.0)
+        sharpe = PerformanceMetrics.sharpe_ratio(returns, periods_per_year=_ppa)
         sortino = PerformanceMetrics.sortino_ratio(returns)
         max_dd = PerformanceMetrics.max_drawdown(price_series)
 

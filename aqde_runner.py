@@ -313,6 +313,11 @@ class AQDERunner:
                     "short_window": 12,
                     "long_window": 26,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
             {
@@ -325,6 +330,11 @@ class AQDERunner:
                     "rsi_oversold": 30,
                     "rsi_overbought": 70,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
             {
@@ -336,6 +346,11 @@ class AQDERunner:
                     "bb_period": 20,
                     "bb_std": 2.0,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
             {
@@ -346,6 +361,11 @@ class AQDERunner:
                     "strategy_type": "donchian_breakout",
                     "donchian_window": 20,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
             {
@@ -358,6 +378,11 @@ class AQDERunner:
                     "dual_mid": 21,
                     "dual_slow": 55,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
             {
@@ -369,6 +394,11 @@ class AQDERunner:
                     "vwap_window": 20,
                     "vwap_threshold": 0.02,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
             {
@@ -380,6 +410,11 @@ class AQDERunner:
                     "short_window": 12,
                     "long_window": 26,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
             {
@@ -391,6 +426,11 @@ class AQDERunner:
                     "atr_window": 14,
                     "atr_factor": 3.0,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                 }
             },
         ]
@@ -485,6 +525,11 @@ class AQDERunner:
                                 "rsi_oversold": s2['parameters'].get('rsi_oversold', 30),
                                 "rsi_overbought": s2['parameters'].get('rsi_overbought', 70),
                                 "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                             }
                         }
                         hypotheses.append(hyp)
@@ -510,6 +555,11 @@ class AQDERunner:
                                         "short_window": sw,
                                         "long_window": lw,
                                         "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                                     }
                                 }
                                 hypotheses.append(hyp)
@@ -529,6 +579,11 @@ class AQDERunner:
                                             "rsi_oversold": os,
                                             "rsi_overbought": ob,
                                             "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                                         }
                                     }
                                     hypotheses.append(hyp)
@@ -545,6 +600,11 @@ class AQDERunner:
                                     "bb_period": bp,
                                     "bb_std": std,
                                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                                 }
                             }
                             hypotheses.append(hyp)
@@ -581,6 +641,11 @@ class AQDERunner:
                                 "rsi_oversold": os,
                                 "rsi_overbought": ob,
                                 "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                             }
                         }
                         hypotheses.append(hyp)
@@ -594,6 +659,11 @@ class AQDERunner:
                         "vwap_window": 20,
                         "vwap_threshold": 0.02,
                         "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                     }
                 }
                 hypotheses.append(hyp)
@@ -609,6 +679,11 @@ class AQDERunner:
                             "short_window": sw,
                             "long_window": lw,
                             "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                         }
                     }
                     hypotheses.append(hyp)
@@ -623,6 +698,11 @@ class AQDERunner:
                         "dual_mid": 21,
                         "dual_slow": 55,
                         "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                     }
                 }
                 hypotheses.append(hyp)
@@ -790,6 +870,11 @@ class AQDERunner:
                 result_data = {
                     "hypothesis_id": hyp_id,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                     "n_trades": n_trades,
                     "win_rate": win_rate,
                     # PnL absoluto en USD (final - initial), NO porcentaje
@@ -810,6 +895,11 @@ class AQDERunner:
                 results.append({
                     "hypothesis_id": hyp_id,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                     "status": "error",
                     "error": str(e)}
                 )
@@ -871,6 +961,11 @@ class AQDERunner:
                 wfv_results[hyp_id] = {
                     "hypothesis_id": hyp_id,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                     "robustness_score": wfv_result.robustness_score,
                     "parameter_stability": wfv_result.parameter_stability,
                     "is_stats": wfv_result.is_stats,
@@ -888,6 +983,11 @@ class AQDERunner:
                 wfv_results[hyp_id] = {
                     "hypothesis_id": hyp_id,
                     "symbol": symbol,
+                    # MEDIDO el 2026-10-01: sin la temporalidad, el backtester
+                    # asumia velas DIARIAS y el Sharpe de un backtest de 15m
+                    # salia anualizado como si cada vela fuera un dia. Se
+                    # propaga desde el runner, que si la sabe.
+                    "timeframe": self.timeframe,
                     "error": str(e),
                     "passed": False
                 }

@@ -662,9 +662,26 @@ class QuantMathAdapter:
 
         strategy_func = make_strategy(strategy_type)
 
+        # MEDIDO el 2026-10-01: la temporalidad NO viaja con la hipotesis, y
+        # sin ella el backtester asumia velas diarias. Un backtest de 15m
+        # anualizado como diario tiene un Sharpe que no se puede comparar con
+        # nada, y el score cientifico (pondero 0,5) se alimentaba de ahi.
+        #
+        # Se lee de donde exista y se DECLARA el origen: si no se sabe, se
+        # pasa `None` y el backtester usa la diaria declarada en vez de
+        # inventar una.
+        _tf = params.get("timeframe") or params.get("interval")
+        if _tf is None and isinstance(hypothesis, dict):
+            _tf = hypothesis.get("timeframe")
+        if _tf is None:
+            _tf = getattr(hypothesis, "timeframe", None)
+        if _tf is None and data:
+            _tf = data.get("timeframe")
+
         bt = Backtester(initial_capital=initial_capital)
         result = bt.run_backtest(strategy_func, price_dict,
-                                  initial_capital=initial_capital)
+                                  initial_capital=initial_capital,
+                                  timeframe=_tf)
 
         return result
 

@@ -102,7 +102,7 @@ def test_el_riesgo_sin_riesgo_tiene_la_misma_unidad_que_la_media():
     media_periodo = media_anual_objetivo / 252.0
     # Alternancia +-: mantiene el sigma acotado y hace la serie determinista.
     returns = np.array([media_periodo * (1 if i % 2 == 0 else -1)
-                        for i in range(n)])
+                        for i in range(n)]) + media_periodo
     media_anual_real = returns.mean() * 252
     assert media_anual_real < 0.02, (
         "la serie tiene que tener media anualizada por debajo del riesgo sin "
@@ -157,3 +157,112 @@ def test_una_estrategia_perdedora_no_puede_salir_con_drawdown_cero():
     assert dd > 5.0, (
         f"la equity cae de 100.000 a 94.079: el drawdown es de ~6% y el "
         f"motor devolvio {dd}")
+
+
+# ---------------------------------------------------------------------------
+# 4. La anualizacion depende de la temporalidad
+# ---------------------------------------------------------------------------
+
+def test_las_temporalidades_tienen_una_anualizacion_distinta():
+    """Un año tiene 35.040 velas de 15m, no 252.
+
+    MEDIDO el 2026-10-01: el numero de periodos al año estaba FIJO en 252
+    sin importar la temporalidad. Un backtest de 15m se annualizaba como si
+    cada vela fuera un dia de mercado, o sea 139 veces de error en el
+    numerador de la media y 11,8 en el de la desviacion.
+    """
+    ppa = PerformanceMetrics.periodos_por_anio
+    assert ppa("15m") == 35_040
+    assert ppa("1h") == 8_760
+    assert ppa("1d") == 365
+    assert ppa("5m") == 105_120
+    # 365,25 dias al año * 96 velas de 15m al dia.
+    assert ppa("15m") == pytest.approx(365.25 * 24 * 4, rel=0.001)
+
+
+def test_temporalidad_desconocida_cae_a_diaria_y_no_alla():
+    """Si no se sabe la temporalidad, se DECLARA la diaria. No se inventa."""
+    assert PerformanceMetrics.periodos_por_anio(None) == 365
+    assert PerformanceMetrics.periodos_por_anio("no-existe") == 365
+    assert PerformanceMetrics.periodos_por_anio("") == 365
+
+
+def test_la_misma_serie_da_un_sharpe_distinto_segun_la_temporalidad():
+    """El caso que hace visible el bug: la MISMA serie, dos anualizaciones.
+
+    Con el 252 fijo, una serie de 15m y la misma serie tratada como diaria
+    darian el mismo numero. Tiene que depender de la temporalidad.
+    """
+    rng = np.random.default_rng(3)
+    returns = rng.normal(0.0002, 0.002, size=400)
+    s_15m = PerformanceMetrics.sharpe_ratio(returns, periods_per_year=35_040)
+    s_diario = PerformanceMetrics.sharpe_ratio(returns, periods_per_year=365)
+    assert s_15m != s_diario, (
+        "el Sharpe no puede ser el mismo para 15m y para diario: eso es "
+        "exactamente lo que pasaba con el 252 fijo")
+    # Con la misma media y sigma, el Sharpe crece con sqrt(P).
+    assert s_15m > s_diario, "mas velas al año, mas periodos que promediar"
+
+
+def test_el_riesgo_sin_riesgo_se_escala_al_periodo():
+    """El termino tiene que restar en la MISMA unidad que la media.
+
+    Con media por periodo positiva pero menor que el riesgo sin riesgo
+    repartido, el Sharpe tiene que salir NEGATIVO. Si se restara el 2%
+    anual entero a una media de 15m, saldria absurdamente negativo; si no se
+    restara nada, positivo.
+    """
+    media_anual = 0.05            # la estrategia gana 5% al año
+    ppa = 35_040
+    media_periodo = media_anual / ppa
+    # Serie con media EXACTAMENTE `media_periodo`: una componente constante
+    # mas un ruido de suma cero. La primera version alternaba +x/-x, que tiene
+    # media CERO, y por eso el Sharpe salia negativo y el test fallaba por su
+    # cuenta y no por la del motor.
+    ruido = np.array([0.001 * (1 if i % 2 == 0 else -1) for i in range(2000)])
+    returns = media_periodo + ruido
+    assert returns.mean() == pytest.approx(media_periodo, rel=1e-9)
+    s = PerformanceMetrics.sharpe_ratio(returns, periods_per_year=ppa)
+    # Gana 5% contra 2% sin riesgo: tiene que ser positivo pero no enorme.
+    assert s > 0, f"gana {media_anual:.0%} contra 2% sin riesgo: positivo. Sale {s}"
+    # Y no puede ser desproporcionado: con P=35040, sqrt(P)=187, asi que un
+    # Sharpe "razonable" esta en el orden de unidades a decenas. Un 1e5
+    # significaria que el riesgo sin riesgo se esta restando sin escalar.
+    assert abs(s) < 1_000, f"Sharpe desproporcionado ({s}): el riesgo sin riesgo no se escalo"
+
+
+def test_run_backtest_acepta_la_temporalidad():
+    """El parametro tiene que existir y llegar a las metricas."""
+    import inspect
+    sig = inspect.signature(__import__("backtesting").Backtester.run_backtest)
+    assert "timeframe" in sig.parameters, (
+        "run_backtest no acepta temporalidad: entonces el Sharpe se "
+        "anualiza siempre como diario")
+
+
+def test_run_backtest_usa_la_temporalidad_que_le_pasan():
+    """TEST DE EXTREMO A EXTREMO del 252 fijo.
+
+    Los tests anteriores llamaban a `sharpe_ratio` directamente, asi que
+    esquivaban `run_backtest`, que es donde estaba el `_ppa = 252`. Al
+    reintroducir ese 252 la suite SEGUIA PASANDO: 14 de 14. Este test pasa
+    por `run_backtest`, que es el camino real, y por eso lo caza.
+    """
+    from backtesting import Backtester
+
+    precios = 100.0 * np.cumprod(1 + np.concatenate([
+        np.full(200, 0.0005), np.full(200, -0.0005)]))
+
+    def estrategia(_data):
+        return ([{'symbol': 'X', 'side': 'buy', 'quantity': 1}]
+                + [{'symbol': 'X', 'side': 'hold', 'quantity': 0}] * (len(precios) - 2)
+                + [{'symbol': 'X', 'side': 'sell', 'quantity': 1}])
+
+    bt = Backtester(initial_capital=10_000.0)
+    r_15m = bt.run_backtest(estrategia, {'X': precios}, timeframe="15m")
+    r_1d = bt.run_backtest(estrategia, {'X': precios}, timeframe="1d")
+    assert r_15m.sharpe_ratio != r_1d.sharpe_ratio, (
+        f"la MISMA serie da el mismo Sharpe a 15m y a diario "
+        f"({r_15m.sharpe_ratio:.4f}): la temporalidad no llega a las metricas")
+    assert r_15m.sharpe_ratio > r_1d.sharpe_ratio, (
+        "con la misma media y sigma, mas periodos al año da un Sharpe mayor")
