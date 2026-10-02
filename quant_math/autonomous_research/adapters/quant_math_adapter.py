@@ -402,7 +402,9 @@ class QuantMathAdapter:
 
     def run_backtest(self, hypothesis, data: Dict[str, Any] = None,
                     initial_capital: float = 100000.0,
-                synthetic: bool = False) -> Any:
+                synthetic: bool = False,
+                fraccion_capital: float = 1.0,
+                apalancamiento: float = 1.0) -> Any:
         """
         Run backtest using quant-math backtester.
 
@@ -525,7 +527,24 @@ class QuantMathAdapter:
         warmup = max(long_window, rsi_period, bb_period, breakout_window,
                      dual_slow, donchian_window, atr_window, vwap_window)
 
-        def make_strategy(stype):
+        def make_strategy(stype, qty_por_precio):
+            """`qty_por_precio[i]` es la cantidad a entrar en la barra `i`.
+
+            MEDIDO el 2026-10-02: antes la cantidad era la constante `1`, o
+            sea que el nocional era el PRECIO del activo. Con una cuenta de
+            100.000 eso da:
+
+                BTC  nocional 105.900  = 105,90% de la cuenta
+                ETH  nocional   2.552  =   2,55%
+                SOL  nocional     148  =   0,15%
+                XRP  nocional   2,17  =   0,0022%
+
+            La exposicion varia 50.000 veces entre el primero y el ultimo, y
+            por eso los cuatro simbolos NO se podian comparar: el "-0,0000%"
+            de XRP no era "no hay edge", era que una operacion movia 0,003
+            USDT. El dimensionamiento va POR FUERA, en el llamado al
+            backtester, que es quien sabe el equity de cada momento.
+            """
             def strategy(data_dict):
                 orders = []
                 in_position = False
@@ -650,17 +669,61 @@ class QuantMathAdapter:
                         )
 
                     if not in_position and buy_sig:
-                        orders.append({'symbol': symbol, 'side': 'buy', 'quantity': 1})
+                        orders.append({'symbol': symbol, 'side': 'buy',
+                                       'quantity': qty_por_precio[i]})
                         in_position = True
                     elif in_position and sell_sig:
-                        orders.append({'symbol': symbol, 'side': 'sell', 'quantity': 1})
+                        orders.append({'symbol': symbol, 'side': 'sell',
+                                       'quantity': qty_por_precio[i]})
                         in_position = False
                     else:
                         orders.append({'symbol': symbol, 'side': 'hold', 'quantity': 0})
                 return orders
             return strategy
 
-        strategy_func = make_strategy(strategy_type)
+        # DIMENSIONAMIENTO. El nocional de cada entrada es una fraccion
+        # FIJA del capital, no un numero de unidades. Medido el 2026-10-02:
+        # con `quantity=1` la exposicion iba del 105,90% de la cuenta en BTC
+        # al 0,0022% en XRP, y los simbolos no eran comparables.
+        #
+        # Fraccional y NO riesgo-por-stop a proposito: el riesgo por stop
+        # meteria en la comparacion una variable mas (distancia del stop) que
+        # es justo lo que se quiere MEDIR. Con fraccion fija, cada simbolo
+        # arriesga lo mismo y la unica diferencia entre ellos es la
+        # estrategia.
+        #
+        # `fraccion_capital` es un PARAMETRO con default 1,0 (100% del
+        # capital, sin apalancamiento implicito). Antes de esta fase el
+        # nocional era el precio, que para BTC daba 105,90%; cualquier otro
+        # valor cambia los numeros, asi que queda declarado y no escondido en
+        # una constante.
+        fraccion = float(fraccion_capital if fraccion_capital is not None else 1.0)
+        lev = max(1.0, float(apalancamiento or 1.0))
+        # MEDIDO el 2026-10-02: con el 100% del capital y apalancamiento 1 el
+        # backtest NO ABRE NINGUNA POSICION. El motor exige
+        # `current_capital >= margen + comision`, y con margen igual al nocional
+        # el 100% del capital mas la comision de entrada no cabe nunca. El
+        # resultado eran 0 operaciones en los 4 simbolos, que se lee como "la
+        # estrategia no genera senal" cuando lo que pasa es que no hay con que
+        # pagar el margen.
+        #
+        # Por eso el nocional es `fraccion del capital por apalancamiento`: lo
+        # que se compromete como margen es la fraccion, y el apalancamiento
+        # determina el nocional. Es la misma relacion que usa el sistema real,
+        # donde 5 USDT a 50x son 250 de nocional.
+        notional_objetivo = (max(0.0, min(fraccion, 1.0))
+                             * float(initial_capital) * lev)
+        # Cantidad por barra: el nocional objetivo dividido por el precio de
+        # ESA barra. Se usa el precio de la barra y no el ultimo, para que el
+        # dimensionamiento no dependa de donde se corte la serie.
+        precios_serie = np.asarray(close_prices, dtype=float)
+        con_precio = precios_serie > 0
+        qty_por_precio = np.zeros(len(precios_serie), dtype=float)
+        if notional_objetivo > 0:
+            qty_por_precio[con_precio] = notional_objetivo / precios_serie[con_precio]
+        qty_por_precio = np.round(qty_por_precio, 8)
+
+        strategy_func = make_strategy(strategy_type, qty_por_precio)
 
         # MEDIDO el 2026-10-01: la temporalidad NO viaja con la hipotesis, y
         # sin ella el backtester asumia velas diarias. Un backtest de 15m
@@ -678,7 +741,7 @@ class QuantMathAdapter:
         if _tf is None and data:
             _tf = data.get("timeframe")
 
-        bt = Backtester(initial_capital=initial_capital)
+        bt = Backtester(initial_capital=initial_capital, leverage=lev)
         result = bt.run_backtest(strategy_func, price_dict,
                                   initial_capital=initial_capital,
                                   timeframe=_tf)

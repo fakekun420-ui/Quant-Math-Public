@@ -90,3 +90,81 @@ resultado, no un fallo.
 La Fase 2 (buscar ventaja donde la literatura dice que existe) solo tiene
 sentido con el punto 1 arreglado, porque comparar cuatro símbolos medidos con
 exposiciones distintas no produce información.
+
+---
+
+# FASE 1b: dimensionamiento de posición
+
+## El bug
+
+El backtest entraba con `quantity=1`, o sea que **el nocional era el precio del
+activo**. Con una cuenta de 100.000:
+
+| Símbolo | Nocional de `quantity=1` | % de la cuenta |
+|---|---:|---:|
+| BTC | 105.900 | 105,90% |
+| ETH | 2.552 | 2,55% |
+| SOL | 148 | 0,15% |
+| XRP | 2,17 | 0,0022% |
+
+50.000 veces de diferencia. BTC se medía al 106% de la cuenta por accidente del
+precio, y en XRP una operación movía 0,003 USDT.
+
+## El arreglo
+
+Nocional = **fracción fija del capital × apalancamiento**, y la cantidad de cada
+barra = nocional / precio de esa barra.
+
+Fraccional y **no** riesgo-por-stop a propósito: el riesgo por stop metería en la
+comparación una variable más —la distancia del stop— que es justo lo que se
+quiere medir. Con fracción fija, cada símbolo arriesga lo mismo y lo único que
+cambia es la estrategia.
+
+## Un hallazgo del propio motor
+
+Con fracción 1,0 y apalancamiento 1 el backtest **no abre ninguna posición**:
+0 operaciones en los 4 símbolos. El motor exige `capital >= margen + comisión`, y
+con margen igual al nocional, el 100% del capital más la comisión de entrada no
+cabe nunca. Se lee como "la estrategia no genera señal" cuando lo que pasa es que
+no hay con qué pagar el margen.
+
+Además, **más exposición produce menos operaciones**, porque la cuenta muere
+antes. Medido en BTC a 50×: fracción 0,95 → 1 operación y 78.732 restantes;
+fracción 0,10 → 112 operaciones y 8.470. Eso es expectativa negativa acting sobre
+el capital, y con dimensionamiento la consequence es visible en el número de
+operaciones, no escondida en un porcentaje.
+
+## Resultado con exposición comparable (25% del capital)
+
+**3 de 32 con expectativa neta positiva, y ninguno con significación.**
+
+| Símbolo | Familia | n | wr% | esp% | **esp neta%** | dd% | **IC95 inf.** |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ETH | ATI | 48 | 39,6 | +0,3308 | **+0,2040** | 7,41 | **−275,31** |
+| SOL | ATI | 39 | 46,2 | +0,2530 | **+0,1262** | 14,34 | **−439,13** |
+| XRP | ATI | 37 | 32,4 | +0,1601 | **+0,0333** | 16,38 | **−836,01** |
+| ETH | Bollinger | 492 | 60,6 | −0,0458 | −0,1726 | 32,57 | −94,54 |
+| XRP | RSI | 474 | 55,5 | −0,0851 | −0,2119 | 43,18 | −136,44 |
+| SOL | RSI | 488 | 56,6 | −0,0707 | −0,1975 | 38,66 | −120,66 |
+
+Las tres positivas son **ATI**, y solo en los tres símbolos con más de 36
+operaciones. Pero sus intervalos de confianza contienen el cero con holgura:
+**ninguna es distinguible de una moneda al azar.**
+
+El resto sigue perdiendo, y hay combinaciones con **60,6% de aciertos que
+pierden**: cuando acierta gana poco y cuando falla pierde más.
+
+## Conclusión de la Fase 1
+
+1. **Ninguna de las 8 familias tiene ventaja demostrada a 15m con taker.**
+2. ATI es la única con señal positiva consistente en 3 símbolos, y no alcanza
+   significación con n=37–48.
+3. Para que ATI fuera concluyente harían falta del orden de **n=200 por
+   símbolo** al nivel de significación actual, o sea ~1.500 operaciones más.
+
+## Siguiente paso natural
+
+No es buscar más indicadores: es **probar ATI con exponente real** (más
+operaciones) y con costes de maker, que son 4,7× más baratos y reduces el
+margen de error. Con maker, un −0,13% neto pasa a −0,03%: el filtro de
+significancia cambiaría.
