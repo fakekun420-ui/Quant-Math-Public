@@ -255,3 +255,112 @@ que no compara nada pasa siempre.
 Mutación usada para comprobarlo: `pnl_pct × 1,5`. Con el test vacío daba
 `2 passed`; con el test arreglado da `1 failed`. Por eso el control de
 mutación es obligatorio y no opcional.
+
+---
+
+# FASE 1d: auditoría del modelo de coste
+
+## Qué se auditó y qué salió
+
+El modelo de coste del backtester, porque toda la Fase 1 restsó el coste "a
+mano" y eso-printa que el motor no lo hacía.
+
+## Error 1: el motor SÍ cobra, y yo lo desconté otra vez
+
+**Medido**: el motor descuenta **−0,2001%** por operación, que reconcilia con
+sus `commission_rate=0.001` por lado (0,2% ida y vuelta).
+
+Escribí en el informe que "el motor NO descuenta el coste: se sigue restando a
+mano". **Eso era falso** y came de no abrir el fichero antes de afirmarlo. Al
+restar 0,1268% encima, el coste se contó dos veces: 0,2% dentro + 0,1268%
+fuera. Todos los "neta%" de las fases anteriores eran **pesimos de más**.
+
+## Error 2: el 0,1268% es solo la comisión — falta el 77% del coste
+
+| Componente | Medido | Origen |
+|---|---:|---|
+| Comisión taker ida y vuelta | 0,1268% | medido |
+| **Spread (deslizamiento)** | **0,4270%** | medido (ask 1,591 vs last 1,5248 en XRP) |
+| **Subtotal real** | **0,5538%** | |
+| Funding (ATI mantiene 3–8,5 días) | +0,24% | medido, 12–25 cobros por operación |
+| **Total para ATI** | **0,79%** | |
+
+**Se ha estado descontando menos de un cuarto de lo que cuesta operar
+realmente.** El "0,1268%" es comisión pura.
+
+## Los dos defaults que mentían
+
+```python
+slippage_pct    = 0.0    #  ejecución perfecta
+funding_rate_8h = 0.0    #  mantener abierto es gratis
+```
+
+Y el adaptador no pasaba ninguno de los dos. **Todos los backtests del
+proyecto asumían ejecución perfecta y mantenimiento gratuito**, sin que
+estuviera escrito en ninguna parte. Un supuesto favorable que no se dice
+nunca es el que más caro sale.
+
+El funding en particular no era conservador sino **falso**: se midió
+negativo (los largos pagaban) de febrero a abril de 2026.
+
+## El arreglo
+
+`ModeloCoste` con los tres componentes medidos, **con fecha y exchange**, y
+`timeframe` pasando también al constructor (antes solo llegaba a
+`run_backtest`, así que el funding se habría calculado a temporalidad 1h
+equivale a 4 veces lo que toca).
+
+## El efecto sobre el veredicto
+
+Con el coste real, sobre ATI:
+
+| Tramo | neta antes (0,1268%) | **neta real (0,79%)** | **sin las 3 mejores** |
+|---|---:|---:|---:|
+| BTC 2025-2026 | +0,3880 | **−0,1515** | −0,9955 |
+| ETH 2025-2026 | +0,3892 | **−0,1296** | −1,6462 |
+| SOL 2025-2026 | +1,9730 | +1,4025 | **−0,3087** |
+| XRP 2025-2026 | +0,9094 | +0,3586 | **−2,3324** |
+
+```
+Tramos con expectativa NETA positiva:                    6 de 8
+Tramos con expectativa neta positiva SIN LAS 3 MEJORES:   1 de 8
+```
+
+**El coste correcto no crea el problema: lo revela.** Con 0,1268% parecía que
+6 de 8 tramos eran rentables. Con el coste real son 6 de 8, pero **al quitar
+las 3 mejores operaciones solo queda 1**, y ese (+0,0353%) es indistinguible
+del cero.
+
+## Dos cosas que parecían bugs y no lo eran
+
+1. **La reconciliación fallaba en SOL (3 de 4).** Al mirar una operación
+   suelta: la diferencia es de 0,02 puntos sobre un coste de 0,7%, y crece en
+   las operaciones ganadoras porque el nocional crece al salir. El motor
+   descuenta correctamente; mi comparación usaba la mediana de horas contra
+   la media de un coste que se cobra por operación.
+
+2. **El motor "cobra de más" (0,1395% en vez de 0,1268%).** La comisión de
+   salida se cobra sobre el nocional **ya subido**: al vender a 120 en vez de
+   a 100 se paga un 20% más. El motor estaba bien y la referencia era
+   ingenua.
+
+## Verificación
+
+- **499 tests verdes** (492 + 7 nuevos).
+- **Control de mutación triple**, los tres cazados:
+  - quitar el deslizamiento de la ruta de producción → 1 fallo
+  - quitar el funding de la ruta de producción → 1 fallo
+  - comisión ×2 en el motor → 2 fallos
+- `graphify update .` hecho. Sin CJK.
+
+## Lo que queda abierto
+
+- El **spread de 0,427%** se midió en XRP en un momento concreto. BTC y ETH
+  tienen spreads más ajustados, así que aplicar 0,427% a los cuatro es
+  conservador de más. **Falta medir el spread de cada símbolo.**
+- El funding de 0,01%/8h es un valor medio. **Falta la serie real** de funding
+  para el periodo backtesteado: en un tramo de funding negativo el coste real
+  es mucho mayor.
+- `ModeloCoste` es un número único. Las comisiones de Bybit **varían por par**
+  (BTC y XRP no tienen las mismas), así que un solo valor no puede ser
+  correcto para los cuatro símbolos.

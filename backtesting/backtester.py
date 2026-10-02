@@ -17,6 +17,83 @@ from datetime import datetime, timedelta
 from order_management import OrderManager, ExecutionReport
 
 
+@dataclass(frozen=True)
+class ModeloCoste:
+    """Lo que cuesta una operacion ida y vuelta, MEDIDO en el exchange.
+
+    POR QUE ESTA CLASE Y NO TRES PARAMETROS SUELTOS
+    ----------------------------------------------
+    MEDIDO el 2026-10-02: el motor se construia con los valores por defecto,
+    que son `slippage_pct=0.0` y `funding_rate_8h=0.0`. Eso significa que
+    TODOS los backtests del proyecto asumian ejecucion perfecta y funding
+    gratis, sin decirlo en ninguna parte. Un backtest cuyo modelo de coste se
+    calla no se puede auditar, y aqui el silencio iba en la direccion
+    favorable: hacia una expectativa mejor que la real.
+
+    Reagruparlos en un objeto con nombre hace que el coste se pueda leer, pasar
+    por parametro y comparar, en vez de estar repartido en defaults que nadie
+    mira.
+
+    LOS TRES COMPONENTES
+    --------------------
+    comision_por_lado      La cobra el exchange en cada relleno. Se descuenta
+                           en entrada y en salida, o sea que ida y vuelta es
+                           el doble.
+    deslizamiento_por_llenado
+                           Media bid/ask pagada de mas en cada relleno. Se
+                           aplica en contra (`_adverse_fill`).
+    funding_por_8h        Perpetuo: se paga cada 8 horas por mantener abierto.
+                           Es el unico de los tres que depende de cuanto se
+                           mantiene la posicion, no de cuantas operaciones se
+                           hacen.
+
+    DE DONDE SALEN LOS NUMEROS
+    --------------------------
+    Medidos contra Bybit el 2026-10-02, no copiados de la documentacion:
+      * taker ida y vuelta 0,1268%  ->  0,000634 por lado
+      * maker ida y vuelta 0,0268%  ->  0,000134 por lado
+      * spread medido en XRP 0,427% (ask 1,591 contra last 1,5248), o sea
+        0,2135% de deslizamiento adverse por relleno.
+    Los tres vienen con la FECHA porque un exchange cambia sus comisiones y un
+    numero sin fecha no es un dato, es un recuerdo.
+    """
+
+    comision_por_lado: float = 0.000634
+    deslizamiento_por_llenado: float = 0.002135
+    funding_por_8h: float = 0.0001
+    #: Que se mido cada numero y cuando. Sin esto, un modelo de coste sin
+    #: fecha parece tan preciso como uno al dia.
+    medido_el: str = "2026-10-02"
+    #: Que exchange se midio. Las comisiones cambian por par y por nivel de
+    #: VIP: BTC no tiene las mismas que XRP.
+    exchange: str = "bybit"
+
+    def ida_y_vuelta_pct(self) -> float:
+        """Coste de UNA operacion completa, en %, sin funding.
+
+        El funding se deja fuera a proposito: depende de cuanto se mantiene
+        la posicion, que es distinto en cada estrategia, y meterlo aqui
+        haria que dos estrategias distintas se compararan con el mismo coste
+        de mantenimiento sin serlo.
+        """
+        return (self.comision_por_lado * 2
+                + self.deslizamiento_por_llenado * 2) * 100.0
+
+    def coste_por_operacion_pct(self, horas_mantenido: float = 0.0) -> float:
+        """Coste total de una operacion, en %, con el funding incluido."""
+        base = self.ida_y_vuelta_pct()
+        if horas_mantenido > 0.0:
+            base += self.funding_por_8h * (horas_mantenido / 8.0) * 100.0
+        return base
+
+
+#: Por defecto, taker con el spread MEDIDO, no ejecucion perfecta. Antes el
+#: motor venia con deslizamiento 0 y funding 0, y todo backtest del proyecto
+#: salia favorecido sin que constara por que.
+COSTE_TAKER = ModeloCoste()
+COSTE_MAKER = ModeloCoste(comision_por_lado=0.000134)
+
+
 @dataclass
 class Trade:
     """Represents a single trade."""
@@ -671,13 +748,23 @@ class Backtester:
             Minimum commission
         slippage_pct : float
             Adverse slippage per fill as fraction (e.g. 0.0001 = 1bp).
-            0.0 preserves legacy exact-fill behaviour.
+            0.0 significa EJECUCION PERFECTA, y se conserva solo por
+            compatibilidad con los tests que asertan aritmetica sobre
+            precios desnudos. MEDIDO el
+            2026-10-02: a spread real de 0,427% en XRP, asi que un backtest
+            con 0,0 se esta atribuyendo una ejecucion que el exchange no
+            concede. Para produccion usa `ModeloCoste`.
         leverage : float
             Position leverage. 1.0 = spot (legacy behaviour). >1 scales PnL,
             posts margin instead of full notional, and enables liquidation.
         funding_rate_8h : float
             Perpetual funding rate per 8h as fraction of notional
-            (e.g. 0.0001 = 0.01%). 0.0 disables.
+            (e.g. 0.0001 = 0.01%). 0.0 lo desactiva, y desactivarlo es
+            asumir que mantener una posicion abierta es gratis. MEDIDO el
+            2026-10-02: el
+            funding fue NEGATIVO (los largos pagaban) de febrero a abril de
+            2026, asi que ignorarlo no es conservador, es falso. Para
+            produccion usa `ModeloCoste`.
         timeframe : str
             Candle timeframe ('1m','5m','15m','1h','4h','1d') used to convert
             bars held into hours for funding accrual.

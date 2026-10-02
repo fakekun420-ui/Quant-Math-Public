@@ -27,7 +27,8 @@ except ImportError:
     EXTERNAL_KNOWLEDGE_BASE = False
 
 try:
-    from backtesting import Backtester, BacktestResult, PerformanceMetrics, Trade
+    from backtesting import (Backtester, BacktestResult, PerformanceMetrics,
+                            Trade, COSTE_TAKER)
     from order_management import OrderManager
     import numpy as np
     import pandas as pd
@@ -404,7 +405,8 @@ class QuantMathAdapter:
                     initial_capital: float = 100000.0,
                 synthetic: bool = False,
                 fraccion_capital: float = 1.0,
-                apalancamiento: float = 1.0) -> Any:
+                apalancamiento: float = 1.0,
+                coste=None) -> Any:
         """
         Run backtest using quant-math backtester.
 
@@ -741,7 +743,32 @@ class QuantMathAdapter:
         if _tf is None and data:
             _tf = data.get("timeframe")
 
-        bt = Backtester(initial_capital=initial_capital, leverage=lev)
+        # COSTE. MEDIDO el 2026-10-02: aqui se construia el motor sin pasarle
+        # ni comision ni deslizamiento ni funding, o sea que TODOS los
+        # backtests del proyecto asumian ejecucion perfecta y mantenimiento
+        # gratis. No era un error de cuentas, era un supuesto favorable que no
+        # estaba escrito en ninguna parte, que es la forma de error de la que
+        # no te enteras.
+        #
+        # El coste entra por parametro (`coste`), no por constante dentro, para
+        # que comparar dos estrategias con taker y con maker sea una llamada y
+        # no una reescritura. Y `ModeloCoste` lleva la FECHA de la medicion:
+        # las comisiones de un exchange cambian y un numero sin fecha no es un
+        # dato.
+        if coste is None:
+            coste = COSTE_TAKER
+        # `timeframe` va TAMBIEN al constructor, no solo a `run_backtest`.
+        # MEDIDO: solo se le pasaba a `run_backtest`, asi que el motor
+        # conversaba barras a horas con su valor por defecto de 1h. Con
+        # funding en cero eso no se notaba; en cuanto se activa, el funding de
+        # una estrategia de 15m se calculaba como si fuese de 1h, o sea 4
+        # veces mas barato de lo que es.
+        bt = Backtester(
+            initial_capital=initial_capital, leverage=lev,
+            commission_rate=coste.comision_por_lado,
+            slippage_pct=coste.deslizamiento_por_llenado,
+            funding_rate_8h=coste.funding_por_8h,
+            timeframe=_tf or "1h")
         result = bt.run_backtest(strategy_func, price_dict,
                                   initial_capital=initial_capital,
                                   timeframe=_tf)
