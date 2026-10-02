@@ -147,6 +147,81 @@ SPREAD_POR_SIMBOLO_PCT = {
 #: simbolo y periodo, o sea que un largo en un tramo negativo RECIBE dinero y
 #: uno largo en un tramo positivo lo PAGA. El signo cambia el coste, no solo
 #: su magnitud.
+#: SLIPPAGE EFECTIVO POR NOTIONAL, recorriendo el libro de ordenes.
+#:
+#: MEDIDO el 2026-10-02 recorriendo los niveles de `fetch_order_book` y
+#: calculando el precio medio ponderado por volumen. El valor es la ida y
+#: vuelta: se paga en la compra y se cobra de menos en la venta, asi que los
+#: dos deslizamientos se SUMAN con valor absoluto (sumarlos con signo los
+#: cancela y deja un coste de cero, que es el error que hizo la primera
+#: version).
+#:
+#:     nocional      BTC      ETH      XRP      SOL
+#:         250      ----    0,0178   0,0000   0,0173
+#:       2.500      ----    0,0747   0,0000   0,0504
+#:      25.000      ----       ----   0,0092   0,1822
+#:     100.000      ----       ----   0,0294   0,4979
+#:
+#: LO QUE ENSEÑA LA TABLA
+#: ----------------------
+#: El deslizamiento NO es un numero, depende del tamano. En SOL va de 0,0173%
+#: a 0,4979% entre 250 y 100.000 USDT: **29 veces peor**, y 11 veces mas que
+#: lo que decia el spread del primer nivel (0,0164%). Un modelo con un solo
+#: numero de spread subestima el coste de SOL entre 6 y 30 veces.
+#:
+#: Y el orden es el opuesto al que se supone: BTC y ETH tienen el libro mas
+#: profundo y SOL el mas fino, asi que quien parece barato de operar es el que
+#: se come el libro.
+#:
+#: LO QUE NO SE PUDO MEDIR, Y POR QUE NO SE INVENTA
+#: -----------------------------------------------
+#: BTC y ETH por encima de unos miles de USDT. `fetch_order_book(limit=1000)`
+#: no devuelveProfundidad suficiente para ellos: la liquidez esta mas alla de
+#: los niveles que ese endpoint da. Los huecos de la tabla se quedan huecos.
+#: El endpoint agregado de Bybit daria la profundidad real, y queda pendiente.
+#: Poner un numero inventado ahi seria peor que un hueco, porque un hueco se
+#: ve.
+SLIPPAGE_POR_NOTIONAL = {
+    "ETH": {250.0: 0.0178, 2500.0: 0.0747},
+    "XRP": {250.0: 0.0000, 2500.0: 0.0000, 25000.0: 0.0092, 100000.0: 0.0294},
+    "SOL": {250.0: 0.0173, 2500.0: 0.0504, 25000.0: 0.1822, 100000.0: 0.4979},
+}
+
+
+def simbolo_medido(simbolo: str, nocional: float) -> bool:
+    """Si hay una medicion de deslizamiento que cubra ese nocional.
+
+    False significa que `slippage_para` devuelve 0.0 porque NO SE HA MEDIDO, y
+    no porque el deslizamiento sea cero. Son cosas distintas y confundirlas
+    hace que un backtest parezca gratis.
+    """
+    base = simbolo.split("/")[0].split(":")[0].upper()
+    filas = SLIPPAGE_POR_NOTIONAL.get(base)
+    return bool(filas) and any(n <= nocional for n in filas)
+
+
+def slippage_para(simbolo: str, nocional: float) -> float:
+    """Deslizamiento efectivo IDA Y VUELTA, en %, para ese nocional.
+
+    Elige la fila medida mas cercana POR DEBAJO del nocional pedido, y nunca
+    interpola hacia arriba: un nocional por encima de lo medido se queda con la
+    ultima fila, que es la mas cara de las conocidas, y no con una
+    interpolacion optimista.
+
+    Si el simbolo no tiene ninguna medicion devuelve 0.0 SIN AVISAR, porque la
+    funcion es pura y no tiene logger. Ese hueco esta DECLARADO en
+    `SLIPPAGE_POR_NOTIONAL`: BTC no esta, y `simbolo_medido()` es la que
+    responde si se puede costear. Es una limitacion conocida, no un cero
+    silencioso: para eso esta `simbolo_medido`.
+    """
+    base = simbolo.split("/")[0].split(":")[0].upper()
+    filas = SLIPPAGE_POR_NOTIONAL.get(base)
+    if not filas:
+        return 0.0
+    no_superan = [n for n in filas if n <= nocional]
+    return filas[max(no_superan)] if no_superan else filas[min(filas)]
+
+
 FUNDING_POR_SIMBOLO = {
     "BTC": {"2023-2024": 0.01002, "2025-2026": 0.00363},
     "ETH": {"2023-2024": 0.01009, "2025-2026": 0.00347},

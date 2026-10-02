@@ -489,3 +489,78 @@ mintiendo.
 - Las **comisiones por par** no se han podido leer: el endpoint público de
   grupos de comisiones devuelve `retCode 10001`. Sigue usándose 0,000634 por
   lado para los cuatro, que es el valor taker estándar medido en BTC.
+
+---
+
+# FASE 1f: el deslizamiento de verdad, que no es el spread
+
+## Qué se midió
+
+Recorriendo el libro de órdenes nivel a nivel y calculando el precio medio
+ponderado por volumen. Ese alejamiento respecto al mejor nivel **es** el
+deslizamiento efectivo, y es lo que se paga de verdad.
+
+## El deslizamiento no es un número: depende del nocional
+
+Ida y vuelta, en %:
+
+| Nocional | BTC | ETH | XRP | SOL |
+|---:|---:|---:|---:|---:|
+| 250 | sin medir | 0,0178 | 0,0000 | 0,0173 |
+| 2.500 | sin medir | 0,0747 | 0,0000 | 0,0504 |
+| 25.000 | sin medir | sin medir | 0,0092 | **0,1822** |
+| 100.000 | sin medir | sin medir | 0,0294 | **0,4979** |
+
+**En SOL va de 0,0173% a 0,4979%: 29 veces peor**, y a 25.000 USDT es
+0,1822%, que es **11 veces** lo que decía el spread del primer nivel
+(0,0164%).
+
+El spread del primer nivel solo dice el precio al que se ejecuta una cantidad
+**mínima**. Un nocional real se come niveles. Un modelo con un solo número de
+spread subestima el coste de SOL entre 6 y 30 veces.
+
+**Y el orden es el opuesto al que se supone:** BTC y ETH tienen el libro más
+profundo y SOL el más fino. Quien parece barato de operar es el que se come el
+libro.
+
+## Tres errores midiendo esto
+
+1. **Sumar los dos lados con signo.** En compra el deslizamiento es positivo y
+   en venta negativo, así que sumarlos **los cancela** y deja un coste de
+   cero. Es `compra + |venta|`.
+2. **Contar niveles de tamaño cero.** Sin filtrarlos, en BTC salían 393
+   niveles para 250 USDT — 0,64 USDT por nivel — y un deslizamiento del 0,10%,
+   **860 veces** el spread del primer nivel. El libro más profundo del mundo
+   aparecía como el más caro, al revés de lo real.
+3. **Mi docstring mentía.** Decía que la función "lo dice" cuando un símbolo no
+   tiene medición, y no lo dice: es pura y no tiene logger. Ahora existe
+   `simbolo_medido()`, que sí responde.
+
+## Lo que no se pudo medir, y se deja como hueco
+
+**BTC y ETH por encima de unos miles de USDT.** `fetch_order_book(limit=1000)`
+no devuelve profundidad suficiente para ellos: su liquidez está más allá de los
+niveles que ese endpoint da. Los huecos se quedan huecos. El endpoint agregado
+de Bybit daría la profundidad real y queda pendiente.
+
+Un hueco declarado es información. Poner un número inventado ahí sería peor,
+porque el hueco se ve y el número inventado no.
+
+## Qué NO cambia
+
+El coste con profundidad sigue por debajo de la expectativa de ATI: en SOL a
+25.000 USDT el deslizamiento real es 0,1822% frente a una expectativa neta de
++1,94%. **No vuelca el veredicto, pero sí el dimensionamiento**: a 100.000 USDT
+el mismo SOL cuesta 0,4979% solo en deslizamiento.
+
+Y el hallazgo de fondo sigue igual, porque es sobre la forma de la
+distribución y no sobre su nivel: **0 de 8 tramos con significación, y solo 2
+de 8 sobreviven a quitar las 3 mejores operaciones.**
+
+## Verificación
+
+- **507 tests verdes** (503 + 4 nuevos).
+- **Control de mutación triple, los tres cazados**:
+  - usar el spread del primer nivel como si fuera el real → 4 fallos
+  - devolver la fila más barata para un nocional sin medir → 3 fallos
+  - `simbolo_medido()` diciendo "medido" cuando no lo está → 1 fallo

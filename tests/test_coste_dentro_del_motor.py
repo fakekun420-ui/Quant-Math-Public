@@ -256,3 +256,64 @@ def test_el_spread_se_aplica_por_simbolo_y_no_a_todos_igual():
     sol = BT.coste_para("SOL/USDT:USDT", periodo="2025-2026")
     assert btc.ida_y_vuelta_pct() < sol.ida_y_vuelta_pct(), (
         "BTC no puede costar lo mismo que SOL: sus libros no se parecen")
+
+
+# ---------------------------------------------------------------------------
+# El deslizamiento EFFECTIVO, que no es el spread del primer nivel.
+# MEDIDO el 2026-10-02 recorriendo el libro de ordenes.
+# ---------------------------------------------------------------------------
+
+def test_el_deslizamiento_crece_con_el_nocional():
+    """Un numero unico de spread subestima el coste, y mucho.
+
+    MEDIDO: en SOL el deslizamiento de ida y vuelta va de 0,0173% con 250 USDT
+    a 0,4979% con 100.000. Son 29 veces, y a 25.000 USDT es 0,1822%, que es
+    11 veces el spread del primer nivel (0,0164%).
+
+    La razon es que el spread del primer nivel solo dice el precio al que se
+    ejecuta una cantidad MINIMA. Un nocional real se come niveles.
+    """
+    import backtesting.backtester as BT
+    sol = [BT.slippage_para("SOL/USDT:USDT", n)
+           for n in (250.0, 2500.0, 25000.0, 100000.0)]
+    assert sol == sorted(sol), f"el deslizamiento tiene que crecer: {sol}"
+    assert sol[-1] > sol[0] * 20, (
+        f"en SOL el deslizamiento solo se multiplica por {sol[-1]/sol[0]:.1f} "
+        f"entre 250 y 100.000 USDT, y lo medido es 29 veces")
+    assert sol[2] > BT.SPREAD_POR_SIMBOLO_PCT["SOL"] * 2 * 10, (
+        "a 25.000 USDT el deslizamiento real tiene que ser MAS que diez veces "
+        "el spread del primer nivel por los dos lados, no solo un poco mas")
+
+
+def test_un_slippage_de_un_tick_no_puede_valer_para_un_nocional_real():
+    """Si el deslizamiento fuera igual al spread del primer nivel, el recorrido
+    del libro no habriaaportado nada. Y el recorrido es justo lo que cambia el
+    numero en SOL."""
+    import backtesting.backtester as BT
+    primero_x2 = BT.SPREAD_POR_SIMBOLO_PCT["SOL"] * 2
+    real = BT.slippage_para("SOL/USDT:USDT", 100000.0)
+    assert real > primero_x2 * 10, (
+        f"el recorrido del libro da {real:.4f}% y el primer nivel {primero_x2:.4f}%. "
+        f"Si salieran parecidos, o el recorrido esta mal o el modelo no lo usa")
+
+
+def test_una_fila_no_medida_no_se_confunde_con_cero():
+    """BTC no tiene profundidad medida. Devolver 0,0 sin avisar es lo que hace
+    que un backtest parezca gratis, asi que tiene que existir una forma de
+    preguntar."""
+    import backtesting.backtester as BT
+    assert not BT.simbolo_medido("BTC/USDT:USDT", 25000.0), (
+        "BTC no tiene profundidad medida a 25.000: pedirla tiene que decir que "
+        "no se sabe, no devolver 0")
+    assert BT.slippage_para("BTC/USDT:USDT", 25000.0) == 0.0
+    # Y un simbolo que SI esta medido no puede dar el mismo cero sin que se note
+    assert BT.simbolo_medido("SOL/USDT:USDT", 25000.0), "SOL si esta medido"
+
+
+def test_nunca_interpola_hacia_arriba():
+    """Un nocional por encima de lo medido se queda con la fila mas cara."""
+    import backtesting.backtester as BT
+    ultima = BT.SLIPPAGE_POR_NOTIONAL["SOL"][100000.0]
+    assert BT.slippage_para("SOL/USDT:USDT", 500000.0) == ultima, (
+        "pedir 500.000 USDT y devolver menos que lo medido a 100.000 seria "
+        "optimista por construccion")
