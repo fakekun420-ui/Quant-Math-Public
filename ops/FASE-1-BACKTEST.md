@@ -168,3 +168,90 @@ No es buscar más indicadores: es **probar ATI con exponente real** (más
 operaciones) y con costes de maker, que son 4,7× más baratos y reduces el
 margen de error. Con maker, un −0,13% neto pasa a −0,03%: el filtro de
 significancia cambiaría.
+
+---
+
+# FASE 1c: ATI sobre 1.249 días, y dos errores míos al medirlo
+
+## Qué se amplió
+
+480.000 velas (1.249 días, del **2023-05-01**). El histórico nuevo es la subida
+de 2023 y el ciclo del halving de 2024, o sea **un régimen de mercado distinto**
+al de los 468 días iniciales.
+
+## Resultado bruto: 8/8 tramos con expectativa neta positiva
+
+Con taker y con maker, en los cuatro símbolos y en los dos cortes
+(2025-01-01). Eso, sobre el papel, es señal consistente.
+
+## Error mío nº1: la línea base estaba medida en otra escala
+
+Comparé ATI con "comprar y esperar 40 barras" y salió 8/8 a favor de ATI.
+
+**Los 40 barras los inventé yo.** Medido, ATI mantiene la posición una mediana
+de **383 a 820 velas**, o sea **4 a 8,5 días**, no 10 horas. Comparé una
+línea base de 10 horas contra una estrategia de 8 días. Esa comparación no
+significa nada y **queda anulada**.
+
+## Error mío nº2: "el backtester mira al futuro" — falso
+
+La mejor operación de ATI sobre SOL 2023-2024 daba **+177,85%**, y el mejor
+movimiento real de 40 barras de ese tramo era **+31,62%**: 5,62×, imposible.
+Conclusión inmediata: el motor se inventa retornos.
+
+**Era falso, y por el mismo error.** Con el horizonte correcto (medido: 820
+velas) el máximo real del tramo es +70,38%, y un movimiento de +177% en 820
+velas **sí ocurre** en SOL durante el squeeze de 2023.
+
+Comprobado operación por operación, cada `pnl_pct` contra el retorno real de
+**su propio** tramo de entrada a salida leído del CSV:
+
+```
+Operaciones comprobadas:               418
+Operaciones que exceden el retorno real:  0
+```
+
+**El motor no se inventa nada y la Fase 1 no está contaminada.** Queda
+fijado como test en `tests/test_backtester_no_inventa_retornos.py`.
+
+## Lo que sí queda en pie: la ventaja son unas 3 operaciones
+
+| Tramo | con todo | sin la mejor | **sin las 3 mejores** | las 3 mejores |
+|---|---:|---:|---:|---|
+| BTC 2023-2024 | +1,7092 | +0,9064 | **−0,2433** | +51,61 · +36,24 · +34,81 |
+| BTC 2025-2026 | +0,1880 | −0,1504 | **−0,6560** | +19,94 · +14,88 · +13,39 |
+| ETH 2023-2024 | +0,8957 | +0,4758 | **−0,3110** | +26,22 · +25,79 · +21,04 |
+| ETH 2025-2026 | +0,1892 | −0,3682 | **−1,3273** | +36,55 · +33,10 · +26,85 |
+| XRP 2023-2024 | +2,8221 | −1,1146 | **−2,8170** | +152,54 · +32,17 · +27,14 |
+| XRP 2025-2026 | +0,7092 | −0,4835 | **−1,9818** | +55,70 · +37,71 · +27,50 |
+| SOL 2023-2024 | +9,1087 | +3,6696 | +0,5186 | +177,85 · +53,62 · +45,35 |
+| SOL 2025-2026 | +1,7728 | +1,2072 | +0,0615 | +30,18 · +29,72 · +27,95 |
+
+(esperanza neta con taker, en % por operación)
+
+**En 6 de 8 tramos la ventaja desaparece al quitar las 3 mejores operaciones.**
+Sobre 418 operaciones totales, unas 24 sostienen el resultado. Los tres
+supervivientes (los dos de SOL) quedan en +0,52% y +0,06%: indistinguibles del
+cero, y ya con elIntervalo de confianza abierto.
+
+## Veredicto de la Fase 1c
+
+1. **El motor es correcto.** Verificado por invariante sobre 418 operaciones.
+2. **ATI no tiene ventaja demostrada.** Su expectativa media es real pero la
+   sostienen unas 3 operaciones por tramo; ninguna variante pasa el filtro de
+   significancia (0 de 8 con IC95 entero por encima de cero, con taker y con
+   maker).
+3. **Más histórico no arregla esto**: de 468 a 1.249 días el número de
+   operaciones fue de ~30-48 a 32-66 por tramo, y el intervalo siguió
+   incluyendo el cero con holgura.
+
+## Nota sobre el test del invariante
+
+La primera versión del test **pasaba con el bug presente**, y no por casualidad:
+trataba `entry_time` como marca de tiempo cuando son índice de barra, así que
+el guard de rango se comía todas las operaciones y no comparaba nada. Un test
+que no compara nada pasa siempre.
+
+Mutación usada para comprobarlo: `pnl_pct × 1,5`. Con el test vacío daba
+`2 passed`; con el test arreglado da `1 failed`. Por eso el control de
+mutación es obligatorio y no opcional.
