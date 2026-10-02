@@ -31,8 +31,8 @@ try:
                             Trade, COSTE_TAKER)
     from backtesting.backtester import (coste_para, periodo_para,
                                    slippage_para, simbolo_medido,
-                                   cuotas_funding_por_barra, leer_funding,
-                                   SEGUNDOS_POR_VELA)
+                                   cuotas_funding_completas,
+                                   leer_funding, SEGUNDOS_POR_VELA)
     from order_management import OrderManager
     import numpy as np
     import pandas as pd
@@ -816,9 +816,21 @@ class QuantMathAdapter:
                 _ini = int(pd.to_datetime(_ts.iloc[0]).timestamp() * 1000)
                 _fin = int(pd.to_datetime(_ts.iloc[-1]).timestamp() * 1000)
                 _serie = leer_funding(_simbolo or "", _ini, _fin)
-                if _serie:
-                    _cuotas = cuotas_funding_por_barra(
-                        _ini, _tf, _serie, len(_marco))
+                _tasa_periodo = getattr(coste, "funding_por_8h", None) or None
+                if _serie or _tasa_periodo:
+                    # `completas` y no `por_barra`: con la serie a medias, los
+                    # cobros sin dato se quedan en CERO y el motor cobra solo
+                    # la suma, o sea que la parte sin cobertura SE COBRA A
+                    # CERO. MEDIDO el 2026-10-02: con 20 cobros de 63 se
+                    # perdia el 37% del funding del periodo, en silencio.
+                    _cuotas, _rellenados = cuotas_funding_completas(
+                        _ini, _tf, _serie, len(_marco), _fin, _tasa_periodo)
+                    if _rellenados:
+                        logger.warning(
+                            "[coste] %s: la serie de funding cubre parte de la "
+                            "ventana y se han rellenado %d cobros con la tasa "
+                            "media del regimen. Es una estimacion, no el dato.",
+                            _simbolo, _rellenados)
             except Exception:
                 _cuotas = None
 

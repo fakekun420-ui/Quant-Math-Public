@@ -809,3 +809,94 @@ cambia el resultado más que cualquier otro número del modelo.
 - **Control de mutación, los dos cazados**:
   - invertir el signo del cobro → 1 fallo
   - prorratear en vez de sumar los cobros → 1 fallo
+
+---
+
+# FASE 1j: la cobertura de la serie, que era dinero gratis
+
+## Lo que se encontró al verificar que la serie llegaba
+
+La serie real **sí** estaba llegando: 1.918 cobros colocados sobre 1.917
+esperados, y su media (0,00270%) cuadra con la del régimen. Eso estaba bien.
+
+Lo que estaba mal era **qué pasa cuando la serie no cubre la ventana**:
+
+```
+cobros esperados en una ventana de 9 meses:  4.110
+cobros con dato:                             1.606
+cobros que se cobraban a CERO:               2.504
+```
+
+`cuotas_funding_por_barra` deja en cero los instantes sin dato, y como el
+motor con serie presente cobra **la suma** de las cuotas, la parte sin
+cobertura **se cobra a cero**. En un caso de prueba de 20 días: **37% del
+funding del periodo, gratis y en silencio**.
+
+Eso es **peor que el prorrateo** que arreglé en la fase anterior: allí al
+menos había una aproximación declarada. Aquí no había nada — ni aproximación,
+ni aviso, ni un cero que significara cero.
+
+## El arreglo
+
+`cuotas_funding_completas` rellena los cobros que faltan con la tasa media del
+régimen y **devuelve cuántos ha rellenado**, para que quien llama lo diga. El
+adaptador lo registra como `warning`.
+
+Sin `tasa_periodo` **no rellena nada**: rellenar con una tasa inventada sería
+cambiar un optimismo silencioso por otro. Lo que no se sabe no se rellena.
+
+| | cobros | suma de cuotas |
+|---|---:|---:|
+| Sin rellenar | 20 de 63 | 0,002000 |
+| Con rellenar | 63 de 63 | 0,003161 |
+
+## El respaldo sin serie también cobra cobros completos
+
+Sin serie, el motor prorrateaba: `tasa × horas / 8`. Ya se midió que con la
+serie real el cobro discreto sale **más caro en los 8 de 8 tramos**, o sea que
+prorratear **cobraba de menos**. El respaldo ahora cuenta cobros enteros
+(`horas // 8`) y va por debajo del discreto solo en los tramos que caen justo
+en un borde. Está declarado en el código.
+
+## Un `timeframe` omitido hacía el funding 4× grande
+
+Al escribir el test del respaldo, el motor contó 199 horas donde había 49,75:
+no se le estaba pasando `timeframe`, así que usaba su valor por defecto de
+**1h** con velas de 15m. **El funding salía cuatro veces grande.**
+
+El adaptador ya lo pasa (por el bug que ya se corrigió), y ahora hay un test
+que lo fija. Es la segunda vez que el mismo descuido aparece en dos sitios
+distintos, y por eso tiene que estar en la firma, no en un valor por defecto
+silencioso.
+
+## Una mutación que no la cazó nadie
+
+Reemplazar el adaptador por la variante **sin rellenar** daba
+**521 passed**. El test de `cuotas_funding_completas` sí que fallaba — hay
+que probarlo primero, no después de escribirlo. Añadido el test que comprueba
+que **el adaptador llama a la versión que rellena**, y la mutación ahora da
+1 fallo.
+
+**Un código bien probado y un código sin usar son cosas distintas**, y solo la
+segunda importa en producción.
+
+## Verificación
+
+- **522 tests verdes**.
+- **Control de mutación, los tres cazados**:
+  - no rellenar los huecos → 1 fallo
+  - volver al prorrateo en el respaldo → 1 fallo
+  - el adaptador usa la serie sin rellenar → 1 fallo
+
+## Estado del modelo de coste
+
+| Componente | Cómo está |
+|---|---|
+| Comisión | medida, con la publicada anotada al lado |
+| Deslizamiento primer nivel | medido **por símbolo** |
+| Deslizamiento de profundidad | medido **por nocional**, sin huecos |
+| Funding | serie **real por cobro**, con huecos rellenados y contados |
+| Suelo de comisión | sin deslizamiento ni funding, a propósito |
+
+Lo que **no** se puede cerrar y está escrito en el código: el spread
+histórico, que el exchange no publica y las velas no contienen.

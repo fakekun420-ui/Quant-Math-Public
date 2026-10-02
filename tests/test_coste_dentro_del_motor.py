@@ -510,3 +510,147 @@ def test_el_intervalo_de_funding_esta_confirmado_por_dos_vias():
     # 32 velas de 15 minutos por periodo de 8 horas: es lo que hace que los
     # cobros caigan en barras enteras y no entre dos.
     assert 8 * 3600 // 900 == 32
+
+
+def test_los_cobros_sin_dato_se_cobran_igual_y_no_a_cero():
+    """La parte sin cobertura se cobra a CERO, y eso es dinero gratis.
+
+    MEDIDO el 2026-10-02: con la serie a medias, `cuotas_funding_por_barra`
+    deja en cero los instantes sin dato, y como el motor cobra la SUMA, el
+    37% del funding de la ventana desaparecia en silencio. Peor que el
+    prorrateo que este mismo archivo arregla, porque aqui no hay ni una
+    aproximacion declarada.
+
+    Con `cuotas_funding_completas` los huecos se rellenan con la tasa del
+    regimen y se DEVUELVEN CUANTOS, para que el que llama pueda decirlo.
+    """
+    import backtesting.backtester as BT
+    n, paso, inicio = 2000, 900000, 1767225600000
+    fin = inicio + (n - 1) * paso
+    serie = {inicio + i * 28800000: 0.0001 for i in range(20)}   # de 63
+    sin = BT.cuotas_funding_por_barra(inicio, "15m", serie, n)
+    con, rellenados = BT.cuotas_funding_completas(
+        inicio, "15m", serie, n, fin, tasa_periodo=0.000027)
+    esperado = int((fin - inicio) // 28800000) + 1
+    assert int((sin != 0).sum()) == 20, "la serie parcial solo tiene 20"
+    assert int((con != 0).sum()) == esperado, (
+        f"con relleno hay {int((con != 0).sum())} cobros y se esperaban "
+        f"{esperado}: quedaria funding sin cobrar")
+    assert rellenados == esperado - 20, (
+        f"rellenados={rellenados} y la diferencia es {esperado - 20}")
+    assert float(con.sum()) > float(sin.sum()), "rellenar tiene que subir la suma"
+
+
+def test_sin_tasa_de_regimen_no_se_rellena_nada():
+    """Si no se dice con que tasa rellenar, se devuelve la serie tal cual.
+
+    Rellenar con una tasa inventada seria cambiar un optimismo silencioso por
+    otro. Sin `tasa_periodo` no se rellena, y quien llama se entera por el
+    numero de salida.
+    """
+    import backtesting.backtester as BT
+    inicio = 1767225600000
+    serie = {inicio + i * 28800000: 0.0001 for i in range(20)}
+    cuotas, rellenados = BT.cuotas_funding_completas(
+        inicio, "15m", serie, 2000, inicio + 1999 * 900000)
+    assert rellenados == 0, "sin tasa de regimen no hay nada con que rellenar"
+    assert int((cuotas != 0).sum()) == 20
+
+
+def test_el_respalpo_cobra_cobros_completos_y_no_una_fraccion():
+    """Sin serie, el cobro es por periodos COMPLETOS, no prorrateado.
+
+    MEDIDO: con la serie real el cobro discreto sale mas caro que el prorrateo
+    en los 8 de 8 tramos, o sea que prorratear cobraba de menos. El respaldo
+    tiene que hacer lo mismo: contar cobros enteros.
+    """
+    import numpy as np
+    from backtesting import Backtester
+    simbolo = "X/USDT:USDT"
+    n = 200                            # 50 horas de velas de 15m
+    precios = np.full(n, 100.0)
+
+    def entrar_salir(_data):
+        o = [{"symbol": simbolo, "side": "buy", "quantity": 1.0}]
+        o += [{"symbol": simbolo, "side": "hold", "quantity": 0}] * (n - 2)
+        o.append({"symbol": simbolo, "side": "sell", "quantity": 1.0})
+        return o
+
+    # MEDIDO AL ESCRIBIR ESTE TEST: sin `timeframe` el motor usa "1h" y
+    # cuenta 199 horas donde hay 49,75, o sea que el funding sale 4 veces
+    # grande. Es el mismo descuido que ya se corrigio en el adaptador, y aqui
+    # se ve por que tiene que estar en la FIRMA y no en un valor por defecto
+    # silencioso.
+    r = Backtester(initial_capital=100000.0, commission_rate=0.0,
+                   leverage=1.0, funding_rate_8h=0.001,
+                   timeframe="15m").run_backtest(
+        entrar_salir, {simbolo: precios}, initial_capital=100000.0)
+    assert r.trades
+    horas = (n - 1) * 0.25
+    cobros_completos = int(horas // 8)
+    assert horas // 8 == 6, f"{horas} horas dan {cobros_completos} cobros"
+    # El prorrateo habria cobrado 6,25 cobros. El respaldo tiene que cobrar 6.
+    assert abs(r.total_funding_paid - 100.0 * 0.001 * 6) < 1e-6, (
+        f"funding cobrado {r.total_funding_paid:.6f} y lo esperado por cobros "
+        f"completos es {100.0 * 0.001 * 6:.6f}. Si sale 6,25, el prorrateo ha "
+        f"vuelto.")
+
+
+def test_el_timeframe_llega_al_constructor_del_motor():
+    """Si `timeframe` no llega, el funding se cuenta con horas de otracosa.
+
+    MEDIDO: el motor convierte barras a horas con SU temporalidad, que por
+    defecto es "1h". Con velas de 15m sin pasarle el timeframe, 199 barras se
+    contaban como 199 horas en vez de 49,75, y el funding salia 4 veces
+    grande. El adaptador ya lo pasa, y este test lo fija.
+    """
+    import numpy as np
+    from backtesting import Backtester
+    simbolo = "X/USDT:USDT"
+    n = 200
+    precios = np.full(n, 100.0)
+
+    def entrar_salir(_data):
+        o = [{"symbol": simbolo, "side": "buy", "quantity": 1.0}]
+        o += [{"symbol": simbolo, "side": "hold", "quantity": 0}] * (n - 2)
+        o.append({"symbol": simbolo, "side": "sell", "quantity": 1.0})
+        return o
+
+    comunes = dict(initial_capital=100000.0, commission_rate=0.0,
+                   leverage=1.0, funding_rate_8h=0.001)
+    con_tf = Backtester(timeframe="15m", **comunes).run_backtest(
+        entrar_salir, {simbolo: precios}, initial_capital=100000.0)
+    sin_tf = Backtester(**comunes).run_backtest(
+        entrar_salir, {simbolo: precios}, initial_capital=100000.0)
+    assert sin_tf.total_funding_paid > con_tf.total_funding_paid * 3, (
+        f"sin timeframe se cobran {sin_tf.total_funding_paid:.4f} y con 15m "
+        f"{con_tf.total_funding_paid:.4f}: el factor 4 es el de 1h contra 15m")
+
+    import inspect
+    from quant_math.autonomous_research.adapters.quant_math_adapter import (
+        QuantMathAdapter)
+    src = inspect.getsource(QuantMathAdapter.run_backtest)
+    assert "timeframe=_tf or" in src, (
+        "el adaptador tiene que pasar timeframe AL CONSTRUCTOR, no solo a "
+        "run_backtest: al motor le afecta para el funding")
+
+
+def test_el_adaptador_usa_la_versión_que_rellena_los_huecos():
+    """MEDIDO el 2026-10-02: el test de `cuotas_funding_completas` cae, pero
+    el del adaptador NO. Es decir, el codigo de la serie esta probado y su
+    USO en la ruta de produccion no, que es donde estaba el dinero gratis.
+
+    Mutacion comprobada: cambiar el adaptador a `cuotas_funding_por_barra`
+    daba 521 passed con este test, y ahora tiene que dar un fallo.
+    """
+    import inspect
+    from quant_math.autonomous_research.adapters.quant_math_adapter import (
+        QuantMathAdapter)
+    src = inspect.getsource(QuantMathAdapter.run_backtest)
+    assert "cuotas_funding_completas(" in src, (
+        "el adaptador tiene que usar `cuotas_funding_completas`, no "
+        "`cuotas_funding_por_barra`: esta ultima deja en cero los cobros sin "
+        "dato y la parte sin cobertura SE COBRA A CERO. Medido: con 20 cobros "
+        "de 63 se perdia el 37% del funding del periodo, en silencio.")
+    assert "cuotas_funding_por_barra(" not in src, (
+        "queda una llamada a la variante que NO rellena")

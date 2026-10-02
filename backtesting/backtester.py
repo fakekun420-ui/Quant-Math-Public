@@ -339,6 +339,55 @@ def cuotas_funding_por_barra(ts_inicio_ms: int, timeframe: str,
     return cuotas
 
 
+def cuotas_funding_completas(ts_inicio_ms: int, timeframe: str,
+                             tasas_por_instante: Dict[int, float],
+                             n_velas: int, ts_fin_ms: Optional[int] = None,
+                             tasa_periodo: Optional[float] = None):
+    """Igual que `cuotas_funding_por_barra`, pero SIN huecos sin cobrar.
+
+    MEDIDO el 2026-10-02: con la serie a medias, `cuotas_funding_por_barra`
+    deja en CERO los instantes de cobro que no tiene dato, y como el motor con
+    serie presente cobra la SUMA de las cuotas, **la parte sin cobertura se
+    cobra a cero**. Medido: una ventana de 9 meses con 1.606 cobros de 4.110
+   -tenia el 61% del funding gratis y en silencio.
+
+    Eso es un optimismo silencioso, y peor que el prorrateo que este mismo
+    commit arregla: aqui no hay ni una aproximacion declarada, hay dinero que
+    no se cobra.
+
+    Asi que los cobros que faltan se rellenan con `tasa_periodo`, que es la
+    tasa media del regimen. No es la tasa real de ese instante (no se tiene),
+    pero es HONESTO: se cobra algo en todos los cobros y se dice cuantos se han
+    rellenado. Si no se pasa `tasa_periodo`, se devuelve la serie tal cual y el
+    numero de rellenos avisa de lo que falta.
+
+    Devuelve `(cuotas, n_rellenados)`.
+    """
+    cuotas = cuotas_funding_por_barra(ts_inicio_ms, timeframe,
+                                      tasas_por_instante, n_velas)
+    if cuotas is None:
+        return None, 0
+    if ts_fin_ms is None or tasa_periodo is None:
+        return cuotas, 0
+    paso = SEGUNDOS_POR_VELA[timeframe] * 1000
+    inicio = int(ts_inicio_ms)
+    fin = int(ts_fin_ms)
+    instantes_de_cobro = set(tasas_por_instante.keys())
+    rellenados = 0
+    # Se recorre la ventana en pasos de 8 horas alineados a la UNA de la
+    # madrugada, que es donde cobra el exchange (medido: 00:00, 08:00 y 16:00).
+    primer_cobro = ((inicio // 28800000) + 1) * 28800000
+    t = primer_cobro
+    while t <= fin:
+        if t not in instantes_de_cobro:
+            j = (t - inicio) // paso
+            if 0 <= j < n_velas:
+                cuotas[int(j)] += float(tasa_periodo)
+                rellenados += 1
+        t += 28800000
+    return cuotas, rellenados
+
+
 def leer_funding(symbolo: str, ts_inicio_ms: int, ts_fin_ms: int,
                  ruta: Optional[str] = None) -> Dict[int, float]:
     """La serie real de funding de un simbolo, acotada a la ventana.
@@ -1154,7 +1203,17 @@ class Backtester:
         if self.funding_rate_8h == 0.0:
             return 0.0
         hours = bars_held * self._timeframe_hours()
-        return notional * self.funding_rate_8h * (hours / 8.0)
+        # MEDIDO el 2026-10-02: con la serie real, el cobro DISCRETO sale mas
+        # caro que el prorrateo en los 8 de 8 tramos medidos, o sea que
+        # prorratear COBRABA DE MENOS. Por eso el respaldo sin serie cobra
+        # cobros COMPLETOS y no una fraccion: `horas // 8` cobros.
+        #
+        # Sin marcas de tiempo no se puede saber si una posicion cruza un
+        # instante de cobro o va justa a un lado, asi que se cuentan los
+        # cobros completos. Va por debajo del discreto en los tramos que caen
+        # justo en un borde, y eso esta declarado en vez de escondido.
+        cobros = int(hours // 8)
+        return notional * self.funding_rate_8h * cobros
 
     def _liq_price_long(self, entry_price: float) -> Optional[float]:
         """Liquidation price for a long at configured leverage (None if spot)."""
