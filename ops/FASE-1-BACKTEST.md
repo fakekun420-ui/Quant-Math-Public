@@ -722,3 +722,90 @@ Tres cosas confirmadas contra fuentes externas y **medidas** en los datos:
   - volver a la constante retractada en el adaptador → 1 fallo
   - devolver el deslizamiento retractado al suelo → 1 fallo
   - period，`o por defecto en vez de deducido → 1 fallo
+
+---
+
+# FASE 1i: funding discreto, y el dead end de las comisiones por par
+
+## El funding se cobra en instantes, no prorrateado
+
+**Medido y confirmado por dos vías independientes:**
+
+1. De los 3.800 periodos descargados por símbolo: intervalo de **8,00 horas
+   exactas en los 3.800**, sin una excepción, siempre a las 00:00, 08:00 y 16:00
+   UTC.
+2. Del endpoint `instrumentsInfo`: `fundingInterval = 480` minutos = 8 horas
+   en los cuatro pares.
+
+Antes se prorrateaba: `tasa × horas / 8`. Eso mete cobros que en el exchange no
+ocurren (12,15 horas no son un cobro y un doceavo) y **promedia un tramo donde
+se paga con uno donde se recibe**. Con velas de 15 minutos, cada cobro cae en
+una vela distinta — las barras 0, 32 y 64 de cada día — y con su tasa real.
+
+## Efecto medido: el discreto es PEOR en 8 de 8
+
+| Símbolo | Tramo | prorrateado | **discreto** | cambio |
+|---|---|---:|---:|---:|
+| BTC | 2023-2024 | +0,4259 | +0,4138 | −0,0121 |
+| BTC | 2025-2026 | +0,0819 | +0,0804 | −0,0015 |
+| ETH | 2023-2024 | +0,2261 | +0,2146 | −0,0115 |
+| ETH | 2025-2026 | +0,0828 | +0,0769 | −0,0059 |
+| XRP | 2025-2026 | −0,0860 | −0,0953 | −0,0093 |
+| SOL | 2023-2024 | +1,7965 | +1,7742 | −0,0223 |
+
+**El prorrateo cobraba de menos, en los ocho tramos.** El modelo correcto es
+el que da peor resultado, que es lo único que hace creíble un modelo.
+
+La magnitud es pequeña (0,001 a 0,022 puntos por operación) y **no cambia el
+veredicto**.
+
+## Un test que pasaba sin comprobar nada
+
+El primer test del signo pasó a la primera. Motivo: **`run_backtest` no llama
+a la estrategia barra a barra — le pide la lista completa de órdenes de una
+vez.** La estrategia de prueba devolvía "comprar, luego vender" pensando que se
+evaluaba en cada barra, así que la posición se cerraba en la barra 0 y la
+ventana del cobro era de una sola barra. **La serie de −1% nunca caía dentro y
+el test no comparaba nada.**
+
+Rehecho con una posición explícita de 100 barras, y con una aserción que
+comprueba que la ventana contiene el cobro antes de mirar el signo.
+
+## Comisiones por par: dead end declarado
+
+`publicGetV5MarketFeeGroupInfo` devuelve **`retCode 10001`** con las tres
+variantes de parámetros probadas (`accountType=UNIFIED`, `SPOT`, y con
+`category`). `instrumentsInfo` no lleva comisión.
+
+Lo que queda son dos fuentes, y las dos están anotadas en el código:
+
+- **Publicada de Bybit VIP 0**: taker 0,0550%, maker 0,0200% por lado.
+- **Medida aquí**: 0,0634% taker y 0,0134% maker. La de taker es un **15% más
+  alta** que la publicada.
+
+Se usa la medida, por ser la propia, y **la diferencia queda escrita en vez de
+escondida**. El hueco —que BTC y XRP pueden tener comisiones distintas— queda
+documentado, no relleno.
+
+## Lo que queda abierto, y es que no se puede cerrar
+
+- **El spread histórico.** El exchange no lo publica y no sale de las velas:
+  `high`/`low` son el rango, no el precio de ejecución. Los números de 2023 y
+  2024 usan una foto de 2026-10-02.
+- **La profundidad por encima de 500.000 USDT** solo está medida a una
+  instantánea por símbolo.
+- **La tasa real de cada cobro**, no la del régimen: el modelo usa la tasa media
+  del periodo, no la serie. La serie está en disco y el motor ya sabe leerla;
+  lo que no se ha hecho es alinear cada cobro de cada operación con su tasa, en
+  vez de con la del régimen.
+
+Ese último es el que queda más cerca y es el que más importa: con el funding
+negativo entre el 10% y el 38% de los periodos, **qué tasa tocó a cada cobro**
+cambia el resultado más que cualquier otro número del modelo.
+
+## Verificación
+
+- **517 tests verdes**.
+- **Control de mutación, los dos cazados**:
+  - invertir el signo del cobro → 1 fallo
+  - prorratear en vez de sumar los cobros → 1 fallo

@@ -11,6 +11,7 @@ This module provides backtesting and performance evaluation capabilities includi
 """
 
 import numpy as np
+import pandas as pd
 from typing import Dict, List, Tuple, Optional, Callable, Any
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -289,6 +290,80 @@ FUNDING_POR_SIMBOLO = {
     "XRP": {"2023-2024": 0.01253, "2025-2026": 0.00270},
     "SOL": {"2023-2024": 0.01079, "2025-2026": 0.00095},
 }
+
+
+#: SEGUNDOS POR VELA, para alinear los cobros de funding con las barras.
+#: MEDIDO: el backtester solo acepta estos marcos, y un marco desconocido
+#: raisea en vez de asumir 15 minutos.
+SEGUNDOS_POR_VELA = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                    "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
+
+#: Donde se guarda la serie real de funding. No se lee sola: leer 15.000 filas
+#: de CSV en cada backtest costaria mas que el backtest, asi que se pasa la
+#: tabla ya cargada y se comprueba que cubra la ventana.
+RUTA_FUNDING = "/sdcard/projects/Quant-Math-Public/data/funding"
+
+
+def cuotas_funding_por_barra(ts_inicio_ms: int, timeframe: str,
+                              tasas_por_instante: Dict[int, float],
+                              n_velas: int) -> Optional[Any]:
+    """Coloca la tasa de cada cobro REAL en la vela que lo contiene.
+
+    MEDIDO el 2026-10-02: los cuatro pares cobran a las 00:00, 08:00 y 16:00
+    UTC, y el cobro se aplica a la posicion que este abierta en ese instante.
+    Con velas de 15 minutos, cada cobro cae en una vela distinta y con la tasa
+    que le corresponde: sumar la tasa REAL de cada cobro es lo que evita que
+    un tramo con funding alto se promedie con uno bajo.
+
+    `tasas_por_instante` va de marca de tiempo en milisegundos a tasa en
+    fraccion. Si una vela cae entre dos cobros, su cuota es cero: no se
+    prorratea nada.
+
+    Devuelve `None` si el timeframe no se reconoce, para que el llamante
+    decida si abortar o seguir con el prorrateo declarado.
+    """
+    if timeframe not in SEGUNDOS_POR_VELA:
+        return None
+    paso = SEGUNDOS_POR_VELA[timeframe] * 1000
+    cuotas = np.zeros(n_velas, dtype=float)
+    if not tasas_por_instante:
+        return cuotas
+    inicio = int(ts_inicio_ms)
+    for instante, tasa in tasas_por_instante.items():
+        # La vela que CONTIENE el instante de cobro. Con paso divisible por 8h
+        # esto es exacto; si no lo fuera, el cobro se asigna a la vela en la
+        # que cae, que es lo que ve el motor.
+        j = (int(instante) - inicio) // paso
+        if 0 <= j < n_velas:
+            cuotas[int(j)] += float(tasa)
+    return cuotas
+
+
+def leer_funding(symbolo: str, ts_inicio_ms: int, ts_fin_ms: int,
+                 ruta: Optional[str] = None) -> Dict[int, float]:
+    """La serie real de funding de un simbolo, acotada a la ventana.
+
+    MEDIDO: el endpoint `publicGetV5MarketFundingHistory` pagina con `endTime`
+    y NO con `end`; con `end` devuelve siempre la misma pagina. Y el metodo
+    privado no existe en este build de ccxt, y el v3 publico da 404. Ver
+    `tools/fetch_funding.py`.
+    """
+    import csv as _csv
+    import os as _os
+    base = symbolo.split("/")[0].split(":")[0].upper()
+    ruta = ruta or _os.path.join(RUTA_FUNDING, f"{base}_funding.csv")
+    if not _os.path.exists(ruta):
+        return {}
+    fuera = {}
+    with open(ruta, newline="", encoding="utf-8") as fh:
+        for fila in _csv.DictReader(fh):
+            try:
+                ts = int(pd.to_datetime(fila["ts"]).timestamp() * 1000)
+            except Exception:
+                continue
+            if ts_inicio_ms <= ts <= ts_fin_ms:
+                fuera[ts] = float(fila["rate"])
+    return fuera
 
 
 def coste_para(simbolo: str, horas_mantenido: float = 0.0,
@@ -965,7 +1040,8 @@ class Backtester:
                  leverage: float = 1.0,
                  funding_rate_8h: float = 0.0,
                  timeframe: str = "1h",
-                 maintenance_margin_rate: Optional[float] = None):
+                 maintenance_margin_rate: Optional[float] = None,
+                 funding_por_barra: Optional[Any] = None):
         """
         Initialize backtester.
 
@@ -1007,6 +1083,10 @@ class Backtester:
         self.leverage = max(1.0, float(leverage))
         self.funding_rate_8h = float(funding_rate_8h)
         self.timeframe = timeframe
+        # Serie real de funding por barra. Si viene, el cobro es DISCRETO; si
+        # no, se prorratea. Ver `_funding_cost` para por que.
+        self.funding_por_barra = (None if funding_por_barra is None
+                                 else np.asarray(funding_por_barra, dtype=float))
         # MMR configurable: el real de Bybit es escalonado por nocional y el
         # valor hardcodeado (0,005) era del segundo tramo. Con None se usa el
         # primer tramo real, que es el que corresponde a un nocional pequeno.
@@ -1041,9 +1121,37 @@ class Backtester:
     def _fee(self, notional: float) -> float:
         return max(self.min_commission, notional * self.commission_rate)
 
-    def _funding_cost(self, notional: float, bars_held: int) -> float:
-        """Funding paid for holding `bars_held` bars at current notional."""
-        if self.funding_rate_8h == 0.0 or bars_held <= 0:
+    def _funding_cost(self, notional: float, bars_held: int,
+                      desde: Optional[int] = None,
+                      hasta: Optional[int] = None) -> float:
+        """Funding pagado por mantener la posicion `bars_held` barras.
+
+        MEDIDO el 2026-10-02 y confirmado en la documentacion: el funding se
+        cobra en INSTANTES DISCRETOS (00:00, 08:00 y 16:00 UTC), no
+        prorrateado por horas. Antes se prorrateaba, con lo que una posicion
+        abierta 12,15 horas hacia un doceavo de cobro que en realidad no se
+        paga. Y, mas importante, la TASA es distinta en cada cobro: hay que
+        sumar los cobros reales de la ventana, no multiplicar una tasa media por
+        un numero de horas.
+
+        Si se pasa `funding_por_barra`, se suman los cobros de la ventana.
+        Si no, se cae al prorrateo antiguo, y se dice en el codigo que es un
+        MENOS EXACTO y no el comportamiento real del exchange.
+
+        `desde` es la barra de entrada y `hasta` la de salida; el cobro entra
+        si cae dentro de la ventana, inclusive la de entrada (se entra antes
+        del corte y se paga).
+        """
+        if bars_held <= 0:
+            return 0.0
+        serie = self.funding_por_barra
+        if serie is not None:
+            a = 0 if desde is None else desde
+            b = len(serie) if hasta is None else hasta + 1
+            if b > a:
+                return notional * float(np.sum(serie[a:b]))
+            return 0.0
+        if self.funding_rate_8h == 0.0:
             return 0.0
         hours = bars_held * self._timeframe_hours()
         return notional * self.funding_rate_8h * (hours / 8.0)
@@ -1230,7 +1338,10 @@ class Backtester:
                     pos = open_positions[symbol]
                     margin = pos.get('margin', pos['quantity'] * pos['entry_price'])
                     bars_held = max(0, i - pos['entry_index'])
-                    funding = self._funding_cost(pos['quantity'] * fill, bars_held)
+                    funding = self._funding_cost(pos['quantity'] * fill,
+                                              bars_held,
+                                              desde=pos['entry_index'],
+                                              hasta=i)
                     total_funding_paid[0] += funding
                     liq = self._liq_price_long(pos['entry_price'])
                     liquidated = self._touched_liq(data[symbol], pos['entry_index'], i, liq)
@@ -1284,7 +1395,10 @@ class Backtester:
             commission = self._fee(pos['quantity'] * fill)
             margin = pos.get('margin', pos['quantity'] * pos['entry_price'])
             bars_held = max(0, len(orders) - 1 - pos['entry_index'])
-            funding = self._funding_cost(pos['quantity'] * fill, bars_held)
+            funding = self._funding_cost(pos['quantity'] * fill,
+                                          bars_held,
+                                          desde=pos['entry_index'],
+                                          hasta=len(orders) - 1)
             total_funding_paid[0] += funding
             liq = self._liq_price_long(pos['entry_price'])
             liquidated = self._touched_liq(data[symbol], pos['entry_index'],

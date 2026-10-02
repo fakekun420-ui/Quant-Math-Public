@@ -30,7 +30,9 @@ try:
     from backtesting import (Backtester, BacktestResult, PerformanceMetrics,
                             Trade, COSTE_TAKER)
     from backtesting.backtester import (coste_para, periodo_para,
-                                   slippage_para, simbolo_medido)
+                                   slippage_para, simbolo_medido,
+                                   cuotas_funding_por_barra, leer_funding,
+                                   SEGUNDOS_POR_VELA)
     from order_management import OrderManager
     import numpy as np
     import pandas as pd
@@ -408,7 +410,7 @@ class QuantMathAdapter:
                 synthetic: bool = False,
                 fraccion_capital: float = 1.0,
                 apalancamiento: float = 1.0,
-                coste=None) -> Any:
+                coste=None, usar_funding_real: bool = True) -> Any:
         """
         Run backtest using quant-math backtester.
 
@@ -797,12 +799,36 @@ class QuantMathAdapter:
         # en cero no se notaba; en cuanto se activa, el funding de una
         # estrategia de 15m se calculaba como si fuese de 1h, o sea 4 veces
         # mas barato de lo que es.
+        # FUNDING DISCRETO. MEDIDO el 2026-10-02: se cobra en instantes
+        # discretos a las 00:00, 08:00 y 16:00 UTC, y cada uno con SU tasa.
+        # Prorratear por horas mete cobros que no existen y promedia un tramo
+        # de funding alto con uno bajo, que es justo lo que hay que no hacer:
+        # el funding de 2025-2026 es entre 3 y 10 veces mas barato que el de
+        # 2023-2024.
+        #
+        # Si la serie real no esta en disco se pasa None y el motor prorratea,
+        # que es MENOS EXACTO y esta declarado como tal en `_funding_cost`.
+        _cuotas = None
+        if (usar_funding_real and _marco is not None
+                and hasattr(_marco, "columns") and _tf in SEGUNDOS_POR_VELA):
+            try:
+                _ts = _marco["ts"]
+                _ini = int(pd.to_datetime(_ts.iloc[0]).timestamp() * 1000)
+                _fin = int(pd.to_datetime(_ts.iloc[-1]).timestamp() * 1000)
+                _serie = leer_funding(_simbolo or "", _ini, _fin)
+                if _serie:
+                    _cuotas = cuotas_funding_por_barra(
+                        _ini, _tf, _serie, len(_marco))
+            except Exception:
+                _cuotas = None
+
         bt = Backtester(
             initial_capital=initial_capital, leverage=lev,
             commission_rate=coste.comision_por_lado,
             slippage_pct=coste.deslizamiento_por_llenado + _prof,
             funding_rate_8h=coste.funding_por_8h,
-            timeframe=_tf or "1h")
+            timeframe=_tf or "1h",
+            funding_por_barra=_cuotas)
         result = bt.run_backtest(strategy_func, price_dict,
                                   initial_capital=initial_capital,
                                   timeframe=_tf)

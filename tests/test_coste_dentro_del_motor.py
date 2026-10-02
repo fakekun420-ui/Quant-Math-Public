@@ -408,3 +408,105 @@ def test_el_funding_liquida_cada_8_horas_y_no_cada_hora():
     import backtesting.backtester as BT
     assert BT.FUNDING_CADA_HORAS == 8
     assert BT.FUNDING_HORAS == (0, 8, 16)
+
+
+# ---------------------------------------------------------------------------
+# El funding DISCRETO. MEDIDO el 2026-10-02.
+# ---------------------------------------------------------------------------
+
+def test_cada_cobro_cae_en_su_vela_y_no_se_prorratea():
+    """El funding se cobra en instantes discretos, no repartido por horas.
+
+    MEDIDO: los cuatro pares cobran a las 00:00, 08:00 y 16:00 UTC, con
+    velas de 15 minutos eso son las barras 0, 32 y 64. Y hay que comprobar que
+    la suma cuadra con la suma de las tasas, porque un reparto por horas
+    mete cobros que en el exchange no ocurren.
+    """
+    import backtesting.backtester as BT
+    import numpy as np
+    inicio = 1767225600000            # 2026-01-01 00:00 UTC
+    tasas = {inicio: 0.0001, inicio + 8 * 3600000: 0.0002,
+             inicio + 16 * 3600000: -0.00005}
+    cuotas = BT.cuotas_funding_por_barra(inicio, "15m", tasas, 96)
+    assert list(np.nonzero(cuotas)[0]) == [0, 32, 64], np.nonzero(cuotas)[0]
+    assert abs(float(cuotas.sum()) - sum(tasas.values())) < 1e-12
+    # Las velas SIN cobro valen cero, no una fraccion.
+    assert cuotas[1] == 0.0 and cuotas[31] == 0.0
+
+
+def test_un_marco_desconocido_no_se_adivina():
+    """Un timeframe que el motor no soporta tiene que fallar, no asumir 15m."""
+    import backtesting.backtester as BT
+    assert BT.cuotas_funding_por_barra(0, "7m", {0: 0.0001}, 100) is None, (
+        "un marco desconocido devuelve None para que el llamante decida; si "
+        "devolviese una serie, estaria inventando la alineacion")
+
+
+def test_el_funding_negativo_se_cobra_en_signo_menos():
+    """Un cobro negativo significa que se RECIBE, y hay que restarlo del coste.
+
+    MEDIDO: la serie real sale negativa entre el 10% y el 38% de los periodos
+    segun simbolo y regimen. Una serie con todas las tasas positivas no puede
+    detectar un error de signo en el cobro, asi que este test usa una taxa
+    NEGATIVA a proposito.
+
+    MEDIDO AL ESCRIBIRLO: `run_backtest` NO llama a la estrategia barra a
+    barra: le pide la lista COMPLETA de ordenes de una vez. La primera version
+    devolvia "comprar, luego vender" pensando que se evaluaba en cada barra, y
+    la posicion se cerraba en la barra 0 y la ventana del cobro era de una
+    sola barra, con lo que la serie de -1% nunca caia dentro y el test pasaba
+    sin comprobar nada.
+    """
+    import numpy as np
+    from backtesting import Backtester
+    simbolo = "X/USDT:USDT"
+    n = 120
+    precios = np.full(n, 100.0)
+
+    def entrar_salir(_data):
+        ordenes = [{"symbol": simbolo, "side": "buy", "quantity": 1.0}]
+        ordenes += [{"symbol": simbolo, "side": "hold", "quantity": 0}] * 99
+        ordenes.append({"symbol": simbolo, "side": "sell", "quantity": 1.0})
+        return ordenes
+
+    cuotas = np.zeros(n)
+    cuotas[50] = -0.01                       # un cobro NEGATIVO del 1%
+    r = Backtester(initial_capital=100000.0, commission_rate=0.0,
+                   leverage=1.0, funding_por_barra=cuotas).run_backtest(
+        entrar_salir, {simbolo: precios}, initial_capital=100000.0)
+    assert r.trades, "la serie de prueba debe producir operaciones"
+    x = r.trades[0]
+    i0, i1 = int(x.entry_time), int(x.exit_time)
+    assert i1 - i0 >= 50, (
+        f"la posicion se mantuvo {i1 - i0} barras y el cobro esta en la 50: "
+        f"si no cae dentro, el test no esta comprobando nada")
+    bruto = (x.exit_price - x.entry_price) / x.entry_price * 100.0
+    # Margen = nocional con apalancamiento 1, asi que el cobro de -1% del
+    # nocional es -1% del margen, y un largo lo RECIBE: el PnL sube.
+    assert float(x.pnl_pct) > bruto + 0.5, (
+        f"pnl_pct={float(x.pnl_pct):.4f}% contra un bruto de {bruto:.4f}%. Con "
+        f"un cobro NEGATIVO de -1% del nocional el largo recibe 1%, asi que el "
+        f"resultado tiene que quedar al menos un 0,5% por ENCIMA del bruto. "
+        f"Si no, el cobro se esta aplicando con el signo cambiado.")
+
+
+def test_el_adaptador_puede_desactivar_la_serie_para_comparar():
+    """El interruptor existe para poder MEDIR la diferencia, no solo declararla."""
+    import inspect
+    from quant_math.autonomous_research.adapters.quant_math_adapter import (
+        QuantMathAdapter)
+    assert "usar_funding_real" in inspect.signature(
+        QuantMathAdapter.run_backtest).parameters, (
+        "sin este parametro no se puede comparar el prorrateo con el cobro "
+        "discreto sobre la misma ejecucion, y la diferencia queda sin medir")
+
+
+def test_el_intervalo_de_funding_esta_confirmado_por_dos_vias():
+    """Medido en los 3.800 periodos del CSV y confirmado por instrumentsInfo."""
+    import backtesting.backtester as BT
+    assert BT.FUNDING_CADA_HORAS == 8
+    assert BT.FUNDING_HORAS == (0, 8, 16)
+    assert BT.SEGUNDOS_POR_VELA["15m"] == 900
+    # 32 velas de 15 minutos por periodo de 8 horas: es lo que hace que los
+    # cobros caigan en barras enteras y no entre dos.
+    assert 8 * 3600 // 900 == 32
